@@ -1,0 +1,47 @@
+---
+# Формат сверен с исходником Hermes (hermes_cli/plugins.py:4370):
+# читается поле provides_tools — плоский список имён. Поля tools: с вложенным
+# toolset у Hermes нет, оно молча игнорируется. Toolset задаётся не здесь,
+# а в вызове ctx.register_tool(toolset=...) внутри __init__.py.
+name: "health"
+version: "1.0.0"
+author: "Health Agent System"
+description: "Метаболический контур: вес, состав тела, КБЖУ, тренировки, гардрейлы"
+kind: "standalone"
+
+# Плагин НЕ грузится сам по себе. Его ключ должен стоять в ~/.hermes/config.yaml:
+#   plugins:
+#     enabled:
+#       - health
+# Гейт: hermes_cli/plugins.py:613 и :1061.
+
+provides_tools:
+  - log_food
+  - log_water
+  - log_glucose
+  - log_weight
+  - log_anthropometry
+  - log_med
+  - pharma
+  - plans
+  - import_scale_export
+  - get_day_summary
+  - get_trends
+  - get_status_bar
+  - get_evening_report
+  - get_weekly_summary
+  - help
+  - query_metrics
+  - query_food
+  - pantry
+  - equipment
+  - plan_day
+  - log_workout
+  - refeed
+  - forecast
+  - style
+  - explain_target
+  - get_progress
+  - register_user
+  - set_milestone
+  - admin_cmd

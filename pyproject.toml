@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "health-agent"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "Health tracking system for nutritional and fitness data"
+dependencies = [
+    "openpyxl",
+    "PyYAML",
+    # Телеграм-транспорт своего цикла агента (заменил шлюз Hermes).
+    # aiohttp приходит вместе с ним и используется как http-клиент для LLM —
+    # второго http-клиента в проекте нет намеренно.
+    "aiogram>=3.20",
+    # Проверка TLS по хранилищу ОС: в сетях с перехватом (антивирус, прокси)
+    # бандл certifi не содержит их корневого сертификата и телеграм недостижим.
+    "truststore",
+]
+
+[tool.setuptools]
+packages = ["health_core", "health_core.ingest", "bot"]

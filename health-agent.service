@@ -1,0 +1,48 @@
+# Health Agent Bot — пользовательский systemd-юнит (не системный, не от root).
+#
+# Установка на Debian VPS от обычного пользователя:
+#   mkdir -p ~/.config/systemd/user
+#   cp health-agent.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now health-agent.service
+#
+# Чтобы сервис жил после выхода из ssh (иначе systemd убьёт сессию пользователя),
+# один раз от root:
+#   loginctl enable-linger <username>
+#
+# Статус и логи:
+#   systemctl --user status health-agent.service
+#   journalctl --user-unit health-agent.service -f
+
+[Unit]
+Description=Health Agent Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10
+
+# User= здесь НЕ указывается намеренно: пользовательский юнит и так исполняется
+# от владельца сессии. Директива User= в --user юните — ошибка запуска.
+
+EnvironmentFile=%h/.hermes/.env
+Environment=PYTHONUNBUFFERED=1
+
+# Бот работает ИЗ КАТАЛОГА ПРОЕКТА, а не из копии в ~/.hermes/: персона,
+# config.yaml, Knowledge/ и код читаются отсюда, и правка файла сразу боевая.
+# Путь подставить свой, если проект развёрнут не в ~/Health_agent_system.
+WorkingDirectory=/opt/webapps/health_agent_system
+ExecStart=/opt/webapps/health_agent_system/.venv/bin/python -m bot.main
+
+# Слабый VPS. Значение ставить ПОСЛЕ замера реального RSS (шаг замера в DEPLOY.md),
+# а не наугад: заниженный MemoryMax убьёт бота посреди диалога.
+# MemoryMax=450M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=health-agent
+
+[Install]
+WantedBy=default.target

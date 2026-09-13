@@ -1,0 +1,62 @@
+# Health Admin Panel — пользовательский systemd-юнit (не системный, не от root).
+# Тот же стиль, что и health-agent.service — см. этот файл для деталей.
+#
+# Установка на Debian VPS от обычного пользователя:
+#   mkdir -p ~/.config/systemd/user
+#   cp health-admin.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now health-admin.service
+#
+# Пароль администратора (один раз, до первого запуска):
+#   python -m admin.server --set-password
+#   # две выведенные строки вручную добавить в ~/.hermes/.env:
+#   #   ADMIN_PASSWORD_HASH=...
+#   #   ADMIN_PASSWORD_SALT=...
+#
+# Чтобы сервис жил после выхода из ssh (иначе systemd убьёт пользовательскую
+# сессию вместе с сервисом), один раз от root:
+#   loginctl enable-linger <username>
+#
+# Панель слушает ТОЛЬКО 127.0.0.1:8765 — снаружи VPS недоступна. Доступ с
+# рабочей машины — ssh-туннель:
+#   ssh -L 8765:localhost:8765 user@vps
+# затем открыть в браузере http://localhost:8765/
+#
+# Публичный (не loopback) --host требует TLS-реверс-прокси перед собой
+# (см. admin/README-proxy.md) и ADMIN_BEHIND_TLS=1 — без этого сервис
+# отказывается стартовать (см. admin/server.py::_refuse_exposed_bind).
+#
+# Статус и логи:
+#   systemctl --user status health-admin.service
+#   journalctl --user-unit health-admin.service -f
+
+[Unit]
+Description=Health Admin Panel (stdlib HTTP server, 127.0.0.1 only)
+After=network.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10
+
+# User= здесь НЕ указывается намеренно: пользовательский юнит и так исполняется
+# от владельца сессии. Директива User= в --user юните — ошибка запуска.
+
+EnvironmentFile=%h/.hermes/.env
+
+# ЗАМЕНИТЬ на реальный путь клона репозитория на VPS (тот же PROJECT_DIR,
+# что передавался в install.sh) — admin/ и plugin/ не копируются в ~/.hermes,
+# они запускаются прямо из чекаута.
+WorkingDirectory=/opt/webapps/health_agent_system
+ExecStart=/opt/webapps/health_agent_system/.venv/bin/python -m admin.server --host 127.0.0.1 --port 8765
+
+# Слабый VPS. Значение ставить ПОСЛЕ замера реального RSS (как в
+# health-agent.service), не наугад.
+# MemoryMax=150M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=health-admin
+
+[Install]
+WantedBy=default.target

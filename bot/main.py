@@ -1,0 +1,739 @@
+"""Точка входа: телеграм-бот вместо шлюза Hermes. Контракт — Docs/bot_design.md.
+
+Запускается ИЗ КАТАЛОГА ПРОЕКТА. Копий кода, персоны и config.yaml в
+~/.hermes/ больше нет: правка файла здесь — правка боевого кода. От ~/.hermes/
+остались только .env (общий канал секретов с админкой) и health.db.
+
+    python -m bot.main
+"""
+import asyncio
+import base64
+import contextlib
+import html
+import io
+import json
+import logging
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import aiohttp
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.utils.chat_action import ChatActionSender
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    # Сеть с TLS-перехватом (антивирус, корпоративный прокси, провайдер) подсовывает
+    # свой корневой сертификат: он лежит в хранилище ОС, но не в бандле certifi,
+    # которым python проверяет цепочку по умолчанию — и api.telegram.org отваливается
+    # с CERTIFICATE_VERIFY_FAILED. truststore переключает проверку на хранилище ОС.
+    # Проверку сертификатов НЕ отключает — это было бы дырой ради удобства.
+    import truststore
+
+    truststore.inject_into_ssl()
+except ImportError:
+    pass          # чистая сеть (обычный VPS) — работает и без него
+
+from admin.auth import load_env_file          # тот же .env, что у панели — второй читалки не заводим
+from bot import history, knowledge, llm, registry
+from health_core import config
+from health_core.config import load as load_config
+from health_core.db import connect, migrate
+
+log = logging.getLogger("bot")
+
+SOUL_PATH = ROOT / "Core" / "system_promt.md"
+TELEGRAM_LIMIT = 4096
+
+# Встроенные команды шлюза, которых мы лишились вместе с Hermes. Плагин их не
+# даёт: у него инструменты, а не команды.
+BUILTIN_COMMANDS = {
+    "new": "Забыть контекст разговора",
+    "help": "Что я умею",
+    "status": "Статус-бар: вес, калории, гарды",
+    "model": "Смена активной модели (админ)",
+}
+
+_soul_cache: tuple[float, str] | None = None
+
+# Замок на пользователя, см. _user_lock. Словарь не чистится: ключей ровно
+# столько, сколько людей написало боту за жизнь процесса.
+_USER_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def system_prompt() -> str:
+    """Персона с диска + индекс знаний. Перечитывается по mtime: персону правят
+    на живой системе, и перезапуск ради одной строки — это ровно то трение,
+    из-за которого правки копятся неделями."""
+    global _soul_cache
+    mtime = SOUL_PATH.stat().st_mtime
+    if _soul_cache is None or _soul_cache[0] != mtime:
+        _soul_cache = (mtime, SOUL_PATH.read_text(encoding="utf-8"))
+    # Индекс знаний НЕ кэшируем вместе с персоной: файлы добавляются через
+    # админку в любой момент, и модель должна увидеть их сразу.
+    return _soul_cache[1] + "\n\n" + knowledge.index()
+
+
+def tool_specs() -> list[dict]:
+    """24 инструмента плагина + knowledge. Собирается на каждый ход: состав тем
+    знаний зависит от каталога и от режима звонящего."""
+    return registry.openai_tools() + [{
+        "type": "function",
+        "function": {
+            "name": "knowledge",
+            "description": "Прочитать справочный материал: протокол, препараты, вехи, книги по питанию",
+            "parameters": knowledge.schema(),
+        },
+    }]
+
+
+def dispatch(name: str, args: dict) -> str:
+    """Единая точка исполнения инструмента. knowledge живёт не в плагине,
+    поэтому маршрутизируется здесь, а не внутри registry."""
+    if name == "knowledge":
+        return knowledge.read(args.get("topic", ""), args.get("query"))
+    return registry.dispatch(name, args)
+
+
+def allowed_users() -> set[str]:
+    """Пусто = не пускаем никого. Fail closed: пустая переменная означает
+    незаконченную настройку, а не «открыто всем»."""
+    raw = os.environ.get("TELEGRAM_ALLOWED_USERS", "")
+    return {p.strip() for p in raw.replace(";", ",").split(",") if p.strip()}
+
+
+def _chunks(text: str, limit: int) -> list[str]:
+    """Режем по границам абзацев: статус-бар и отчёты — таблицы, разрыв
+    посередине строки делает их нечитаемыми."""
+    if len(text) <= limit:
+        return [text]
+    out, cur = [], ""
+    for para in text.split("\n\n"):
+        if cur and len(cur) + len(para) + 2 > limit:
+            out.append(cur)
+            cur = ""
+        while len(para) > limit:          # один абзац длиннее лимита — режем как есть
+            out.append(para[:limit])
+            para = para[limit:]
+        cur = f"{cur}\n\n{para}" if cur else para
+    if cur:
+        out.append(cur)
+    return out
+
+
+async def send_long(message: Message, text: str) -> None:
+    """Разметка приходит от модели и бывает битой (незакрытая звёздочка). Когда
+    телеграм отказывается её разбирать, шлём тот же кусок без разметки:
+    молчание в ответ на вопрос хуже сырого текста."""
+    if not text.strip():
+        # Пустой ответ телеграм отвергает, и вместо ошибки человек видит тишину.
+        # Молчание — худший из возможных ответов: непонятно, дошло ли вообще.
+        text = "Готово."
+    for chunk in _chunks(text, TELEGRAM_LIMIT):
+        try:
+            sent = await message.answer(chunk)
+            log.info("отправлено chat=%s message_id=%s (%d симв)",
+                     message.chat.id, sent.message_id, len(chunk))
+        except TelegramBadRequest as e:
+            # Разметка от модели бывает битой. Логируем причину: без неё
+            # «бот молчит» неотличимо от «бот не понял».
+            log.warning("разметка отвергнута (%s), шлём без неё", e)
+            sent = await message.answer(html.escape(chunk), parse_mode=None)
+            log.info("отправлено без разметки chat=%s message_id=%s",
+                     message.chat.id, sent.message_id)
+
+
+def _plain(raw: str) -> str:
+    """Инструменты отдают JSON — человеку он не нужен. Достаём текстовое поле,
+    а нет его — показываем как есть: молча проглотить ответ хуже."""
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+    if not isinstance(data, dict):
+        return raw
+    for key in ("text", "help", "status_bar", "error"):
+        value = data.get(key)
+        if isinstance(value, str):
+            return value
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def admin_user_ids() -> set[str]:
+    """Список telegram id администраторов из config.yaml."""
+    cfg = load_config()
+    raw_ids = (cfg.get("admin") or {}).get("telegram_admin_ids") or []
+    return {str(i).strip() for i in raw_ids if str(i).strip()}
+
+
+def _format_models_message(providers: list[dict]) -> str:
+    lines = ["🤖 **Цепочка моделей нейросетей:**\n"]
+    for i, p in enumerate(providers):
+        m = p.get("model", f"model-{i+1}")
+        env = p.get("api_key_env", "")
+        if i == 0:
+            lines.append(f"**{i+1}. 🟢 `{m}`** — *основная (активна)*")
+        else:
+            lines.append(f"{i+1}. `{m}` `[{env}]`")
+    lines.append("\nДля смены нажмите кнопку ниже или введите:\n`/model <номер или название>` (например `/model 2` или `/model deepseek`)")
+    return "\n".join(lines)
+
+
+def _model_keyboard(providers: list[dict]) -> InlineKeyboardMarkup:
+    buttons = []
+    for i, p in enumerate(providers):
+        m_name = p.get("model", f"model-{i+1}")
+        short_name = m_name.split("/")[-1]
+        prefix = "🟢 " if i == 0 else ""
+        text = f"{prefix}{i+1}. {short_name}"
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"switch_model:{i}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def switch_model_cmd(args: str) -> str:
+    """Обработчик текстовой команды /model <args>."""
+    from admin.server import _update_providers_in_config
+    current_cfg = load_config()
+    providers = list((current_cfg.get("bot") or {}).get("providers", []))
+    if not providers:
+        return "В config.yaml нет зарегистрированных моделей."
+
+    args = args.strip()
+    if not args:
+        return _format_models_message(providers)
+
+    target_idx = None
+    if args.isdigit():
+        idx = int(args) - 1
+        if 0 <= idx < len(providers):
+            target_idx = idx
+        else:
+            return f"❌ Неверный номер модели (доступно от 1 до {len(providers)})."
+    else:
+        q = args.lower()
+        for i, p in enumerate(providers):
+            if q in p.get("model", "").lower():
+                target_idx = i
+                break
+        if target_idx is None:
+            avail = ", ".join(f"{i+1}. {p.get('model', '').split('/')[-1]}" for i, p in enumerate(providers))
+            return f"❌ Модель '{args}' не найдена.\nДоступные модели:\n{avail}"
+
+    if target_idx == 0:
+        return f"ℹ️ Модель `{providers[0].get('model')}` уже является основной (приоритет #1)."
+
+    chosen = providers.pop(target_idx)
+    new_providers = [chosen] + providers
+    try:
+        _update_providers_in_config(new_providers)
+    except Exception as exc:
+        return f"❌ Ошибка сохранения config.yaml: {exc}"
+
+    return (
+        f"✅ Основной моделью установлена:\n"
+        f"**`{chosen.get('model')}`** (приоритет #1)\n\n"
+        + _format_models_message(new_providers)
+    )
+
+
+def run_command(uid: str, text: str) -> str | None:
+    """Слэш-команды исполняются без модели — в этом их смысл. None означает
+    «не наша команда»: сообщение уходит дальше в обычный разбор."""
+    name, _, args = text[1:].partition(" ")
+    name = name.split("@")[0].lower()          # /help@botname в группах
+
+    if name == "new":
+        conn = connect()
+        try:
+            history.clear(conn, uid)
+        finally:
+            conn.close()
+        return "Контекст забыт. Записи в базе на месте."
+    if name == "status":
+        return _plain(registry.dispatch("get_status_bar", {}))
+    if name == "help":
+        return _plain(registry.dispatch("help", {}))
+    if name in ("model", "models"):
+        if uid not in admin_user_ids():
+            return "⚠ Команда /model доступна только администраторам."
+        return switch_model_cmd(args.strip())
+
+    for cmd_name, handler, _desc in registry.SLASH_COMMANDS:
+        if cmd_name == name:
+            try:
+                return _plain(handler(args.strip()))
+            finally:
+                # Хендлеры слэш-команд текут соединениями ровно так же, как
+                # хендлеры инструментов, — и мимо registry.dispatch() уборка
+                # не срабатывает. См. registry.release_connections.
+                registry.release_connections()
+    return None
+
+
+def _user_time_context(conn, uid: str) -> str:
+    user_row = conn.execute(
+        "SELECT id, timezone FROM users WHERE telegram_user_id=?", (uid,)
+    ).fetchone()
+    if user_row:
+        config.set_tz(user_row["timezone"])
+        u_now = config.user_now(conn, user_row["id"])
+        tz_info = f" ({user_row['timezone']})" if user_row["timezone"] else ""
+    else:
+        u_now = config.local_now()
+        tz_info = ""
+    return (
+        f"\n\n**[CURRENT TIME & DATE]**\n"
+        f"Текущая дата и время пользователя: {u_now.strftime('%Y-%m-%d %H:%M')}{tz_info}.\n"
+        f"Сегодня: {u_now.strftime('%d.%m.%Y')} (ТЕКУЩИЙ ГОД: {u_now.year}).\n"
+        f"ВАЖНО: Текущий год — {u_now.year}! Ни в коем случае не используй 2025 или 2024 при логировании еды или запросах за сегодня."
+    )
+
+
+def _open_turn(uid: str, text: str) -> list[dict]:
+    """Собрать запрос и сразу записать реплику человека. Синхронная работа с
+    sqlite и чтение персоны с диска — блокирующие, поэтому вызывается через
+    asyncio.to_thread: иначе один медленный диск останавливает поллинг и
+    вместе с ним переписку всех остальных."""
+    conn = connect()
+    try:
+        migrate(conn)
+        time_ctx = _user_time_context(conn, uid)
+        prefix = [{"role": "system", "content": system_prompt() + time_ctx}]
+        prefix += history.load(conn, uid)
+        prefix.append({"role": "user", "content": text})
+        history.append(conn, uid, {"role": "user", "content": text})
+        return prefix
+    finally:
+        conn.close()
+
+
+def _open_turn_vision(uid: str, content: list[dict], text_for_history: str) -> list[dict]:
+    """Как _open_turn, но для vision-запроса с картинкой. В историю пишем
+    только текстовую часть — base64 занимает мегабайты и убивает окно."""
+    conn = connect()
+    try:
+        migrate(conn)
+        time_ctx = _user_time_context(conn, uid)
+        prefix = [{"role": "system", "content": system_prompt() + time_ctx}]
+        prefix += history.load(conn, uid)
+        prefix.append({"role": "user", "content": content})
+        # В историю — только текст, не base64: он занял бы всё окно целиком
+        history.append(conn, uid, {"role": "user", "content": text_for_history})
+        return prefix
+    finally:
+        conn.close()
+
+
+def _close_turn(uid: str, new_messages: list[dict]) -> None:
+    """Дописать в историю то, что цикл добавил после реплики человека."""
+    conn = connect()
+    try:
+        for m in new_messages:
+            history.append(conn, uid, m)
+    finally:
+        conn.close()
+
+
+def _user_lock(uid: str) -> asyncio.Lock:
+    """Один замок на человека. Без него два его же сообщения подряд
+    перемешивают записи в chat_history: реплика второго хода вклинивается
+    между assistant с tool_calls и его результатами, и следующий запрос
+    провайдер отвергает целиком как невалидный. Замки разных людей
+    независимы — очередь одного не тормозит другого."""
+    lock = _USER_LOCKS.get(uid)
+    if lock is None:
+        lock = _USER_LOCKS[uid] = asyncio.Lock()
+    return lock
+
+
+async def _handle_document(message: Message, uid: str) -> None:
+    doc = message.document
+    if not doc:
+        return
+    filename = doc.file_name or "uploaded_file"
+    log.info("получен файл %s (%d байт) от user %s", filename, doc.file_size or 0, uid)
+    
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir) / filename
+        await message.bot.download(doc, destination=tmp_path)
+        
+        # Если zip-архив (например, из Mi Fitness или архив с tcx/csv)
+        if filename.lower().endswith(".zip") or tmp_path.suffix.lower() == ".zip":
+            import zipfile
+            import migrate as _mig
+            extract_dir = Path(tmp_dir) / "unzipped"
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(tmp_path, "r") as zf:
+                zf.extractall(extract_dir)
+            
+            conn = connect()
+            try:
+                migrate(conn)
+                user_id_row = conn.execute("SELECT id FROM users WHERE telegram_user_id=?", (uid,)).fetchone()
+                user_id = user_id_row["id"] if user_id_row else 1
+                
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    _mig.run_scale(conn, user_id, str(extract_dir))
+                    _mig.run_tcx(conn, user_id, str(extract_dir))
+                conn.commit()
+                out = buf.getvalue().strip() or "Файлы из zip обработаны."
+                await message.answer(f"📦 Разобран zip-архив `{filename}`:\n\n{out}", parse_mode=ParseMode.MARKDOWN)
+            finally:
+                conn.close()
+            return
+
+        # Иначе пробуем стандартный импорт файла (TCX, XLSX, CSV)
+        registry.set_caller(uid)
+        try:
+            raw_res = await asyncio.to_thread(
+                registry.dispatch, "import_scale_export", {"file_path": str(tmp_path)}
+            )
+            data = json.loads(raw_res)
+            if "error" in data:
+                await message.answer(f"❌ Ошибка импорта: {data['error']}")
+            else:
+                added = data.get("added", 0)
+                skipped = data.get("skipped", 0)
+                if added > 0:
+                    await message.answer(f"✅ Файл `{filename}` успешно импортирован! (добавлено: {added}, пропущено дублей: {skipped})", parse_mode=ParseMode.MARKDOWN)
+                elif skipped > 0:
+                    await message.answer(f"ℹ️ Данные из файла `{filename}` уже есть в базе (пропущено существующих записей: {skipped}).", parse_mode=ParseMode.MARKDOWN)
+                else:
+                    await message.answer(f"ℹ️ В файле `{filename}` новых данных не найдено.", parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            log.exception("ошибка при импорте файла")
+            await message.answer(f"❌ Не удалось обработать файл: {e}")
+
+
+async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: dict, uid: str) -> None:
+    """Скачивает фото, кодирует в base64 и отправляет модели как vision-запрос.
+    Сценарии: фото еды для оценки КБЖУ, фото глюкометра, фото этикетки."""
+    # Telegram sends multiple sizes; take the largest (last in array)
+    photo = message.photo[-1]
+
+    # Download photo to bytes
+    bio = io.BytesIO()
+    await message.bot.download(photo, destination=bio)
+    bio.seek(0)
+    image_bytes = bio.read()
+
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+
+    # Build multimodal content for OpenAI vision format
+    caption = (message.caption or "").strip()
+    text_part = caption if caption else "Что на этом фото? Если это еда — оцени КБЖУ. Если глюкометр — назови показание. Если этикетка — разбери состав."
+
+    content = [
+        {"type": "text", "text": text_part},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+    ]
+
+    # Use _open_turn_vision with special image content
+    registry.set_caller(uid)
+    prefix = await asyncio.to_thread(_open_turn_vision, uid, content, caption or "[фото]")
+
+    load_env_file()
+    current_cfg = load_config()
+    bot_cfg = current_cfg.get("bot", cfg.get("bot", {}))
+    try:
+        answer, full = await llm.run_loop(
+            session, prefix, tool_specs(), bot_cfg["providers"],
+            dispatch, max_iters=bot_cfg.get("max_tool_iters", 6),
+        )
+    except RuntimeError as e:
+        log.error("все провайдеры недоступны: %s", e)
+        await message.answer("Не смог связаться с моделью. Повтори через минуту.")
+        return
+
+    await asyncio.to_thread(_close_turn, uid, full[len(prefix):])
+    await send_long(message, answer)
+
+
+async def handle_message(message: Message, session: aiohttp.ClientSession, cfg: dict) -> None:
+    uid = str(message.from_user.id)
+    if uid not in allowed_users():
+        # В чат не отвечаем вовсе: ответ подтверждает чужому, что бот жив.
+        log.warning("отказано незнакомому telegram id %s", uid)
+        return
+
+    if message.document:
+        async with _user_lock(uid):
+            async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+                await _handle_document(message, uid)
+        return
+
+    if message.photo:
+        async with _user_lock(uid):
+            async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+                await _handle_photo(message, session, cfg, uid)
+        return
+
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        return
+
+    async with _user_lock(uid):
+        # «печатает…» на всё время хода. Телеграм гасит статус через 5 секунд,
+        # ChatActionSender переотправляет его сам, пока блок не закончится.
+        # Ответ идёт 5-20 секунд, и без этого статуса бот неотличим от мёртвого —
+        # именно так это и выглядело после ухода Hermes, который статус слал.
+        async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+            await _handle_turn(message, session, cfg, uid, text)
+
+
+async def _handle_turn(message: Message, session: aiohttp.ClientSession,
+                       cfg: dict, uid: str, text: str) -> None:
+    # Личность звонящего выставляем до любого исполнения: без неё инструменты
+    # отработают над user_id=1, кто бы ни прислал сообщение.
+    registry.set_caller(uid)
+
+    if text.startswith("/"):
+        cmd_name = text[1:].partition(" ")[0].split("@")[0].lower()
+        if cmd_name in ("model", "models"):
+            if uid not in admin_user_ids():
+                await message.answer("⚠ Команда /model доступна только администраторам.")
+                return
+            cmd_args = text[1:].partition(" ")[2].strip()
+            if not cmd_args:
+                current_cfg = load_config()
+                providers = list((current_cfg.get("bot") or {}).get("providers", []))
+                kb = _model_keyboard(providers)
+                msg_text = _format_models_message(providers)
+                await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+                return
+
+        # Хендлеры команд синхронные и лезут в sqlite — в поток, чтобы не
+        # блокировать polling. to_thread копирует контекст, ContextVar доедет.
+        answer = await asyncio.to_thread(run_command, uid, text)
+        if answer is not None:
+            await send_long(message, answer)
+            return
+
+    rewritten = registry.quick_macro(text)
+    if rewritten:
+        text = rewritten
+
+    prefix = await asyncio.to_thread(_open_turn, uid, text)
+
+    load_env_file()
+    current_cfg = load_config()
+    bot_cfg = current_cfg.get("bot", cfg.get("bot", {}))
+    try:
+        answer, full = await llm.run_loop(
+            session, prefix, tool_specs(), bot_cfg["providers"],
+            dispatch, max_iters=bot_cfg.get("max_tool_iters", 6),
+        )
+    except RuntimeError as e:
+        log.error("все провайдеры недоступны: %s", e)
+        await message.answer("Не смог связаться с моделью. Записи в базе не потеряны, повтори через минуту.")
+        return
+
+    await asyncio.to_thread(_close_turn, uid, full[len(prefix):])
+    await send_long(message, answer)
+
+
+def _admin_port_busy(host: str, port: int) -> bool:
+    """Кто-то уже слушает этот порт (панель подняли руками через start-admin.sh)?
+    Без проверки дочерний процесс просто упал бы с EADDRINUSE в лог бота."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def _start_admin_panel() -> subprocess.Popen | None:
+    """Поднимает админку вместе с ботом. Возвращает процесс или None, если
+    запуск пропущен — пропуск НИКОГДА не валит бота: панель это удобство, а
+    телеграм — работа.
+
+    Отдельным процессом, а не потоком в боте, хотя поток был бы короче:
+    bot/registry.py подменяет plugin.tools.connect трекером соединений, а
+    админка дёргает те же хендлеры (_admin_set, handle_set_milestone). В общем
+    процессе её HTTP-потоки попали бы под чужую заплатку, которая рассчитана на
+    цикл dispatch бота и в потоках панели никогда не вызывается. Отдельный
+    процесс — ровно та конфигурация, что уже проверена (python -m admin.server).
+
+    Выключается HEALTH_ADMIN_AUTOSTART=0 в ~/.hermes/.env.
+    """
+    if os.environ.get("HEALTH_ADMIN_AUTOSTART", "1") == "0":
+        log.info("админка не запущена: HEALTH_ADMIN_AUTOSTART=0")
+        return None
+    if not (os.environ.get("ADMIN_PASSWORD_HASH") and os.environ.get("ADMIN_PASSWORD_SALT")):
+        log.warning("админка не запущена: нет ADMIN_PASSWORD_HASH/SALT "
+                    "(python -m admin.server --set-password)")
+        return None
+
+    # Один try на всё остальное, включая разбор порта: опечатка в
+    # HEALTH_ADMIN_PORT — это ValueError, а непрошенный хост — gaierror, и
+    # любое из них, вылетев наружу, убило бы бота из-за неработающего
+    # удобства. Панель не имеет права ронять телеграм ничем.
+    try:
+        host = os.environ.get("HEALTH_ADMIN_HOST", "127.0.0.1")
+        port = int(os.environ.get("HEALTH_ADMIN_PORT", "8765"))
+        if _admin_port_busy(host, port):
+            log.info("админка уже слушает %s:%d — второй экземпляр не поднимаю", host, port)
+            return None
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "admin.server", "--host", host, "--port", str(port)],
+            cwd=str(ROOT),
+        )
+    except Exception:
+        log.exception("админка не запустилась — бот продолжает работу без неё")
+        return None
+    log.info("админка запущена: http://%s:%d/ (pid %d)", host, port, proc.pid)
+    return proc
+
+
+def _stop_admin_panel(proc: subprocess.Popen | None) -> None:
+    """Гасит панель на выходе бота. terminate, а не kill: у панели есть
+    server_close(). Не дождались за 5 с — добиваем, иначе порт останется занят
+    и следующий старт бота решит, что панель уже поднята."""
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    log.info("админка остановлена")
+
+
+async def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        # force: если кто-то из импортированных пакетов уже настроил logging,
+        # обычный basicConfig молча становится пустышкой — и лог бота исчезает
+        # целиком. Это уже случилось: бот работал, а файл лога был пуст, и
+        # отладка «почему молчит» шла вслепую.
+        force=True,
+    )
+    load_env_file()
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        log.error("TELEGRAM_BOT_TOKEN не задан (~/.hermes/.env)")
+        return 1
+    if not allowed_users():
+        log.error("TELEGRAM_ALLOWED_USERS пуст — бот не ответит никому. Заполните ~/.hermes/.env")
+        return 1
+
+    cfg = load_config()
+    # Проверяем раздел bot ДО первого сообщения. Иначе опечатка в config.yaml
+    # всплывает KeyError внутри обработчика, человек видит "Внутренняя ошибка"
+    # на каждое сообщение, а причина — только в логе.
+    providers = (cfg.get("bot") or {}).get("providers")
+    if not providers:
+        log.error("в config.yaml нет bot.providers — некого спрашивать, см. Docs/llm_config.md")
+        return 1
+    for i, p in enumerate(providers):
+        missing = [k for k in ("base_url", "api_key_env", "model") if not p.get(k)]
+        if missing:
+            log.error("bot.providers[%d]: не хватает полей %s", i, ", ".join(missing))
+            return 1
+        if not os.environ.get(p["api_key_env"]):
+            # Не отказ: цепочка фолбэка на то и цепочка. Но молчать нельзя —
+            # именно так «бот перестал отвечать» превращается в поиск вслепую.
+            log.warning("bot.providers[%d] (%s): переменная %s пуста, провайдер будет пропущен",
+                        i, p["model"], p["api_key_env"])
+
+    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+    dp = Dispatcher()
+
+    admin_proc = _start_admin_panel()
+    try:
+        return await _run_polling(bot, dp, cfg)
+    finally:
+        _stop_admin_panel(admin_proc)
+
+
+async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
+    async with aiohttp.ClientSession() as session:
+        @dp.message()
+        async def _on_message(message: Message) -> None:
+            try:
+                await handle_message(message, session, cfg)
+            except Exception:
+                # Падение одного сообщения не должно ронять polling: молчащий
+                # бот выглядит поломкой, а перезапуск теряет очередь.
+                log.exception("сообщение не обработано")
+                await message.answer("Внутренняя ошибка, она записана в лог. Повтори иначе.")
+
+        @dp.callback_query(lambda c: bool(c.data and c.data.startswith("switch_model:")))
+        async def _on_switch_model(callback: CallbackQuery) -> None:
+            cb_uid = str(callback.from_user.id)
+            if cb_uid not in admin_user_ids():
+                await callback.answer("⚠ Только для администраторов.", show_alert=True)
+                return
+            try:
+                idx_str = (callback.data or "").split(":", 1)[1]
+                idx = int(idx_str)
+            except (IndexError, ValueError):
+                await callback.answer("Неверные данные.")
+                return
+
+            current_cfg = load_config()
+            providers = list((current_cfg.get("bot") or {}).get("providers", []))
+            if not (0 <= idx < len(providers)):
+                await callback.answer("Модель не найдена.", show_alert=True)
+                return
+
+            if idx == 0:
+                await callback.answer(f"Модель {providers[0].get('model')} уже активна.", show_alert=False)
+                return
+
+            from admin.server import _update_providers_in_config
+            chosen = providers.pop(idx)
+            new_providers = [chosen] + providers
+            try:
+                _update_providers_in_config(new_providers)
+            except Exception as exc:
+                await callback.answer(f"Ошибка: {exc}", show_alert=True)
+                return
+
+            short_name = chosen.get("model", "").split("/")[-1]
+            await callback.answer(f"✅ Выбрана: {short_name}")
+            new_kb = _model_keyboard(new_providers)
+            new_text = _format_models_message(new_providers)
+            try:
+                if callback.message:
+                    await callback.message.edit_text(new_text, reply_markup=new_kb, parse_mode=ParseMode.MARKDOWN)
+            except TelegramBadRequest:
+                try:
+                    if callback.message:
+                        await callback.message.edit_text(new_text, reply_markup=new_kb)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        log.info("бот запущен, разрешено пользователей: %d", len(allowed_users()))
+
+        # Меню команд — косметика, и запуск на нём висеть не должен. Сеть тут
+        # рвётся урывками: этот вызов молча съедал старт целиком, бот не доходил
+        # ни до строки лога, ни до поллинга, и снаружи выглядел мёртвым при живом
+        # процессе. Не вышло — работаем без меню, слэш-команды всё равно живы.
+        try:
+            await asyncio.wait_for(
+                bot.set_my_commands([
+                    BotCommand(command=c, description=d) for c, d in BUILTIN_COMMANDS.items()
+                ]),
+                timeout=10,
+            )
+        except Exception as e:
+            log.warning("меню команд не зарегистрировано (%s) — не мешает работе", type(e).__name__)
+        await dp.start_polling(bot)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
