@@ -177,8 +177,13 @@ def _import_scale_upload(conn, user_id: int, filename: str, data: bytes) -> tupl
                     import zipfile
                     extract_dir = Path(tmp_dir) / "unzipped"
                     extract_dir.mkdir(parents=True, exist_ok=True)
+                    extract_dir_resolved = extract_dir.resolve()
                     with zipfile.ZipFile(tmp_path, "r") as zf:
-                        zf.extractall(extract_dir)
+                        for member in zf.infolist():
+                            member_path = (extract_dir / member.filename).resolve()
+                            if not member_path.is_relative_to(extract_dir_resolved):
+                                continue  # zip slip: entry would escape extract_dir — skip it
+                            zf.extract(member, extract_dir)
                     _migrate_mod.run_scale(conn, user_id, str(extract_dir))
                     _migrate_mod.run_tcx(conn, user_id, str(extract_dir))
                 elif suffix == ".tcx":

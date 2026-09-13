@@ -61,7 +61,7 @@ et al., Diabetes Obes Metab, 2025). Форбс при 42 кг жира даёт 
     обязан быть отражением состава потери. Профицитные сценарии — грубая
     прикидка, а не прогноз;
   - симуляция обрывается, когда жировая масса подходит к неснижаемому минимуму
-    (ESSENTIAL_FAT_PCT). Дальше модель неприменима: правило Форбса при пустом
+    (ESSENTIAL_FAT_PCT_M / ESSENTIAL_FAT_PCT_F). Дальше модель неприменима: правило Форбса при пустом
     депо продолжало бы срезать одну тощую массу и увело бы вес в бессмыслицу;
   - адаптивный термогенез — одно число на весь горизонт, и по умолчанию ноль.
     Согласованной величины в литературе нет: Fothergill et al. (Obesity, 2016)
@@ -105,9 +105,11 @@ MODEL_ERR_LO_PCT = 0.062
 MODEL_ERR_HI_PCT = 0.037
 MODEL_ERR_REF_DAYS = 182
 
-# Неснижаемый жир у мужчин — около 3-5% массы. Ниже этой границы симуляция
-# обрывается: правило Форбса там продолжало бы срезать одну тощую массу.
-ESSENTIAL_FAT_PCT = 0.05
+# Неснижаемый жир — около 3-5% массы у мужчин, ~10-13% у женщин (физиология
+# существенно другая). Ниже этой границы симуляция обрывается: правило Форбса
+# там продолжало бы срезать одну тощую массу.
+ESSENTIAL_FAT_PCT_M = 0.05
+ESSENTIAL_FAT_PCT_F = 0.11
 
 # Диапазон вменяемости для сценарного прихода, ккал/сут. Без него отрицательное
 # или абсурдное число даёт гигантский дефицит и обваливает траекторию за сутки.
@@ -209,6 +211,7 @@ def _simulate(weight_kg: float, fat_kg: float, height_cm: float, age_years: int,
     lean_kg = weight_kg - fat_kg
     out = [weight_kg]
     truncated = None
+    essential_fat_pct = ESSENTIAL_FAT_PCT_F if sex == "f" else ESSENTIAL_FAT_PCT_M
     for day in range(days):
         if truncated is not None:
             out.append(weight_kg)
@@ -228,7 +231,7 @@ def _simulate(weight_kg: float, fat_kg: float, height_cm: float, age_years: int,
         weight_kg = fat_kg + lean_kg
 
         # Неснижаемый жир: ниже него у модели нет ни физиологии, ни данных.
-        if fat_kg <= weight_kg * ESSENTIAL_FAT_PCT:
+        if fat_kg <= weight_kg * essential_fat_pct:
             truncated = day + 1
         out.append(weight_kg)
     return out, truncated

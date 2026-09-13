@@ -45,6 +45,8 @@ def _parse_summary(path: str) -> dict:
             duration_sec = el.text
         elif tag == "HeartRateBpm" and avg_hr is None:
             avg_hr = el.text
+        elif tag == "Lap":
+            in_lap = False
         el.clear()  # освобождаем содержимое узла (включая трекпоинты) сразу после чтения
 
     return {

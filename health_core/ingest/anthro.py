@@ -47,7 +47,10 @@ def parse_text(text: str, default_year: int | None = None) -> list[dict]:
         site, value_raw = lm.groups()
         if site not in SITES:
             continue
-        records.append({"measured_on": measured_on, "site": site, "value": _parse_value(value_raw)})
+        try:
+            records.append({"measured_on": measured_on, "site": site, "value": _parse_value(value_raw)})
+        except ValueError:
+            continue
     return records
 
 

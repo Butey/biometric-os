@@ -333,6 +333,12 @@ def _document(title: str, body_html: str) -> str:
         "}\n"
         "document.addEventListener('DOMContentLoaded', updateThemeUI);\n"
         "</script>\n"
+        "<script>\n"
+        "document.addEventListener('submit', function(e){\n"
+        "  var msg = e.target && e.target.dataset && e.target.dataset.confirm;\n"
+        "  if(msg && !window.confirm(msg)) e.preventDefault();\n"
+        "});\n"
+        "</script>\n"
         f"<style>{_STYLE}</style>\n"
         f"</head><body>\n{body_html}\n</body></html>"
     )
@@ -813,7 +819,8 @@ GUARD_FORM_GROUPS = [
             ("lbm_ratio_min_points", "Мин. точек в окне мышц", "Мин. количество замеров состава тела за окно для расчёта (по умолч. 4)."),
             ("lbm_drift_threshold", "Накопительный дрейф мышц", "Доля потери тощей массы за всё время от старта (по умолч. 0.20 = 20%)."),
             ("ffm_noise_floor_kg", "Порог шума биоимпеданса (кг)", "Если потеря FFM меньше шума весов, алерт не выставляется (по умолч. 0.5 кг)."),
-            ("ffmi_floor", "Минимальный FFMI (кг/м²)", "Критический пол индекса мышечной массы (саркопения, по умолч. 19.0)."),
+            ("ffmi_floor_m", "Минимальный FFMI, мужчины (кг/м²)", "Критический пол индекса мышечной массы для мужчин (саркопения, по умолч. 19.0)."),
+            ("ffmi_floor_f", "Минимальный FFMI, женщины (кг/м²)", "Критический пол индекса мышечной массы для женщин (саркопения, по умолч. 16.0)."),
         ],
     },
     {
@@ -1337,14 +1344,14 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
                     preview = (p["body"][:100] + "…") if len(p["body"]) > 100 else p["body"]
                     kind_label = "Тренировка" if kind == "workout" else "Питание"
                     link = f'<a href="/plans?date={_e(date)}">{kind_label}</a>'
-                    del_form = f"""<form method="post" action="/plans/delete" style="display:inline;margin-left:8px;" onsubmit="return confirm('Удалить план ({kind_label}) на {date}?');">
+                    del_form = f"""<form method="post" action="/plans/delete" style="display:inline;margin-left:8px;" data-confirm="Удалить план ({kind_label}) на {_e(date)}?">
 <input type="hidden" name="csrf" value="{csrf_token}">
 <input type="hidden" name="date" value="{_e(date)}">
 <input type="hidden" name="kind" value="{_e(kind)}">
 <button type="submit" class="btn-del" style="padding:2px 8px;font-size:12px;color:var(--danger);border:1px solid var(--border);border-radius:6px;background:transparent;cursor:pointer;">Удалить</button>
 </form>"""
                     cells.append(
-                        f'<div class="card"><h3>{date}</h3>'
+                        f'<div class="card"><h3>{_e(date)}</h3>'
                         f'<div class="comment" style="display:flex;align-items:center;">{link}{del_form}</div>'
                         f'<pre>{_e(preview)}</pre></div>'
                     )
@@ -1361,7 +1368,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
             k = row["kind"]
             preview = (row["body_preview"][:80] + "…") if len(row["body_preview"]) > 80 else row["body_preview"]
             kind_label = "Тренировка" if k == "workout" else "Питание"
-            del_btn = f"""<form method="post" action="/plans/delete" style="display:inline;" onsubmit="return confirm('Удалить план ({kind_label}) на {d}?');">
+            del_btn = f"""<form method="post" action="/plans/delete" style="display:inline;" data-confirm="Удалить план ({kind_label}) на {_e(d)}?">
 <input type="hidden" name="csrf" value="{csrf_token}">
 <input type="hidden" name="date" value="{_e(d)}">
 <input type="hidden" name="kind" value="{_e(k)}">
@@ -1381,7 +1388,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
     if selected_date and selected_plan:
         kind_label = "Тренировка" if selected_plan["kind"] == "workout" else "Питание"
         back_link = '<a href="/plans">← Вернуться к списку</a>'
-        del_detail = f"""<form method="post" action="/plans/delete" style="display:inline;margin-left:12px;" onsubmit="return confirm('Удалить план ({kind_label}) на {selected_date}?');">
+        del_detail = f"""<form method="post" action="/plans/delete" style="display:inline;margin-left:12px;" data-confirm="Удалить план ({kind_label}) на {_e(selected_date)}?">
 <input type="hidden" name="csrf" value="{csrf_token}">
 <input type="hidden" name="date" value="{_e(selected_date)}">
 <input type="hidden" name="kind" value="{_e(selected_plan['kind'])}">
@@ -1461,7 +1468,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
                 name = _e(m.get("name", "—"))
                 kcal = _n(m.get("kcal"), "{:.0f}")
                 raw_slot = m.get("meal_slot", "")
-                del_m = f"""<form method="post" action="/plans/template/delete" style="display:inline;margin-left:4px;" onsubmit="return confirm('Удалить {slot}?');">
+                del_m = f"""<form method="post" action="/plans/template/delete" style="display:inline;margin-left:4px;" data-confirm="Удалить {slot}?">
 <input type="hidden" name="csrf" value="{csrf_token}">
 <input type="hidden" name="type" value="meal">
 <input type="hidden" name="day_of_week" value="{dow}">
@@ -1479,7 +1486,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
                 kind = _e(w.get("kind", "—"))
                 dur = _n(w.get("duration_min"), "{:.0f}")
                 raw_name = w.get("name", "")
-                del_w = f"""<form method="post" action="/plans/template/delete" style="display:inline;margin-left:4px;" onsubmit="return confirm('Удалить тренировку {name}?');">
+                del_w = f"""<form method="post" action="/plans/template/delete" style="display:inline;margin-left:4px;" data-confirm="Удалить тренировку {name}?">
 <input type="hidden" name="csrf" value="{csrf_token}">
 <input type="hidden" name="type" value="workout">
 <input type="hidden" name="day_of_week" value="{dow}">
@@ -1495,7 +1502,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
 
     clear_template_btn = ""
     if any(meals_by_day.values()) or any(workouts_by_day.values()):
-        clear_template_btn = f"""<form method="post" action="/plans/template/delete" style="display:inline;margin-left:12px;" onsubmit="return confirm('Очистить весь недельный шаблон?');">
+        clear_template_btn = f"""<form method="post" action="/plans/template/delete" style="display:inline;margin-left:12px;" data-confirm="Очистить весь недельный шаблон?">
 <input type="hidden" name="csrf" value="{csrf_token}">
 <input type="hidden" name="type" value="all">
 <button type="submit" style="padding:4px 10px;font-size:12px;color:var(--danger);border:1px solid var(--border);border-radius:6px;background:transparent;cursor:pointer;">Очистить шаблон</button>
@@ -1686,7 +1693,7 @@ def workouts_page(rows: list[dict], stats: dict, sports_efficiency: dict,
             notes_val = r.get("notes") or ""
             source_val = r.get("source") or ("TCX" if r.get("file_hash") and not r.get("file_hash", "").startswith("manual") else "Вручную")
 
-            del_btn = f"""<form method="post" action="/workouts/delete" style="display:inline;" onsubmit="return confirm('Удалить тренировку #{w_id} ({sport_val})?');">
+            del_btn = f"""<form method="post" action="/workouts/delete" style="display:inline;" data-confirm="Удалить тренировку #{w_id} ({_e(sport_val)})?">
 <input type="hidden" name="csrf" value="{csrf_token}">
 <input type="hidden" name="workout_id" value="{w_id}">
 <button type="submit" class="btn-del">✕</button>

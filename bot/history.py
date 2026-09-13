@@ -57,11 +57,14 @@ def load(conn, telegram_id: str) -> list[dict]:
     """Окно последних сообщений: до history_window штук И до history_chars символов,
     что жёстче, срезано строго по границе хода (см. _trim)."""
     _ensure_table(conn)
-    rows = conn.execute(
-        "SELECT ts, role, content FROM chat_history WHERE telegram_user_id=? ORDER BY rowid ASC",
-        (str(telegram_id),),
-    ).fetchall()
     window, chars = _bot_config()
+    rows = conn.execute(
+        "SELECT ts, role, content FROM ("
+        "  SELECT ts, role, content, rowid FROM chat_history WHERE telegram_user_id=? "
+        "  ORDER BY rowid DESC LIMIT ?"
+        ") ORDER BY rowid ASC",
+        (str(telegram_id), window if window > 0 else 0),
+    ).fetchall()
     return [json.loads(r["content"]) for r in _trim(rows, window, chars)]
 
 

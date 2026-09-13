@@ -164,13 +164,21 @@ def _morning_weights(conn: sqlite3.Connection, user_id: int, start: str, end: st
     return [r["weight_kg"] for r in rows]
 
 
-def adaptive_tdee(conn: sqlite3.Connection, user_id: int, window_days: int = 14) -> float | None:
+def adaptive_tdee(
+    conn: sqlite3.Connection, user_id: int, window_days: int = 14, for_date: str | None = None
+) -> float | None:
     """TDEE_факт = средний_intake_Nд + (Δвес_Nд · 7700 / N).
 
     Достоверность требует еду залогированной минимум 11 из 14 дней (порог
     масштабируется пропорционально для нестандартного окна). Иначе — None,
-    калибровка замораживается, а не подгоняется."""
-    end = local_now().date()
+    калибровка замораживается, а не подгоняется.
+
+    Окно по умолчанию заканчивается сегодня (для forecast.py/report.py, которым
+    нужен именно текущий TDEE). daily_target() пересчитывает цель задним числом
+    и обязан передавать свою же дату через for_date, иначе повторный вызов на
+    одну и ту же историческую дату даёт разный результат в зависимости от того,
+    когда он был выполнен — окно "плывёт" вместе с local_now()."""
+    end = datetime.fromisoformat(for_date[:10]).date() if for_date else local_now().date()
     start = end.fromordinal(end.toordinal() - window_days + 1)
     start_s, end_s = start.isoformat(), end.isoformat()
 
@@ -198,7 +206,7 @@ def adaptive_tdee(conn: sqlite3.Connection, user_id: int, window_days: int = 14)
         return None
     delta_weight = weights[-1] - weights[0]
 
-    return mean_intake + (delta_weight * 7700 / window_days)
+    return mean_intake - (delta_weight * 7700 / window_days)
 
 
 def _tcx_net(conn: sqlite3.Connection, user_id: int, date_: str) -> float:
@@ -294,7 +302,7 @@ def _weekday_multiplier(date_: str) -> float:
 
 def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
     bmr = bmr_floor(conn, user_id)
-    adaptive = adaptive_tdee(conn, user_id)
+    adaptive = adaptive_tdee(conn, user_id, for_date=date)
     if adaptive is not None:
         base, seed_tag = adaptive, "adaptive"
     else:
@@ -383,8 +391,14 @@ def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
     protein_g = targets.get("protein_g")
     # Жир считается здесь, а не в targets_for: он доля уже утверждённого
     # калоража. См. config.yaml::fat_pct_of_kcal.
-    fat_pct = targets.get("fat_pct")
-    fat_g = round(kcal * fat_pct / 9, 1) if fat_pct else None
+    # Если действующий пол — macro_minimum, он сам был выведен из fat_pct_min
+    # (см. macro_minimum_kcal), а не из номинального fat_pct. Если здесь всё
+    # равно взять номинальный fat_pct, белок+жир по факту превысят весь kcal
+    # (при protein_g=126, kcal=630 получается 504+189=693>630) — цель станет
+    # физически невыполнимой в трекере. Поэтому на macro_minimum считаем жир
+    # той же долей, что и сам пол.
+    effective_fat_pct = targets.get("fat_pct_min") if floor_reason == "macro_minimum" else targets.get("fat_pct")
+    fat_g = round(kcal * effective_fat_pct / 9, 1) if effective_fat_pct else None
     # Углеводы — остаток калорий после белка (4 ккал/г) и жира (9 ккал/г). Клампим
     # снизу нулём: на очень низкой цели белок+жир могут перекрыть весь калораж.
     carbs_g = None

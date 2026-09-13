@@ -83,6 +83,10 @@ def check_lbm_ratio(conn: sqlite3.Connection, user_id: int):
     ratio, d_weight, d_lean, n = res
     if n < cfg["lbm_ratio_min_points"]:
         return None
+    if d_lean >= 0:
+        # Тощая масса не снижается — это не потеря мышц (набор/рекомпозиция), а
+        # гардрейл про риск катаболизма мышц. Направление важнее модуля дельты.
+        return None
     if abs(d_lean) < cfg["ffm_noise_floor_kg"]:
         return None
     threshold = cfg["lbm_ratio_threshold"]
@@ -116,6 +120,9 @@ def check_lbm_drift(conn: sqlite3.Connection, user_id: int):
             f"меньше {cfg['lbm_ratio_min_points']} для уверенного дрейфа.",
             n, cfg["lbm_ratio_min_points"],
         )
+    if d_lean >= 0:
+        # См. check_lbm_ratio: тощая масса растёт или не меняется — не сигнал катаболизма.
+        return None
     if abs(d_lean) < cfg["ffm_noise_floor_kg"]:
         return None
     threshold = cfg["lbm_drift_threshold"]
@@ -140,12 +147,14 @@ def check_ffmi_floor(conn: sqlite3.Connection, user_id: int):
     ).fetchone()
     if row is None:
         return None
-    urow = conn.execute("SELECT height_cm FROM users WHERE id=?", (user_id,)).fetchone()
+    urow = conn.execute("SELECT height_cm, sex FROM users WHERE id=?", (user_id,)).fetchone()
     if urow is None or urow["height_cm"] is None:
+        return None
+    if urow["sex"] is None:
         return None
     height_m = urow["height_cm"] / 100
     ffmi = row["ffm_kg"] / (height_m ** 2)  # приём BMI, применённый к тощей массе (§10)
-    threshold = cfg["ffmi_floor"]
+    threshold = cfg["ffmi_floor_f"] if urow["sex"] == "f" else cfg["ffmi_floor_m"]
     if ffmi < threshold:
         return _alert("FFMI_FLOOR", "critical", f"FFMI {ffmi:.1f} ниже порога {threshold:.1f}.",
                       round(ffmi, 2), threshold)
@@ -158,7 +167,7 @@ def check_undereating(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
     days, ratio = cfg["undereating_days"], cfg["undereating_ratio"]
     today = _now().date()
-    for i in range(days):
+    for i in range(1, days + 1):
         d = (today - timedelta(days=i)).isoformat()
         target = conn.execute(
             "SELECT kcal_target FROM daily_targets WHERE user_id=? AND date=?", (user_id, d)
@@ -622,7 +631,7 @@ GUARD_DEFINITIONS = {
         "description": "Индекс сухой массы тела FFMI = FFM (кг) / Рост (м)². Аналог ИМТ, исключающий жир.",
         "rationale": "Падение FFMI ниже 19.0 кг/м² для взрослого мужчины означает клиническую саркопению, мышечное истощение, снижение плотности костей и иммунитета.",
         "action": "Полная остановка дефицита калорий. Переход на изокалорийный рацион или лёгкий профицит для восстановления мышечной ткани.",
-        "keys": ["ffmi_floor"],
+        "keys": ["ffmi_floor_m", "ffmi_floor_f"],
     },
     "BMR_FLOOR": {
         "code": "BMR_FLOOR",
@@ -839,7 +848,7 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
                 item["message"] = "Требуется история замеров от базовой точки."
 
         elif code == "FFMI_FLOOR":
-            thresh = cfg["ffmi_floor"]
+            thresh = cfg["ffmi_floor_f"] if sex == "f" else cfg["ffmi_floor_m"]
             item["threshold_val"] = f"≥ {thresh:.1f} кг/м²"
             if last_bm and last_bm["ffm_kg"] and height_cm:
                 ffmi = last_bm["ffm_kg"] / ((height_cm / 100) ** 2)

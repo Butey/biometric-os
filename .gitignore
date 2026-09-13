@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 *.egg-info/
 config.bak
+.claude/scheduled_tasks.lock

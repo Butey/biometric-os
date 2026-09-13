@@ -352,7 +352,9 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
         if not tool_calls:
             return last_text, messages
 
-        results = await asyncio.gather(*(_run_one(call, dispatch) for call in tool_calls))
+        results = []
+        for call in tool_calls:
+            results.append(await _run_one(call, dispatch))
         for call, result in zip(tool_calls, results):
             messages.append({
                 "role": "tool",

@@ -4,18 +4,41 @@ import sqlite3
 from contextvars import ContextVar
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from functools import lru_cache
 from pathlib import Path
 
 import yaml
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
+_config_cache: dict | None = None
+_config_mtime: float | None = None
 
-@lru_cache(maxsize=1)
+
 def load() -> dict:
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    """Читает config.yaml, перечитывая его при изменении mtime файла.
+
+    Раньше был @lru_cache(maxsize=1): кэш никогда не сбрасывался сам по себе,
+    а admin-панель работает отдельным ОС-процессом (bot/main.py запускает её
+    через subprocess.Popen), так что config.load.cache_clear() в её хендлере
+    очищал кэш только в памяти admin-процесса — процесс бота о правке не
+    узнавал и жил на старых порогах, пока его не перезапустят вручную.
+    Проверка mtime работает через файловую систему, а не через сигнал в
+    памяти, поэтому видна из обоих процессов одинаково.
+    """
+    global _config_cache, _config_mtime
+    mtime = CONFIG_PATH.stat().st_mtime
+    if _config_cache is None or mtime != _config_mtime:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            _config_cache = yaml.safe_load(f)
+        _config_mtime = mtime
+    return _config_cache
+
+
+# Совместимость: старые вызовы config.load.cache_clear() (admin/server.py,
+# admin/auth.py, plugin/tools.py) больше не нужны — mtime к моменту вызова
+# уже изменится сам — но пусть остаются безопасным no-op, а не падают с
+# AttributeError на функции, у которой больше нет .cache_clear().
+load.cache_clear = lambda: None
 
 
 # Часовой пояс того, кого сейчас обслуживаем. ContextVar, а не глобалка: два
