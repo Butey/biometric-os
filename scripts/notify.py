@@ -113,8 +113,9 @@ def _user_tz(user_id: int) -> str | None:
         row = conn.execute("SELECT timezone FROM users WHERE id=?", (user_id,)).fetchone()
     finally:
         conn.close()
+    name = (row["timezone"] if row else None) or load_config().get("schedule", {}).get("default_timezone")
     try:
-        return str(ZoneInfo(row["timezone"])) if row and row["timezone"] else None
+        return str(ZoneInfo(name)) if name else None
     except (ZoneInfoNotFoundError, ValueError):
         return None
 

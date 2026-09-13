@@ -244,8 +244,22 @@ journalctl --user-unit health-agent.service -f
 исключение, он ничего не проверяет и печатает текст безусловно, но
 `notify.py --all` в этом случае просто не находит получателей).
 
-Раньше это делал `hermes cron create`. Теперь — обычный cron: команда
-запускает cron-скрипт и доставляет его stdout в телеграм.
+Расписание — один systemd-таймер `health-dispatch`, раз в 10 минут. Он
+запускает `scripts/dispatch.py`, который для КАЖДОГО человека смотрит его
+локальное время (`users.timezone`, иначе `schedule.default_timezone`) и
+отправляет задачи из `config.yaml::schedule.jobs`, чей слот наступил. Время
+задач — местное время человека, сервер может стоять в любом поясе.
+`dispatch_log` в базе не даёт отправить один слот дважды.
+
+```bash
+systemctl link /opt/webapps/health_agent_system/systemd/health-dispatch.service \
+               /opt/webapps/health_agent_system/systemd/health-backup.service
+systemctl enable --now /opt/webapps/health_agent_system/systemd/health-dispatch.timer \
+                       /opt/webapps/health_agent_system/systemd/health-backup.timer
+python scripts/dispatch.py --dry-run   # что ушло бы прямо сейчас
+```
+
+Отправку одной задачи делает `notify.py` — его можно звать и руками:
 
 ```bash
 python scripts/notify.py <script.py> [--to <telegram_id> | --all | --admins]
@@ -270,23 +284,8 @@ LLM: Hermes пересказывал текст `evening_report()` персон�
 детерминированная: `scripts/evening_report.py` печатает готовый текст, LLM в
 расписании не вызывается вовсе (см. комментарий в самом файле).
 
-```bash
-crontab -e
-```
-
-```cron
-0 8 * * *   cd ~/Health_agent_system && .venv/bin/python scripts/notify.py scripts/morning_checkin.py --all
-0 10 * * *  cd ~/Health_agent_system && .venv/bin/python scripts/notify.py scripts/meal_window_check.py --all
-0 14 * * *  cd ~/Health_agent_system && .venv/bin/python scripts/notify.py scripts/meal_window_check.py --all
-0 20 * * *  cd ~/Health_agent_system && .venv/bin/python scripts/notify.py scripts/meal_window_check.py --all
-0 21 * * 0  cd ~/Health_agent_system && .venv/bin/python scripts/notify.py scripts/injection_reminder.py --all
-0 3 * * *   cd ~/Health_agent_system && .venv/bin/python scripts/notify.py scripts/export_backup.py --admins
-0 8 * * 1   cd ~/Health_agent_system && .venv/bin/python scripts/notify.py scripts/weekly_recalc.py --all
-30 21 * * * cd ~/Health_agent_system && .venv/bin/python scripts/notify.py scripts/evening_report.py --all
-```
-
-Путь `~/Health_agent_system` — поправьте под реальное расположение проекта,
-то же самое, что в `health-agent.service`.
+Путь `/opt/webapps/health_agent_system` в юнитах `systemd/` — поправьте под
+реальное расположение проекта, то же самое, что в `health-agent.service`.
 
 ## Откат
 

@@ -1,9 +1,0 @@
-[Unit]
-Description=Health: напоминания о приёмах пищи
-
-[Timer]
-OnCalendar=*-*-* 10,14,20:00:00 Asia/Yekaterinburg
-Unit=health-notify@meal_window_check.service
-
-[Install]
-WantedBy=timers.target

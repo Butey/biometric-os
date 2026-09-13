@@ -1,9 +1,0 @@
-[Unit]
-Description=Health: недельный пересчёт целей
-
-[Timer]
-OnCalendar=Mon *-*-* 08:00:00 Asia/Yekaterinburg
-Unit=health-notify@weekly_recalc.service
-
-[Install]
-WantedBy=timers.target

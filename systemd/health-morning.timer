@@ -1,9 +1,0 @@
-[Unit]
-Description=Health: утренний чек-ин
-
-[Timer]
-OnCalendar=*-*-* 08:00:00 Asia/Yekaterinburg
-Unit=health-notify@morning_checkin.service
-
-[Install]
-WantedBy=timers.target

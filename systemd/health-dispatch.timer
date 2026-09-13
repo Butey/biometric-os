@@ -1,0 +1,10 @@
+[Unit]
+Description=Health: диспетчер уведомлений раз в 10 минут
+
+[Timer]
+# Шаг должен быть меньше schedule.grace_minutes, иначе слоты будут теряться.
+OnCalendar=*:0/10
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

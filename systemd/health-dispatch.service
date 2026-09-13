@@ -1,0 +1,11 @@
+# Уведомления по локальному времени каждого человека — scripts/dispatch.py,
+# расписание в config.yaml::schedule. Ночной бэкап — отдельно, health-backup.
+[Unit]
+Description=Health: диспетчер уведомлений по часовым поясам
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/webapps/health_agent_system
+ExecStart=/opt/webapps/health_agent_system/.venv/bin/python scripts/dispatch.py

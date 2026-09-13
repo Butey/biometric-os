@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -340,6 +340,17 @@ CREATE TABLE IF NOT EXISTS persona_styles (
 
 -- v15: анализы, введённые текстом (health_core/labs.py). Одна строка на
 -- показатель в день: повторный ввод того же дня исправляет значение.
+-- v16: журнал отправленных по расписанию уведомлений (scripts/dispatch.py).
+-- slot_key = задача@локальная дата и время слота человека: таймер может
+-- сработать дважды в окне слота, UNIQUE не даёт отправить повторно.
+CREATE TABLE IF NOT EXISTS dispatch_log (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    slot_key TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    UNIQUE(user_id, slot_key)
+);
+
 CREATE TABLE IF NOT EXISTS lab_results (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id),
@@ -463,6 +474,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         if row["version"] < 14:
             _migrate_v13_to_v14(conn)
         # v14->v15 — только новые таблицы lab_results и sick_days, отдельного шага не нужно.
+        # v15->v16 — только новая таблица dispatch_log.
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 

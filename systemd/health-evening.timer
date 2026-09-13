@@ -1,9 +1,0 @@
-[Unit]
-Description=Health: вечерний отчёт
-
-[Timer]
-OnCalendar=*-*-* 21:30:00 Asia/Yekaterinburg
-Unit=health-notify@evening_report.service
-
-[Install]
-WantedBy=timers.target

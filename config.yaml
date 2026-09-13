@@ -166,6 +166,24 @@ sick:
   # искажены сдвигами жидкости, аппетит возвращается не сразу
   quiet_after_days: 2
 
+# Расписание уведомлений — scripts/dispatch.py, запускается таймером раз в 10 минут.
+# Время задач — ЛОКАЛЬНОЕ время каждого человека (users.timezone), а не сервера.
+schedule:
+  # пояс для людей, у которых он не записан в профиле
+  default_timezone: Europe/Moscow
+  # сколько минут после слота задача ещё считается своевременной. Больше периода
+  # таймера — чтобы опоздавший запуск не терял слот; меньше часа — чтобы
+  # meal_window_check, выбирающий окно по текущему часу, попадал в нужный час.
+  grace_minutes: 25
+  jobs:
+    - {script: morning_checkin, at: "08:00"}
+    - {script: meal_window_check, at: "10:00"}
+    - {script: meal_window_check, at: "14:00"}
+    - {script: meal_window_check, at: "20:00"}
+    - {script: evening_report, at: "21:30"}
+    - {script: injection_reminder, at: "21:00", days: [sun]}
+    - {script: weekly_recalc, at: "08:00", days: [mon]}
+
 # Пайплайны ввода и миграция истории (§08, §12) — health_core/ingest/.
 ingest:
   # разрыв между замерами внутри одной серии на весах, сек — кластеризация по
