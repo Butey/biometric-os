@@ -1,0 +1,10 @@
+[Unit]
+Description=Health: ночной бэкап базы
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 Asia/Yekaterinburg
+Persistent=true
+Unit=health-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -13,6 +13,8 @@ sys.stdout.reconfigure(encoding="utf-8")  # VPS-локаль не гаранти
 
 from health_core.db import connect, migrate
 from health_core.report import status_bar
+from health_core.guards import check_all
+from health_core.chrono import caffeine_cutoff
 
 
 def main() -> int:
@@ -35,7 +37,17 @@ def main() -> int:
     blocks = []
     for u in users:
         try:
-            blocks.append(status_bar(conn, u["id"]))
+            block_lines = [status_bar(conn, u["id"])]
+            # Кофеиновое окно
+            cutoff = caffeine_cutoff(conn, u["id"])
+            if cutoff is not None:
+                block_lines.append(f"☕ Кофеин — последний не позже {cutoff}.")
+            # BINGE_RISK alert
+            alerts = check_all(conn, u["id"])
+            for alert in alerts:
+                if alert.get("code") == "BINGE_RISK":
+                    block_lines.append(f"⚠ {alert['message']}")
+            blocks.append("\n".join(block_lines))
         except Exception as e:
             blocks.append(f"user_id={u['id']}: чек-ин не удался: {e}")
     conn.close()

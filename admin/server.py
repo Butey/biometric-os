@@ -29,7 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root: for `migrate` and `plugin`
 
 from admin import auth, pages, upload
-from health_core.config import CONFIG_PATH, load as load_config
+from health_core.config import CONFIG_PATH, load as load_config, user_today
 from health_core.db import DB_PATH, connect, migrate as db_migrate
 _connect = connect
 from health_core.energy import daily_target
@@ -115,7 +115,7 @@ def _run_action(conn, user_id: int, action: str) -> str:
             path = backup_db(str(DB_PATH), backup_dir)
             return f"Бэкап создан: {path}"
         if action == "recalc":
-            today = date.today().isoformat()
+            today = user_today(conn, user_id)
             result = daily_target(conn, user_id, today)
             return f"Цель на {today}: {result['kcal']:.0f} ккал (source={result['source']})"
         if action == "import":
@@ -586,7 +586,7 @@ class Handler(BaseHTTPRequestHandler):
             if user_id is None:
                 body = pages.no_user_page()
                 return self._html(200, pages.layout("Дашборд", body, sess["csrf"], active="dashboard"))
-            today = date.today().isoformat()
+            today = user_today(conn, user_id)
             alerts = check_all(conn, user_id)
             tr = trends(conn, user_id, 90)
             latest = conn.execute(
@@ -1010,7 +1010,7 @@ class Handler(BaseHTTPRequestHandler):
                 from health_core.plans import get_plan
 
                 # Get user today date
-                today_str = datetime.now().strftime("%Y-%m-%d")
+                today_str = user_today(conn, user_id)
 
                 # Fetch today's plans
                 for kind in ["workout", "meal"]:

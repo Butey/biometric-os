@@ -783,7 +783,7 @@ def dashboard_page(alerts: list[dict], tr: dict, latest, target: dict | None,
 <div class="card">
   <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
     <h3 style="margin:0;">Гардрейлы безопасности</h3>
-    <a href="/guards" style="font-size:12px;font-weight:600;color:var(--accent);text-decoration:none;">Управление и все 14 правил &rarr;</a>
+    <a href="/guards" style="font-size:12px;font-weight:600;color:var(--accent);text-decoration:none;">Управление и все правила &rarr;</a>
   </div>
   {guards_html}
 </div>
@@ -869,6 +869,17 @@ GUARD_FORM_GROUPS = [
             ("stale_calib_window_days", "Окно проверки дневника (дней)", "Длина окна проверки непрерывности пищевого дневника (по умолч. 14)."),
             ("no_measure_days", "Дней без замеров (строго)", "Порог длительного отсутствия антропометрии и веса (по умолч. 7 дней)."),
             ("measure_soon_after_days", "Дней до напоминания о замере", "Мягкое превентивное напоминание для ритма мониторинга (по умолч. 5 дней)."),
+        ],
+    },
+    {
+        "category": "🍽️ Риск пищевого срыва (триада)",
+        "desc": "Совпадение накопленного дефицита калорий, короткого сна и нехватки белка на завтрак — предиктор компульсивного переедания.",
+        "fields": [
+            ("binge_window_days", "Окно накопленного дефицита (дней)", "Длина окна для суммарного дефицита калорий, заканчивающегося вчера (по умолч. 5)."),
+            ("binge_deficit_kcal", "Порог накопленного дефицита (ккал)", "Суммарный дефицит за окно, выше которого фактор срыва считается сработавшим (по умолч. 3500 ккал)."),
+            ("binge_sleep_min", "Мин. сон прошлой ночью (мин)", "Порог продолжительности сна; короче — фактор недосыпа сработал (по умолч. 390 мин = 6ч30м)."),
+            ("binge_breakfast_protein_g", "Мин. белок на завтрак (г)", "Порог белка в завтраке; меньше (или завтрак пропущен после полудня) — фактор сработал (по умолч. 20 г)."),
+            ("binge_min_factors", "Мин. факторов для триады", "Сколько из трёх факторов должны совпасть, чтобы сработал гардрейл (по умолч. 2 из 3)."),
         ],
     },
 ]
@@ -1040,7 +1051,7 @@ def guards_page(guards_status: list[dict], guards_cfg: dict, comments: dict[str,
 {active_html}
 <div class="card">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
-    <h2 style="margin:0;">Мониторинг всех 14 правил</h2>
+    <h2 style="margin:0;">Мониторинг всех правил</h2>
     <span class="comment">Данные обновляются в реальном времени</span>
   </div>
   {"".join(catalog_blocks)}

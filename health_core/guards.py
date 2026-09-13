@@ -544,6 +544,104 @@ def check_measure_soon(conn: sqlite3.Connection, user_id: int):
     return None
 
 
+# ---------------------------------------------------------------- BINGE_RISK
+
+def check_binge_risk(conn: sqlite3.Connection, user_id: int):
+    """Триада риска пищевого срыва: накопленный дефицит калорий за окно,
+    короткий сон прошлой ночью, мало белка на завтрак (или завтрак пропущен).
+
+    Каждый фактор — True/False/None(неизвестно). Неизвестный фактор никогда не
+    считается сработавшим — гардрейл молчит на тонких данных, а не гадает."""
+    from health_core import energy
+
+    cfg = _cfg()
+    now = _now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+    window_days = cfg["binge_window_days"]
+
+    # --- фактор 1: накопленный дефицit за window_days дней, заканчивающихся вчера
+    deficit_fired = None
+    deficit_msg = None
+    tdee = energy.adaptive_tdee(conn, user_id, for_date=yesterday.isoformat())
+    if tdee is not None:
+        window_start = yesterday - timedelta(days=window_days - 1)
+        logged_days = 0
+        deficit_sum = 0.0
+        for i in range(window_days):
+            d = (window_start + timedelta(days=i)).isoformat()
+            row = conn.execute(
+                "SELECT COUNT(*) n, COALESCE(SUM(fi.kcal),0) kcal FROM food_log fl "
+                "JOIN food_items fi ON fi.food_log_id=fl.id "
+                "WHERE fl.user_id=? AND date(fl.eaten_at)=?", (user_id, d),
+            ).fetchone()
+            if row["n"] > 0:
+                logged_days += 1
+                deficit_sum += tdee - row["kcal"]
+        if logged_days >= window_days - 1:
+            threshold_deficit = cfg["binge_deficit_kcal"]
+            deficit_fired = deficit_sum > threshold_deficit
+            if deficit_fired:
+                deficit_msg = (
+                    f"дефицит {deficit_sum:.0f} ккал за {window_days} дн "
+                    f"(порог {threshold_deficit:.0f})"
+                )
+
+    # --- фактор 2: сон прошлой ночью (night_date = сегодняшнее утреннее пробуждение)
+    sleep_fired = None
+    sleep_msg = None
+    sleep_row = conn.execute(
+        "SELECT duration_min FROM sleep_log WHERE user_id=? AND night_date=?",
+        (user_id, today.isoformat()),
+    ).fetchone()
+    if sleep_row is not None and sleep_row["duration_min"] is not None:
+        duration = sleep_row["duration_min"]
+        threshold_sleep = cfg["binge_sleep_min"]
+        sleep_fired = duration < threshold_sleep
+        if sleep_fired:
+            h, m = divmod(duration, 60)
+            th_h, th_m = divmod(threshold_sleep, 60)
+            sleep_msg = f"сон {h} ч {m} мин (< {th_h} ч {th_m} мин)"
+
+    # --- фактор 3: белок на завтрак (или завтрак пропущен при активном логировании)
+    protein_fired = None
+    protein_msg = None
+    today_iso = today.isoformat()
+    threshold_protein = cfg["binge_breakfast_protein_g"]
+    breakfast = conn.execute(
+        "SELECT COUNT(*) n, COALESCE(SUM(fi.protein_g),0) p FROM food_log fl "
+        "JOIN food_items fi ON fi.food_log_id=fl.id "
+        "WHERE fl.user_id=? AND date(fl.eaten_at)=? AND fl.meal_slot='breakfast'",
+        (user_id, today_iso),
+    ).fetchone()
+    if breakfast["n"] > 0:
+        protein = breakfast["p"]
+        protein_fired = protein < threshold_protein
+        if protein_fired:
+            protein_msg = f"белок на завтрак {protein:.0f} г (< {threshold_protein:.0f} г)"
+    else:
+        any_food_today = conn.execute(
+            "SELECT COUNT(*) n FROM food_log WHERE user_id=? AND date(eaten_at)=?",
+            (user_id, today_iso),
+        ).fetchone()["n"] > 0
+        if now.hour >= 12 and any_food_today:
+            protein_fired = True
+            protein_msg = "завтрака нет"
+
+    fired_msgs = [m for fired, m in ((deficit_fired, deficit_msg), (sleep_fired, sleep_msg),
+                                     (protein_fired, protein_msg)) if fired]
+    fired_count = len(fired_msgs)
+    min_factors = cfg["binge_min_factors"]
+    if fired_count < min_factors:
+        return None
+    severity = "critical" if fired_count == 3 else "warning"
+    message = (
+        f"Триада риска срыва ({fired_count} из 3 факторов): " + "; ".join(fired_msgs) +
+        ". Нужен полноценный белковый приём пищи, не углублять дефицит сегодня."
+    )
+    return _alert("BINGE_RISK", severity, message, fired_count, min_factors)
+
+
 # ---------------------------------------------------------------- диспетчер
 
 _CHECKS = (
@@ -561,6 +659,7 @@ _CHECKS = (
     check_protein_skew,
     check_glucose_volatility,
     check_measure_soon,
+    check_binge_risk,
 )
 
 
@@ -743,11 +842,21 @@ GUARD_DEFINITIONS = {
         "action": "Запланировать замер на ближайшее утро.",
         "keys": ["measure_soon_after_days"],
     },
+    "BINGE_RISK": {
+        "code": "BINGE_RISK",
+        "name": "Риск пищевого срыва (триада)",
+        "category": "Питание и калории",
+        "default_severity": "warning",
+        "description": "Триада факторов риска срыва: накопленный дефицит калорий за окно, короткий сон прошлой ночью, мало белка на завтрак (или завтрак пропущен). Срабатывает при совпадении не менее двух факторов из трёх.",
+        "rationale": "Ограничение сна повышает грелин и снижает лептин, усиливая голод и тягу к калорийной еде (Spiegel et al., 2004). Большой накопленный дефицит энергии сам по себе провоцирует компенсаторное переедание. Более высокобелковый завтрак повышает насыщение и снижает потребление калорий в течение дня (Leidy et al., 2013). По отдельности факторы шумные, но их совпадение — устойчивый предиктор срыва.",
+        "action": "Полноценный белковый приём пищи в ближайшее время, не углублять дефицит сегодня.",
+        "keys": ["binge_window_days", "binge_deficit_kcal", "binge_sleep_min", "binge_breakfast_protein_g", "binge_min_factors"],
+    },
 }
 
 
 def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
-    """Детальный срез по всем 14 гардрейлам с реальными значениями, статусами,
+    """Детальный срез по всем 15 гардрейлам с реальными значениями, статусами,
     порогами и обоснованиями для панели управления и дашборда."""
     alerts = check_all(conn, user_id)
     fired_map = {a["code"]: a for a in alerts}
@@ -819,6 +928,9 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
             elif code in ("NO_MEASURE", "MEASURE_SOON"):
                 item["current_val"] = f"{val} дн. без замеров" if isinstance(val, (int, float)) else str(val)
                 item["threshold_val"] = f"< {thr} дн."
+            elif code == "BINGE_RISK":
+                item["current_val"] = f"{val} из 3 факторов" if isinstance(val, (int, float)) else str(val)
+                item["threshold_val"] = f"< {thr} факторов" if isinstance(thr, (int, float)) else str(thr)
             else:
                 item["current_val"] = str(val) if val is not None else "—"
                 item["threshold_val"] = str(thr) if thr is not None else "—"
@@ -954,6 +1066,10 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
             else:
                 item["status"] = "nodata"
                 item["current_val"] = "Нет замеров"
+
+        elif code == "BINGE_RISK":
+            item["threshold_val"] = f"< {cfg['binge_min_factors']} факторов"
+            item["current_val"] = "Триада не выявлена"
 
         results.append(item)
 
@@ -1452,5 +1568,87 @@ if __name__ == "__main__":
             print("OK: деградация окна (1 точка) вернула None как ожидается")
 
             print("Все тесты медианы для LBM_RATIO прошли.")
+
+            # ---------------------------------------------------------------- BINGE_RISK tests
+            import health_core.energy as energy_mod
+
+            def _add_binge_food(uid, days_ago, kcal, protein_g=10.0, meal_slot=None, hour=13):
+                d = (_now().date() - timedelta(days=days_ago)).isoformat()
+                ts = f"{d} {hour:02d}:00:00"
+                conn.execute("INSERT INTO food_log(user_id, eaten_at, meal_slot) VALUES (?,?,?)", (uid, ts, meal_slot))
+                flid = conn.execute("SELECT last_insert_rowid() id").fetchone()["id"]
+                conn.execute(
+                    "INSERT INTO food_items(food_log_id, kcal, protein_g, fat_g, carbs_g) VALUES (?,?,?,?,?)",
+                    (flid, kcal, protein_g, 10, 10),
+                )
+
+            def _add_binge_sleep(uid, night_date, duration_min):
+                conn.execute(
+                    "INSERT INTO sleep_log(user_id, night_date, duration_min) VALUES (?,?,?)",
+                    (uid, night_date, duration_min),
+                )
+
+            _now_real = _now
+            orig_adaptive_tdee = energy_mod.adaptive_tdee
+            today_iso = _now().date().isoformat()
+
+            # Сценарий A: все три фактора -> critical
+            u40 = make_user(140, height_cm=185, created_days_ago=30)
+            energy_mod.adaptive_tdee = lambda conn, user_id, window_days=14, for_date=None: 2500.0
+            for days_ago in range(1, 5):  # 4 из 5 дней окна залогированы (>= window-1)
+                _add_binge_food(u40, days_ago, 700)  # дефицит (2500-700)*4 = 7200 > 3500
+            _add_binge_sleep(u40, today_iso, 300)  # < 390 мин
+            _add_binge_food(u40, 0, 300, protein_g=10.0, meal_slot="breakfast")  # < 20 г
+            conn.commit()
+            alerts40 = check_all(conn, u40)
+            binge40 = [a for a in alerts40 if a["code"] == "BINGE_RISK"]
+            assert binge40, f"BINGE_RISK должен сработать при всех 3 факторах, получили {alerts40}"
+            assert binge40[0]["severity"] == "critical", f"3 фактора -> critical, получили {binge40[0]}"
+
+            # Сценарий B: ровно 2 фактора (завтрак в норме) -> warning
+            u41 = make_user(141, height_cm=185, created_days_ago=30)
+            for days_ago in range(1, 5):
+                _add_binge_food(u41, days_ago, 700)
+            _add_binge_sleep(u41, today_iso, 300)
+            _add_binge_food(u41, 0, 300, protein_g=25.0, meal_slot="breakfast")  # >= 20 г, не сработал
+            conn.commit()
+            alerts41 = check_all(conn, u41)
+            binge41 = [a for a in alerts41 if a["code"] == "BINGE_RISK"]
+            assert binge41, f"BINGE_RISK должен сработать при 2 факторах, получили {alerts41}"
+            assert binge41[0]["severity"] == "warning", f"2 фактора -> warning, получили {binge41[0]}"
+
+            # Сценарий C: только 1 фактор (сон) -> None
+            u42 = make_user(142, height_cm=185, created_days_ago=30)
+            energy_mod.adaptive_tdee = lambda conn, user_id, window_days=14, for_date=None: None
+            _add_binge_sleep(u42, today_iso, 300)  # сон сработал в одиночку, еды сегодня нет
+            conn.commit()
+            alerts42 = check_all(conn, u42)
+            binge42 = [a for a in alerts42 if a["code"] == "BINGE_RISK"]
+            assert not binge42, f"BINGE_RISK не должен сработать при 1 факторе, получили {alerts42}"
+
+            # Сценарий D: нет сна, tdee=None, нет еды сегодня -> None (все три неизвестны)
+            u43 = make_user(143, height_cm=185, created_days_ago=30)
+            conn.commit()
+            alerts43 = check_all(conn, u43)
+            binge43 = [a for a in alerts43 if a["code"] == "BINGE_RISK"]
+            assert not binge43, f"BINGE_RISK должен молчать без данных (все факторы неизвестны), получили {alerts43}"
+
+            # Сценарий E: завтрак пропущен после 12:00 при активном логировании + короткий
+            # сон -> 2 фактора (дефицит неизвестен, tdee=None), warning
+            u44 = make_user(144, height_cm=185, created_days_ago=30)
+            _now = lambda: _now_real().replace(hour=13, minute=0, second=0, microsecond=0)
+            _add_binge_food(u44, 0, 500, protein_g=15.0, meal_slot="lunch", hour=13)  # еда сегодня, не завтрак
+            _add_binge_sleep(u44, today_iso, 300)
+            conn.commit()
+            alerts44 = check_all(conn, u44)
+            _now = _now_real
+            binge44 = [a for a in alerts44 if a["code"] == "BINGE_RISK"]
+            assert binge44, f"BINGE_RISK должен считать пропущенный завтрак после 12:00 фактором, получили {alerts44}"
+            assert "завтрака нет" in binge44[0]["message"], f"сообщение должно упоминать пропуск завтрака: {binge44[0]}"
+            assert binge44[0]["severity"] == "warning", f"2 фактора -> warning, получили {binge44[0]}"
+
+            energy_mod.adaptive_tdee = orig_adaptive_tdee
+            print("OK: BINGE_RISK — 3 фактора critical, 2 фактора warning, 1 фактор молчит, "
+                  "без данных молчит, пропуск завтрака после 12:00 засчитан как фактор")
         finally:
             conn.close()

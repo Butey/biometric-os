@@ -854,6 +854,96 @@ def handle_log_glucose(params: dict) -> str:
 
 
 @_handler_wrapper
+def handle_log_labs(params: dict) -> str:
+    """Log lab results with automatic validation and derived calculations."""
+    conn = connect()
+    migrate(conn)
+    user_id = _get_user_id(params, conn)
+
+    action = (params.get("action") or "add").lower()
+
+    # ── Delete action ──
+    if action == "delete":
+        try:
+            lab_id = int(params.get("lab_id"))
+        except (TypeError, ValueError):
+            conn.close()
+            return json.dumps(
+                {"error": "Нужен lab_id — номер записи анализа"},
+                ensure_ascii=False
+            )
+        from health_core import labs as _labs
+        deleted = _labs.delete(conn, user_id, lab_id)
+        conn.close()
+        if not deleted:
+            return json.dumps(
+                {"error": f"Записи #{lab_id} нет"},
+                ensure_ascii=False
+            )
+        return json.dumps(
+            {"ok": f"Удалена запись анализа #{lab_id}"},
+            ensure_ascii=False
+        )
+
+    # ── List action ──
+    if action == "list":
+        limit = int(params.get("limit") or 30)
+        if limit < 1:
+            limit = 30
+        from health_core import labs as _labs
+        history = _labs.history(conn, user_id, limit=limit)
+        conn.close()
+        return json.dumps({"labs": history}, ensure_ascii=False)
+
+    # ── Derived action ──
+    if action == "derived":
+        from health_core import labs as _labs
+        d = _labs.derived(conn, user_id)
+        conn.close()
+        if not d:
+            return json.dumps({
+                "derived": {},
+                "hint": "Нужны: глюкоза и инсулин в один день; креатинин плюс пол и дата рождения в профиле; общий холестерин и ЛПВП в один день; HbA1c."
+            }, ensure_ascii=False)
+        return json.dumps({"derived": d}, ensure_ascii=False)
+
+    # ── Add action (default) ──
+    if action != "add":
+        conn.close()
+        return json.dumps(
+            {"error": f"Неизвестное действие {action!r}. Допустимо: add, list, delete, derived"},
+            ensure_ascii=False
+        )
+
+    markers = params.get("markers") or {}
+    if not markers:
+        conn.close()
+        return json.dumps(
+            {"error": "Нужны показатели markers: {название: число}"},
+            ensure_ascii=False
+        )
+
+    taken_on = params.get("taken_on") or _today_iso()
+    notes = params.get("notes")
+
+    from health_core import labs as _labs
+    try:
+        result = _labs.save(conn, user_id, taken_on, markers, notes=notes)
+    except ValueError as e:
+        conn.close()
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    derived = _labs.derived(conn, user_id)
+    conn.close()
+
+    return json.dumps({
+        "saved": result["saved"],
+        "rejected": result["rejected"],
+        "derived": derived
+    }, ensure_ascii=False)
+
+
+@_handler_wrapper
 def handle_log_weight(params: dict) -> str:
     """Log body metrics and return delta to previous measurement."""
     conn = connect()
@@ -2536,7 +2626,23 @@ def _pharma_due(next_at: str) -> str:
     return f"{label} ({rel})"
 
 
-def _render_pharma(rows, last) -> str:
+def _glp1_line(glp: dict) -> str:
+    """Строка про оценочный уровень тирзепатида для _render_pharma.
+
+    Формат оценки, не факта: цифры из health_core.glp1 — фармакокинетическая
+    прикидка по вкладышу препарата, а не измерение. Никаких калорий/таргетов
+    отсюда не считается — только ориентир для планирования дня."""
+    parts = [f"Уровень ≈ {glp['level_pct']}% ({glp['phase']})"]
+    if glp.get("peak_at"):
+        pk = _dt(glp["peak_at"])
+        parts.append(f"пик {_PHARMA_DOW[pk.weekday()]} {pk.strftime('%d.%m')}")
+    if glp.get("trough_at"):
+        tr = _dt(glp["trough_at"])
+        parts.append(f"минимум {_PHARMA_DOW[tr.weekday()]} {tr.strftime('%d.%m %H:%M')}")
+    return " · ".join(parts) + f" — оценка по T½ {glp.get('half_life_days', 5)} дн"
+
+
+def _render_pharma(rows, last, glp=None) -> str:
     lines = ["💊 Фарма"]
     if not rows:
         lines.append("Расписаний нет. Задай: pharma schedule.")
@@ -2546,6 +2652,8 @@ def _render_pharma(rows, last) -> str:
         lines.append(f"\n{r['substance']} · {dose}{route}")
         if r["next_at"]:
             lines.append(f"  Следующая: {_pharma_due(r['next_at'])}")
+            if glp is not None and _canon_med(r["substance"]) == _canon_med("Тирзепатид"):
+                lines.append(f"  {_glp1_line(glp)}")
         if r["every_days"]:
             lines.append(f"  Каждые {r['every_days']} дн")
         if r["stock_doses"] is not None:
@@ -2578,8 +2686,15 @@ def handle_pharma(params: dict) -> str:
             "SELECT at, substance, dose, unit FROM med_log WHERE user_id=? ORDER BY at DESC LIMIT 1",
             (user_id,),
         ).fetchone()
+        # Оценка уровня — вспомогательная; сбой в ней не должен рушить статус фармы.
+        glp = None
+        try:
+            from health_core import glp1
+            glp = glp1.profile(conn, user_id)
+        except Exception:
+            glp = None
         conn.close()
-        return json.dumps({"pharma": _render_pharma(rows, last)}, ensure_ascii=False)
+        return json.dumps({"pharma": _render_pharma(rows, last, glp=glp)}, ensure_ascii=False)
 
     substance = _canon_med(params.get("substance"))
     if not substance:
@@ -3706,7 +3821,7 @@ def _admin_status() -> str:
 
 
 def _admin_guards() -> str:
-    """Детальный статус по всем 14 гардрейлам с обоснованиями."""
+    """Детальный статус по всем гардрейлам с обоснованиями."""
     conn = None
     try:
         conn = connect()
@@ -3718,7 +3833,7 @@ def _admin_guards() -> str:
         ok_count = sum(1 for g in status_list if g["status"] == "ok")
         nodata_count = sum(1 for g in status_list if g["status"] == "nodata")
 
-        lines = ["🛡️ Мониторинг гардрейлов безопасности (14 правил):"]
+        lines = ["🛡️ Мониторинг гардрейлов безопасности:"]
         if active:
             lines.append(f"\n⚠️ Активные предупреждения ({len(active)}):")
             for a in active:
@@ -4180,6 +4295,7 @@ def register(ctx):
         ("log_food", handle_log_food, schemas.log_food_schema),
         ("log_water", handle_log_water, schemas.log_water_schema),
         ("log_glucose", handle_log_glucose, schemas.log_glucose_schema),
+        ("log_labs", handle_log_labs, schemas.log_labs_schema),
         ("log_sleep", handle_log_sleep, schemas.log_sleep_schema),
         ("log_weight", handle_log_weight, schemas.log_weight_schema),
         ("log_anthropometry", handle_log_anthropometry, schemas.log_anthropometry_schema),
@@ -4300,7 +4416,7 @@ if __name__ == "__main__":
         register(ctx)
 
         expected_tools = {
-            "log_food", "log_water", "log_glucose", "log_sleep", "log_weight",
+            "log_food", "log_water", "log_glucose", "log_labs", "log_sleep", "log_weight",
             "equipment", "plan_day", "log_workout", "refeed", "forecast",
             "log_anthropometry", "log_med", "pharma", "plans", "import_scale_export",
             "get_day_summary", "get_trends", "get_status_bar",
@@ -4336,6 +4452,49 @@ if __name__ == "__main__":
 
         print(f"OK: log_water returned valid JSON with alerts")
         print(f"Result: {result}")
+
+        print("\n" + "="*60)
+        print("TEST 2b: log_labs handler")
+        print("="*60)
+
+        handler = ctx.tools["log_labs"]["handler"]
+        result_json = handler({
+            "action": "add",
+            "taken_on": "2026-09-01",
+            "markers": {"глюкоза": 5.0, "инсулин": 10, "foo": 1},
+            "user_id": uid
+        })
+        result = json.loads(result_json)
+
+        assert "saved" in result, f"Missing 'saved' key in result: {result}"
+        assert "rejected" in result, f"Missing 'rejected' key in result: {result}"
+        assert "derived" in result, f"Missing 'derived' key in result: {result}"
+        assert result["saved"].get("glucose") == 5.0, f"Expected glucose saved, got {result['saved']}"
+        assert result["saved"].get("insulin") == 10, f"Expected insulin saved, got {result['saved']}"
+        assert "foo" in result["rejected"], f"Expected 'foo' to be rejected, got {result['rejected']}"
+        assert "homa_ir" in result["derived"], f"Expected homa_ir in derived, got {result['derived']}"
+        homa_value = result["derived"]["homa_ir"]["value"]
+        assert abs(homa_value - 2.22) < 0.02, f"Expected HOMA-IR ≈ 2.22, got {homa_value}"
+
+        print(f"OK: log_labs add with valid/invalid markers and derived HOMA-IR")
+
+        # Test list action
+        result_json = handler({"action": "list", "limit": 10, "user_id": uid})
+        result = json.loads(result_json)
+        assert "labs" in result, f"Missing 'labs' key in list result: {result}"
+        assert isinstance(result["labs"], list), f"Expected labs to be list, got {type(result['labs'])}"
+        assert len(result["labs"]) >= 1, f"Expected at least 1 lab record, got {len(result['labs'])}"
+
+        lab_id = result["labs"][0]["id"]
+        print(f"OK: log_labs list returns history")
+
+        # Test delete action
+        result_json = handler({"action": "delete", "lab_id": lab_id, "user_id": uid})
+        result = json.loads(result_json)
+        assert "ok" in result, f"Expected 'ok' in delete result, got {result}"
+        assert f"#{lab_id}" in result["ok"], f"Expected lab_id in ok message"
+
+        print(f"OK: log_labs delete removes a record")
 
         print("\n" + "="*60)
         print("TEST 3: get_status_bar byte-identity")
@@ -5517,6 +5676,7 @@ if __name__ == "__main__":
             "forecast": {"intake_kcal": 1500},
             "log_water": {"ml": 250},
             "log_glucose": {"mmol_l": 5.5},
+            "log_labs": {"markers": {"glucose": 5.0, "insulin": 10}},
             "log_sleep": {"duration_min": 480},
             "log_weight": {"weight_kg": 80.0},
             "log_anthropometry": {"site": "талия", "value_cm": 85.0},

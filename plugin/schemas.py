@@ -727,3 +727,40 @@ admin_cmd_schema = {
     },
     "required": ["command"]
 }
+
+log_labs_schema = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["add", "list", "delete", "derived"],
+            "description": "add (умолчание) — записать показатели на дату сдачи; list — история анализов; delete — удалить по lab_id; derived — расчётные показатели HOMA-IR, eGFR, non-HDL, eAG"
+        },
+        "taken_on": {
+            "type": "string",
+            "description": "Дата сдачи анализа YYYY-MM-DD, по умолчанию сегодня"
+        },
+        "markers": {
+            "type": "object",
+            "additionalProperties": {"type": "number"},
+            "description": "Словарь показателей: название (глюкоза, инсулин, HbA1c, креатинин, общий холестерин, ЛПВП, ЛПНП, триглицериды, АЛТ, АСТ) → числовое значение. Единицы: ммоль/л, мкЕд/мл, %, мкмоль/л, Ед/л. Обязателен для action=add"
+        },
+        "notes": {
+            "type": "string",
+            "description": "Свободный комментарий к анализу"
+        },
+        "lab_id": {
+            "type": "integer",
+            "description": "ID анализа для action=delete"
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Максимум записей для action=list (по умолчанию 30)"
+        },
+        "user_id": {
+            "type": "integer",
+            "description": "ID пользователя"
+        }
+    },
+    "required": []
+}

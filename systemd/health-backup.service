@@ -1,0 +1,7 @@
+[Unit]
+Description=Health notify: export_backup (админам)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/webapps/health_agent_system
+ExecStart=/opt/webapps/health_agent_system/.venv/bin/python scripts/notify.py scripts/export_backup.py --admins

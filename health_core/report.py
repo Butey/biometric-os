@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 from health_core.config import load, local_now, targets_for
 from health_core.guards import check_all
+from health_core.chrono import eating_window, late_load
 
 MINUS = "−"  # настоящий минус, не дефис — так в §07
 
@@ -244,6 +245,15 @@ def evening_report(conn: sqlite3.Connection, user_id: int, date: str) -> str:
         lines.append(f"Съедено {d['kcal_eaten']:.0f} ккал, цель не рассчитана.")
     if d["water_target_ml"]:
         lines.append(f"Вода {d['water_ml'] / 1000:.1f} / {d['water_target_ml'] / 1000:.1f} л.")
+    window = eating_window(conn, user_id, date)
+    if window is not None:
+        lines.append(f"Пищевое окно {window['first']}–{window['last']} ({window['hours']} ч).")
+    # Отбой сегодняшней ночи в 21:30 ещё не записан — поздняя нагрузка только за вчера.
+    yesterday = (datetime.fromisoformat(date[:10]) - timedelta(days=1)).strftime("%Y-%m-%d")
+    late = late_load(conn, user_id, yesterday)
+    if late is not None:
+        late_pct = round(late["share"] * 100)
+        lines.append(f"Вчера за {load()['chrono']['late_load_hours']} ч до сна: {late_pct}% ккал.")
     if fired:
         lines.append("Гардрейлы: " + "; ".join(f"{a['code']} — {a['message']}" for a in fired))
     else:

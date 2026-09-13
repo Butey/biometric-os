@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -325,6 +325,20 @@ CREATE TABLE IF NOT EXISTS persona_styles (
     created_at TEXT NOT NULL,
     UNIQUE(user_id, name)
 );
+
+-- v15: анализы, введённые текстом (health_core/labs.py). Одна строка на
+-- показатель в день: повторный ввод того же дня исправляет значение.
+CREATE TABLE IF NOT EXISTS lab_results (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    taken_on TEXT NOT NULL,
+    marker TEXT NOT NULL,
+    value REAL NOT NULL,
+    unit TEXT,
+    notes TEXT,
+    UNIQUE(user_id, taken_on, marker)
+);
+CREATE INDEX IF NOT EXISTS idx_lab_results_user_date ON lab_results(user_id, taken_on);
 """
 
 
@@ -436,6 +450,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         # v12->v13 — equipment и plan_log, тоже только новые таблицы.
         if row["version"] < 14:
             _migrate_v13_to_v14(conn)
+        # v14->v15 — только новая таблица lab_results, отдельного шага не нужно.
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 
@@ -458,10 +473,10 @@ if __name__ == "__main__":
             "users", "user_targets", "milestones", "body_metrics", "anthropometry",
             "food_log", "food_items", "water_log", "glucose_log", "activity",
             "daily_targets", "alerts", "med_log", "llm_calls", "import_log",
-            "refeed_days", "meal_plan", "workout_plan", "persona_styles",
+            "refeed_days", "meal_plan", "workout_plan", "persona_styles", "lab_results",
         }
         assert expected <= tables, f"missing tables: {expected - tables}"
-        assert len(expected) == 19
+        assert len(expected) == 20
 
         conn.execute(
             "INSERT INTO users(telegram_user_id, created_at) VALUES (1, '2026-08-20 00:00:00')"

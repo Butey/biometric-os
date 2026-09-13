@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -90,13 +91,32 @@ def run_script(script: str, user_id: int | None) -> subprocess.CompletedProcess:
     Отличаем так, а не по имени файла, чтобы новый cron-скрипт без --user не
     провалился молча."""
     cmd = [sys.executable, str(ROOT / script)]
+    env = None
     if user_id is not None:
         cmd += ["--user", str(user_id)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", cwd=str(ROOT))
+        tz = _user_tz(user_id)
+        if tz:
+            # Скрипты считают «сегодня» и час окна через datetime.now(): TZ в
+            # окружении переводит весь дочерний процесс на пояс человека.
+            env = {**os.environ, "TZ": tz}
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", cwd=str(ROOT), env=env)
     if user_id is not None and proc.returncode == 2 and "--user" in proc.stderr:
         proc = subprocess.run(cmd[:1] + [str(ROOT / script)],
-                               capture_output=True, text=True, encoding="utf-8", cwd=str(ROOT))
+                               capture_output=True, text=True, encoding="utf-8", cwd=str(ROOT), env=env)
     return proc
+
+
+def _user_tz(user_id: int) -> str | None:
+    """Пояс из профиля; неизвестное имя glibc молча превратил бы в UTC — отбрасываем."""
+    conn = connect()
+    try:
+        row = conn.execute("SELECT timezone FROM users WHERE id=?", (user_id,)).fetchone()
+    finally:
+        conn.close()
+    try:
+        return str(ZoneInfo(row["timezone"])) if row and row["timezone"] else None
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
 
 
 def report_failure(script: str, proc: subprocess.CompletedProcess, token: str) -> None:

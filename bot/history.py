@@ -6,7 +6,7 @@
 import json
 from datetime import datetime
 
-from health_core.config import load as _load_config
+from health_core.config import load as _load_config, local_now
 
 _DEFAULT_WINDOW = 20
 _DEFAULT_CHARS = 8000
@@ -15,7 +15,7 @@ _DEFAULT_CHARS = 8000
 def _now_iso() -> str:
     # тот же формат, что и в plugin/tools.py._now_iso: "YYYY-MM-DD HH:MM:SS",
     # без 'T' — единообразие с остальной базой, хотя тут это отдельная таблица.
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return local_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _ensure_table(conn) -> None:

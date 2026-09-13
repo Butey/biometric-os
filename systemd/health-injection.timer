@@ -1,0 +1,9 @@
+[Unit]
+Description=Health: напоминание об инъекции
+
+[Timer]
+OnCalendar=Sun *-*-* 21:00:00 Asia/Yekaterinburg
+Unit=health-notify@injection_reminder.service
+
+[Install]
+WantedBy=timers.target
