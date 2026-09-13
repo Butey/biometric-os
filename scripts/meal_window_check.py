@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")
 
 from health_core.db import connect, migrate
+from health_core import sick
 
 # fire_hour (когда срабатывает cron) -> (since_hour окна, метка приёма пищи)
 _BY_FIRE_HOUR = {
@@ -65,6 +66,8 @@ def main() -> int:
     since = f"{today} {since_hour:02d}:00:00"
     lines = []
     for u in users:
+        if sick.is_sick(conn, u["id"], today):
+            continue  # болен — напоминаний о еде не шлём
         n = conn.execute(
             "SELECT COUNT(*) c FROM food_log WHERE user_id=? AND eaten_at>=? AND date(eaten_at)=?",
             (u["id"], since, today),

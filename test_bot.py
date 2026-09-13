@@ -59,7 +59,7 @@ os.environ["FAKE_KEY"] = "test"
 def test_tool_specs():
     specs = main.tool_specs()
     names = [s["function"]["name"] for s in specs]
-    assert len(names) == 32, f"31 инструмент плагина + knowledge, получено {len(names)}"
+    assert len(names) == 33, f"32 инструмента плагина + knowledge, получено {len(names)}"
     assert "knowledge" in names, "инструмент знаний не подключён"
     assert "log_food" in names and "get_status_bar" in names
     for s in specs:

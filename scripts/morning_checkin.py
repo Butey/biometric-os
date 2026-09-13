@@ -15,6 +15,8 @@ from health_core.db import connect, migrate
 from health_core.report import status_bar
 from health_core.guards import check_all
 from health_core.chrono import caffeine_cutoff
+from health_core import sick
+from health_core.config import local_now
 
 
 def main() -> int:
@@ -47,6 +49,15 @@ def main() -> int:
             for alert in alerts:
                 if alert.get("code") == "BINGE_RISK":
                     block_lines.append(f"⚠ {alert['message']}")
+            today = local_now().date().isoformat()
+            st = sick.status(conn, u["id"], today)
+            if st["sick"]:
+                until = st["until"]
+                until_dd_mm = f"{until[8:10]}.{until[5:7]}" if until else "?"
+                block_lines.append(
+                    f"🤒 Режим болезни до {until_dd_mm}: цель без дефицита, "
+                    "напоминания о еде выключены."
+                )
             blocks.append("\n".join(block_lines))
         except Exception as e:
             blocks.append(f"user_id={u['id']}: чек-ин не удался: {e}")

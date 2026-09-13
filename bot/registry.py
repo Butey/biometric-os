@@ -29,6 +29,7 @@ DESCRIPTIONS = {
     "plan_day": "План на конкретный день: get — прочитать, list — история, save — записать, delete — удалить (по дате или kind). kind=workout или meal. Текст плана пишешь ты, код только хранит.",
     "log_workout": "Записать выполненную тренировку/активность: вид спорта/упражнения, длительность в мин, калории, средний пульс, заметки. Также action=list для истории и action=delete для удаления.",
     "refeed": "Плановые перерывы в дефиците по протоколу MATADOR: status — фаза сегодня, schedule — расставить цикл 2 недели дефицита / 2 недели поддержания, clear — снять.",
+    "sick": "Режим болезни: start — человек заболел (температура, инфекция, рвота/понос, травма): цель без дефицита, напоминания о еде выключены, шумные гарды молчат; stop — выздоровел; status — текущее состояние.",
     "forecast": "Прогноз массы: project — траектория на горизонт до 182 дней, reach — когда будет заданный вес. Это ОЦЕНКА с полосой, а не обещание: отдавай диапазон, никогда одну дату. Модель не знает про плато и смену дозы.",
     "log_weight": "Записать вес и, если есть, показатели состава тела с весов (жир, мышцы, вода и т.п.). Также action=delete для удаления по weight_id.",
     "log_anthropometry": "Записать замер тела сантиметровой лентой: талия, таз, грудь, бедро, шея, бицепс. Также action=delete для удаления по anthropometry_id.",
@@ -243,7 +244,7 @@ if __name__ == "__main__":
 
     expected_tools = {
         "log_food", "log_water", "log_glucose", "log_labs", "log_sleep", "log_weight",
-        "equipment", "plan_day", "log_workout", "refeed", "forecast",
+        "equipment", "plan_day", "log_workout", "refeed", "sick", "forecast",
         "log_anthropometry", "log_med", "pharma", "plans", "import_scale_export",
         "get_day_summary", "get_trends", "get_status_bar",
         "query_metrics", "query_food", "pantry", "style", "explain_target", "get_progress",

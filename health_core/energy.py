@@ -206,7 +206,13 @@ def adaptive_tdee(
         return None
     delta_weight = weights[-1] - weights[0]
 
-    return mean_intake - (delta_weight * 7700 / window_days)
+    tdee = mean_intake - (delta_weight * 7700 / window_days)
+    # Расход ниже базового обмена физиологически невозможен — так выходит, когда
+    # в окно попали недописанные дни (220 ккал за день в логе). Такая калибровка
+    # хуже, чем никакой: от неё считается пол, и цель проваливалась до ~1090 ккал.
+    if tdee < bmr_floor(conn, user_id):
+        return None
+    return tdee
 
 
 def _tcx_net(conn: sqlite3.Connection, user_id: int, date_: str) -> float:
@@ -281,6 +287,17 @@ def _is_refeed(conn: sqlite3.Connection, user_id: int, date_: str) -> bool:
     ).fetchone() is not None
 
 
+def _is_sick(conn: sqlite3.Connection, user_id: int, date_: str) -> bool:
+    """Режим болезни (health_core/sick.py) на эту дату? Для калоража день
+    болезни ведёт себя ровно как рефид — полный TDEE, шаги 2-4 на паузе:
+    во время острой болезни организму не до дефицита, а есть заставлять через
+    силу вредно. Отдельный тег "+sick" в source вместо переиспользования
+    "+refeed" — чтобы explain честно называл причину паузы дефицита."""
+    return conn.execute(
+        "SELECT 1 FROM sick_days WHERE user_id=? AND date=?", (user_id, date_)
+    ).fetchone() is not None
+
+
 def _weekday_multiplier(date_: str) -> float:
     """§09 шаг 4: "распределение по дням недели, недельная сумма неизменна".
 
@@ -335,12 +352,15 @@ def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
     deadline_unreachable = False
     active_milestone_name = None
     refeed = _is_refeed(conn, user_id, date)
+    sick = _is_sick(conn, user_id, date)
 
-    if refeed:
-        # шаг 5: рефид активен -> цель := полный TDEE, шаги 2-4 на паузе.
+    if refeed or sick:
+        # шаг 5 (и режим болезни): цель := полный TDEE, шаги 2-4 на паузе.
         # Но безопасный пол (шаг 3) — не опция, а инвариант: держим его и тут.
         kcal = max(full_tdee, floor)
-        tags.append("refeed")
+        # Если день одновременно рефид и болезнь — одного тега достаточно
+        # (см. докстринг _is_sick): "sick" называет более конкретную причину.
+        tags.append("sick" if sick else "refeed")
         if full_tdee < floor:
             tags.append("clamped")
     else:
@@ -431,6 +451,7 @@ def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
         "active_milestone": active_milestone_name,
         "deadline_unreachable": deadline_unreachable,
         "refeed": refeed,
+        "sick": sick,
     }
 
 
@@ -563,6 +584,28 @@ if __name__ == "__main__":
         conn.execute("DELETE FROM milestones WHERE user_id=? AND name='refeed-deadline'", (uid,))
         conn.execute("DELETE FROM refeed_days WHERE user_id=?", (uid,))
         conn.commit()
+
+        # --- режим болезни: тот же полный TDEE, что и рефид, но тег "+sick" ---
+        conn.execute(
+            "INSERT INTO milestones(user_id, name, metric, threshold, deadline) "
+            "VALUES (?, 'sick-deadline', 'weight_kg', 101.8, '2026-09-03')",
+            (uid,),
+        )
+        result_no_sick = daily_target(conn, uid, "2026-08-21")
+        conn.execute("INSERT INTO sick_days(user_id, date) VALUES (?, '2026-08-21')", (uid,))
+        conn.commit()
+        result_sick = daily_target(conn, uid, "2026-08-21")
+        print(f"daily_target (sick) = {result_sick}")
+        assert result_sick["sick"] is True
+        assert result_sick["kcal"] >= result_no_sick["kcal"], (
+            f"цель в день болезни должна быть выше или равна цели без него: "
+            f"{result_sick['kcal']} < {result_no_sick['kcal']}"
+        )
+        assert "sick" in result_sick["source"], result_sick["source"]
+        conn.execute("DELETE FROM milestones WHERE user_id=? AND name='sick-deadline'", (uid,))
+        conn.execute("DELETE FROM sick_days WHERE user_id=?", (uid,))
+        conn.commit()
+        print("OK: день болезни даёт цель без дефицита (как рефид), тег «sick» в source")
 
         # --- daily_targets upsert: второй вызов на ту же дату оставляет одну строку ---
         daily_target(conn, uid, "2026-08-25")

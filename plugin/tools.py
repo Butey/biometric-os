@@ -1348,11 +1348,24 @@ def handle_log_workout(params: dict) -> str:
     new_id = cur.lastrowid
     conn.commit()
 
+    # Add heart rate zone info if avg_hr is provided
+    hr_zone = None
+    hr_zones_info = None
+    if avg_hr is not None:
+        try:
+            from health_core import hr_zones as _hz
+            z = _hz.zones(conn, user_id, started_at[:10])
+            if z:
+                hr_zone = _hz.classify(avg_hr, z)
+                hr_zones_info = z
+        except Exception:
+            pass
+
     alerts = check_all(conn, user_id)
     record(conn, user_id, alerts)
     conn.close()
 
-    return json.dumps({
+    result = {
         "ok": f"Тренировка записана: {sport}, {duration_min or '—'} мин, {kcal or '—'} ккал (#{new_id})",
         "workout_id": new_id,
         "sport": sport,
@@ -1361,7 +1374,12 @@ def handle_log_workout(params: dict) -> str:
         "avg_hr": avg_hr,
         "started_at": started_at,
         "alerts": alerts,
-    }, ensure_ascii=False)
+    }
+    if hr_zone:
+        result["hr_zone"] = hr_zone
+    if hr_zones_info:
+        result["hr_zones"] = hr_zones_info
+    return json.dumps(result, ensure_ascii=False)
 
 
 _MAX_IMPORT_BYTES = 20 * 1024 * 1024  # 20 МБ — жёсткий отказ, файл больше в память не грузим
@@ -1886,6 +1904,13 @@ def handle_get_trends(params: dict) -> str:
     # и отдельного инструмента ради одного словаря заводить незачем. Пустой
     # sports={} — честное "TCX ещё не загружали", а не поломка.
     t["training_efficiency"] = training_efficiency(conn, user_id)
+
+    # Add heart rate zones
+    try:
+        from health_core import hr_zones as _hz
+        t["hr_zones"] = _hz.zones(conn, user_id)
+    except Exception:
+        pass
 
     conn.close()
 
@@ -3090,6 +3115,80 @@ def handle_refeed(params: dict) -> str:
 
 
 @_handler_wrapper
+def handle_sick(params: dict) -> str:
+    """Режим болезни: дефицит отключается, шумные гарды молчат."""
+    from health_core import sick as _sick
+
+    conn = connect()
+    migrate(conn)
+    user_id = _get_user_id(params, conn)
+    action = (params.get("action") or "status").lower()
+    today = config.local_now().replace(tzinfo=None).date().isoformat()
+
+    if action == "status":
+        st = _sick.status(conn, user_id, today)
+        conn.close()
+        return json.dumps(st, ensure_ascii=False)
+
+    if action == "start":
+        days = params.get("days")
+        if days is not None:
+            try:
+                days = int(days)
+            except (TypeError, ValueError):
+                conn.close()
+                return json.dumps({"error": "days — число дней 1..30"}, ensure_ascii=False)
+        else:
+            days = config.load()["sick"]["default_days"]
+
+        from_date = params.get("from_date") or today
+        note = params.get("note")
+
+        try:
+            result = _sick.start(conn, user_id, from_date, days, note=note)
+        except ValueError as e:
+            conn.close()
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+        # Refresh today's calorie target
+        kcal_target = None
+        try:
+            from health_core.energy import daily_target
+            tgt = daily_target(conn, user_id, today)
+            kcal_target = round(tgt["kcal"])
+        except Exception:
+            pass
+
+        conn.close()
+        result["kcal_target"] = kcal_target
+        quiet_days = config.load().get("sick", {}).get("quiet_after_days", 2)
+        result["note"] = (f"Цель без дефицита, напоминания о еде выключены, шумные гарды молчат "
+                          f"ещё {quiet_days} дн. после выздоровления.")
+        return json.dumps(result, ensure_ascii=False)
+
+    if action == "stop":
+        n = _sick.stop(conn, user_id, today)
+
+        # Refresh today's calorie target
+        kcal_target = None
+        try:
+            from health_core.energy import daily_target
+            tgt = daily_target(conn, user_id, today)
+            kcal_target = round(tgt["kcal"])
+        except Exception:
+            pass
+
+        conn.close()
+        return json.dumps({
+            "ok": f"Режим болезни снят, убрано дней: {n}",
+            "kcal_target": kcal_target
+        }, ensure_ascii=False)
+
+    conn.close()
+    return json.dumps({"error": f"Неизвестное действие {action!r}. Допустимо: start, stop, status"}, ensure_ascii=False)
+
+
+@_handler_wrapper
 def handle_pantry(params: dict) -> str:
     """Холодильник: учёт продуктовых запасов. action=list|add|remove.
     Хранилище детерминированное; умный подбор блюд из запасов и списание при
@@ -3430,9 +3529,15 @@ _HELP_USER = """🧭 **Что я умею**
 «что приготовить» / «составь ужин» — соберу из того, что есть.
 «мой план» — недельный план питания и тренировок.
 
+**🩺 Анализы**
+«анализы 12.09: глюкоза 5.1, инсулин 9, креатинин 88» — сохраню и посчитаю HOMA-IR, eGFR и другие показатели.
+
+**🤒 Болезнь**
+«заболел» / «температура 38» — уберу дефицит и напоминания о еде; «выздоровел» — верну как было.
+
 **🎯 Цели и прогресс**
 «почему такая цель» — разложу расчёт калорий по шагам.
-«прогресс» / «тренды» — вес, сухая масса, талия за период.
+«прогресс» / «тренды» — вес, сухая масса, талия за период, пульсовые зоны тренировок.
 «веха 110» — поставить цель. Число цели ставишь только ты.
 
 Специальных команд заучивать не надо — говори обычными словами, инструмент я выберу сам."""
@@ -4316,6 +4421,7 @@ def register(ctx):
         ("plan_day", handle_plan_day, schemas.plan_day_schema),
         ("log_workout", handle_log_workout, schemas.log_workout_schema),
         ("refeed", handle_refeed, schemas.refeed_schema),
+        ("sick", handle_sick, schemas.sick_schema),
         ("forecast", handle_forecast, schemas.forecast_schema),
         ("style", handle_style, schemas.style_schema),
         ("explain_target", handle_explain_target, schemas.explain_target_schema),
@@ -4417,7 +4523,7 @@ if __name__ == "__main__":
 
         expected_tools = {
             "log_food", "log_water", "log_glucose", "log_labs", "log_sleep", "log_weight",
-            "equipment", "plan_day", "log_workout", "refeed", "forecast",
+            "equipment", "plan_day", "log_workout", "refeed", "sick", "forecast",
             "log_anthropometry", "log_med", "pharma", "plans", "import_scale_export",
             "get_day_summary", "get_trends", "get_status_bar",
             "query_metrics", "query_food", "pantry", "style", "explain_target", "get_progress",
@@ -6230,6 +6336,56 @@ if __name__ == "__main__":
                  + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
         assert _norm_ts(_next) == _next, "next_at не должен попадать под окно события"
         print("OK: неверный год и будущее отклонены, вчера и next_at пропущены")
+
+        print("="*60)
+        print("TEST 29: sick mode (start/status/stop) and hr_zones in log_workout")
+        print("="*60)
+
+        # Test sick status (should be not sick initially)
+        handler_sick = ctx.tools["sick"]["handler"]
+        result_json = handler_sick({"action": "status", "user_id": uid})
+        result = json.loads(result_json)
+        assert result.get("sick") is False, f"User should not be sick initially, got {result}"
+        print("OK: sick status returns False initially")
+
+        # Test sick start
+        result_json = handler_sick({"action": "start", "days": 2, "user_id": uid})
+        result = json.loads(result_json)
+        assert "from" in result and "to" in result, f"sick start should return from/to, got {result}"
+        assert "kcal_target" in result, f"sick start should return kcal_target, got {result}"
+        print(f"OK: sick start returns from={result['from']}, to={result['to']}, kcal_target={result.get('kcal_target')}")
+
+        # Test sick status (should be sick now)
+        result_json = handler_sick({"action": "status", "user_id": uid})
+        result = json.loads(result_json)
+        assert result.get("sick") is True, f"User should be sick after start, got {result}"
+        print(f"OK: sick status returns True after start, until={result.get('until')}")
+
+        # Test sick stop
+        result_json = handler_sick({"action": "stop", "user_id": uid})
+        result = json.loads(result_json)
+        assert "ok" in result, f"sick stop should return ok, got {result}"
+        assert "kcal_target" in result, f"sick stop should return kcal_target, got {result}"
+        print(f"OK: sick stop returns ok={result['ok']}, kcal_target={result.get('kcal_target')}")
+
+        # Test log_workout with hr_zones
+        handler_workout = ctx.tools["log_workout"]["handler"]
+        result_json = handler_workout({
+            "action": "add",
+            # не «Бег 30», как в контрактном тесте выше: file_hash ручной записи —
+            # user+секунда+вид+длительность, в одну секунду они совпадали
+            "sport": "VR-кардио",
+            "duration_min": 41,
+            "kcal": 450,
+            "avg_hr": 128,
+            "user_id": uid
+        })
+        result = json.loads(result_json)
+        assert "ok" in result, f"log_workout should return ok, got {result}"
+        assert "hr_zone" in result, f"log_workout with avg_hr should return hr_zone, got {result}"
+        assert "hr_zones" in result, f"log_workout with avg_hr should return hr_zones dict, got {result}"
+        hr_zone_value = result.get("hr_zone")
+        print(f"OK: log_workout returns hr_zone={hr_zone_value}, hr_zones={result.get('hr_zones')}")
 
         print("="*60)
         print("ALL TESTS PASSED")

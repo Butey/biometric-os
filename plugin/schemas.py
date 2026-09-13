@@ -764,3 +764,31 @@ log_labs_schema = {
     },
     "required": []
 }
+
+sick_schema = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["start", "stop", "status"],
+            "description": "start — включить режим болезни; stop — выздоровел; status (умолчание) — состояние"
+        },
+        "days": {
+            "type": "integer",
+            "description": "На сколько дней, по умолчанию из настроек"
+        },
+        "from_date": {
+            "type": "string",
+            "description": "С какой даты (YYYY-MM-DD), по умолчанию сегодня"
+        },
+        "note": {
+            "type": "string",
+            "description": "Что случилось: температура, отравление…"
+        },
+        "user_id": {
+            "type": "integer",
+            "description": "ID пользователя"
+        }
+    },
+    "required": []
+}

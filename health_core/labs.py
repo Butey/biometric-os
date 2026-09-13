@@ -81,6 +81,83 @@ MARKERS = {
         "hi": 2000.0,
         "aliases": ("аст", "ast"),
     },
+    "ggt": {
+        "label": "ГГТ",
+        "unit": "Ед/л",
+        "lo": 1.0,
+        "hi": 2000.0,
+        "aliases": ("ггт", "гамма-гт", "ggt"),
+    },
+    "alp": {
+        "label": "щелочная фосфатаза",
+        "unit": "Ед/л",
+        "lo": 10.0,
+        "hi": 2000.0,
+        "aliases": ("щф", "щелочная фосфатаза", "alp"),
+    },
+    "uric_acid": {
+        "label": "мочевая кислота",
+        "unit": "мкмоль/л",
+        "lo": 50.0,
+        "hi": 1500.0,
+        "aliases": ("мочевая кислота", "uric acid"),
+    },
+    "tsh": {
+        "label": "ТТГ",
+        "unit": "мЕд/л",
+        "lo": 0.01,
+        "hi": 100.0,
+        "aliases": ("ттг", "tsh"),
+    },
+    "ft4": {
+        "label": "свободный Т4",
+        "unit": "пмоль/л",
+        "lo": 1.0,
+        "hi": 100.0,
+        "aliases": ("свободный т4", "свт4", "ft4"),
+    },
+    "ft3": {
+        "label": "свободный Т3",
+        "unit": "пмоль/л",
+        "lo": 0.5,
+        "hi": 50.0,
+        "aliases": ("свободный т3", "свт3", "ft3"),
+    },
+    "testosterone": {
+        "label": "тестостерон общий",
+        "unit": "нмоль/л",
+        "lo": 0.1,
+        "hi": 100.0,
+        "aliases": ("тестостерон", "тестостерон общий", "testosterone"),
+    },
+    "shbg": {
+        "label": "ГСПГ",
+        "unit": "нмоль/л",
+        "lo": 1.0,
+        "hi": 300.0,
+        "aliases": ("гспг", "shbg"),
+    },
+    "hematocrit": {
+        "label": "гематокрит",
+        "unit": "%",
+        "lo": 10.0,
+        "hi": 75.0,
+        "aliases": ("гематокрит", "hct"),
+    },
+    "apob": {
+        "label": "аполипопротеин B",
+        "unit": "г/л",
+        "lo": 0.1,
+        "hi": 5.0,
+        "aliases": ("апоb", "апов", "apob"),
+    },
+    "cystatin_c": {
+        "label": "цистатин C",
+        "unit": "мг/л",
+        "lo": 0.2,
+        "hi": 10.0,
+        "aliases": ("цистатин c", "цистатин с", "cystatin c"),
+    },
 }
 
 # Обратная карта псевдоним -> канонический ключ. Канонический ключ сам себе
@@ -111,7 +188,9 @@ def _reject_reason(canon, value, meta):
     # правильную единицу для самых частых путаниц.
     if canon in ("glucose", "total_chol", "hdl", "ldl", "tg") and value > hi:
         return f"похоже на мг/дл, нужны {unit}"
-    if canon == "creatinine" and value < lo:
+    if canon in ("creatinine", "uric_acid") and value < lo:
+        return f"похоже на мг/дл, нужны {unit}"
+    if canon == "apob" and value > hi:
         return f"похоже на мг/дл, нужны {unit}"
     return f"вне допустимого диапазона ({lo}–{hi} {unit})"
 
@@ -407,5 +486,24 @@ if __name__ == "__main__":
     assert delete(conn, uid, lab_id) is True
     assert delete(conn, uid, lab_id) is False  # уже удалено
 
+    # --- new markers: GGT, ALP, uric_acid, TSH, FT4, FT3, testosterone, SHBG, hematocrit, ApoB, cystatin_c ---
+    assert canon_marker("ГГТ") == "ggt"
+    assert canon_marker("Цистатин С") == "cystatin_c"  # Cyrillic С
+    assert canon_marker("цистатин с") == "cystatin_c"  # Cyrillic с, lowercase
+
+    # hematocrit 45 -> saved
+    res = save(conn, uid, "2026-09-07", {"hematocrit": 45})
+    assert "hematocrit" in res["saved"], f"hematocrit 45 should be saved: {res}"
+    assert res["saved"]["hematocrit"] == 45
+
+    # hematocrit 450 -> rejected
+    res = save(conn, uid, "2026-09-08", {"hematocrit": 450})
+    assert "hematocrit" in res["rejected"], f"hematocrit 450 should be rejected: {res}"
+
+    # uric_acid 6 -> rejected with мг/дл hint (value < lo of 50)
+    res = save(conn, uid, "2026-09-09", {"uric_acid": 6})
+    assert "uric_acid" in res["rejected"], f"uric_acid 6 should be rejected: {res}"
+    assert "мг/дл" in res["rejected"]["uric_acid"], f"expected мг/дл hint: {res['rejected']['uric_acid']}"
+
     conn.close()
-    print("OK: labs.py — aliases, save/reject/upsert, HOMA-IR, eGFR (м/ж), non-HDL, eAG, history/delete")
+    print("OK: labs.py — aliases, save/reject/upsert, HOMA-IR, eGFR (м/ж), non-HDL, eAG, history/delete, new markers")

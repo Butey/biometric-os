@@ -256,6 +256,18 @@ CREATE TABLE IF NOT EXISTS refeed_days (
     UNIQUE(user_id, date)
 );
 
+-- v15: режим болезни (health_core/sick.py) — булев признак на дату, как
+-- refeed_days выше. На этих датах дефицит ставится на паузу (energy.py), а
+-- шумные поведенческие гардрейлы молчат (guards.py), но безопасность
+-- (BMR/FFMI/липиды/глюкоза) остаётся включённой.
+CREATE TABLE IF NOT EXISTS sick_days (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    date TEXT NOT NULL,
+    note TEXT,
+    UNIQUE(user_id, date)
+);
+
 -- v4: weekly repeating plan template (day_of_week 0=Mon..6=Sun, per Python's
 -- date.weekday()) — NOT a dated log. Empty until the person fills it; no seeded
 -- rows, no defaults inserted anywhere near this DDL.
@@ -450,7 +462,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         # v12->v13 — equipment и plan_log, тоже только новые таблицы.
         if row["version"] < 14:
             _migrate_v13_to_v14(conn)
-        # v14->v15 — только новая таблица lab_results, отдельного шага не нужно.
+        # v14->v15 — только новые таблицы lab_results и sick_days, отдельного шага не нужно.
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 
@@ -474,9 +486,10 @@ if __name__ == "__main__":
             "food_log", "food_items", "water_log", "glucose_log", "activity",
             "daily_targets", "alerts", "med_log", "llm_calls", "import_log",
             "refeed_days", "meal_plan", "workout_plan", "persona_styles", "lab_results",
+            "sick_days",
         }
         assert expected <= tables, f"missing tables: {expected - tables}"
-        assert len(expected) == 20
+        assert len(expected) == 21
 
         conn.execute(
             "INSERT INTO users(telegram_user_id, created_at) VALUES (1, '2026-08-20 00:00:00')"

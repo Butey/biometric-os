@@ -662,6 +662,17 @@ _CHECKS = (
     check_binge_risk,
 )
 
+# Режим болезни (health_core/sick.py) глушит поведенческие гардрейлы: во время
+# болезни человек и так ест как получится и не взвешивается по расписанию, а
+# вес/БИА пару дней после болезни искажены задержкой жидкости. FFMI_FLOOR,
+# BMR_FLOOR, LIPID_GUARD, GLUCOSE_VOLATILITY и WHR_HIGH сюда НЕ входят —
+# GLUCOSE_VOLATILITY остаётся демонстративно: болезнь сама по себе поднимает
+# глюкозу, и это ровно тот сигнал, который нельзя заглушать.
+SICK_QUIET_CODES = frozenset({
+    "UNDEREATING", "BINGE_RISK", "PROTEIN_SKEW", "PLATEAU", "RATE_HIGH",
+    "STALE_CALIB", "NO_MEASURE", "MEASURE_SOON", "LBM_RATIO", "LBM_DRIFT",
+})
+
 
 def check_all(conn: sqlite3.Connection, user_id: int) -> list[dict]:
     out: list[dict] = []
@@ -670,6 +681,9 @@ def check_all(conn: sqlite3.Connection, user_id: int) -> list[dict]:
         if res is None:
             continue
         out.extend(res) if isinstance(res, list) else out.append(res)
+    from health_core import sick  # локальный импорт — на случай, если sick.py когда-нибудь импортирует guards
+    if sick.quiet(conn, user_id, _now().date().isoformat()):
+        out = [a for a in out if a["code"] not in SICK_QUIET_CODES]
     return out
 
 
@@ -1650,5 +1664,54 @@ if __name__ == "__main__":
             energy_mod.adaptive_tdee = orig_adaptive_tdee
             print("OK: BINGE_RISK — 3 фактора critical, 2 фактора warning, 1 фактор молчит, "
                   "без данных молчит, пропуск завтрака после 12:00 засчитан как фактор")
+
+            # ---------------------------------------------------------------- режим болезни
+            import health_core.sick as sick_mod
+
+            today_sick = _now().date().isoformat()
+
+            # UNDEREATING сам по себе (без болезни) — воспроизводим сценарий, каким его
+            # проверяет check_undereating: N дней подряд ниже undereating_ratio цели.
+            def _make_undereating_user(tg_id):
+                uid = make_user(tg_id, height_cm=185, created_days_ago=30)
+                cfg = _cfg()
+                for i in range(1, cfg["undereating_days"] + 1):
+                    d = (_now().date() - timedelta(days=i)).isoformat()
+                    conn.execute("INSERT INTO daily_targets(user_id, date, kcal_target) VALUES (?,?,?)",
+                                 (uid, d, 2000))
+                    conn.execute("INSERT INTO food_log(user_id, eaten_at) VALUES (?,?)", (uid, f"{d} 12:00:00"))
+                    flid = conn.execute("SELECT last_insert_rowid() id").fetchone()["id"]
+                    conn.execute(
+                        "INSERT INTO food_items(food_log_id, kcal, protein_g, fat_g, carbs_g) VALUES (?,?,?,?,?)",
+                        (flid, 900, 60, 20, 60),  # 45% цели, ниже undereating_ratio
+                    )
+                conn.commit()
+                return uid
+
+            u_sick_off = _make_undereating_user(150)
+            alerts_off = check_all(conn, u_sick_off)
+            assert any(a["code"] == "UNDEREATING" for a in alerts_off), (
+                f"UNDEREATING должен сработать без режима болезни, получили {alerts_off}"
+            )
+
+            u_sick_on = _make_undereating_user(151)
+            sick_mod.start(conn, u_sick_on, today_sick, 1, note="грипп")
+            alerts_on = check_all(conn, u_sick_on)
+            assert not any(a["code"] == "UNDEREATING" for a in alerts_on), (
+                f"UNDEREATING должен молчать в день болезни, получили {alerts_on}"
+            )
+            print("OK: режим болезни глушит UNDEREATING")
+
+            # GLUCOSE_VOLATILITY — безопасность, должен звучать и в день болезни.
+            u_sick_glucose = make_user(152, height_cm=185, created_days_ago=30)
+            for d, v in [(12, 4.0), (10, 7.5), (8, 4.2), (4, 7.8), (0, 4.1)]:  # тот же волатильный сценарий
+                _add_glucose(u_sick_glucose, d, v)
+            sick_mod.start(conn, u_sick_glucose, today_sick, 1, note="грипп")
+            conn.commit()
+            alerts_glucose_sick = check_all(conn, u_sick_glucose)
+            assert any(a["code"] == "GLUCOSE_VOLATILITY" for a in alerts_glucose_sick), (
+                f"GLUCOSE_VOLATILITY обязан звучать даже в день болезни, получили {alerts_glucose_sick}"
+            )
+            print("OK: режим болезни НЕ глушит GLUCOSE_VOLATILITY (безопасность)")
         finally:
             conn.close()

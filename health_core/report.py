@@ -238,6 +238,9 @@ def evening_report(conn: sqlite3.Connection, user_id: int, date: str) -> str:
     d = day_summary(conn, user_id, date)
     fired = check_all(conn, user_id)
     lines = [f"Отчёт за {date}."]
+    from health_core import sick
+    if sick.is_sick(conn, user_id, date):
+        lines.append("🤒 Режим болезни: дефицит на паузе.")
     if d["kcal_target"] is not None:
         lines.append(f"Съедено {d['kcal_eaten']:.0f} из {d['kcal_target']:.0f} ккал, "
                      f"Б {d['protein_g']:.0f} / Ж {d['fat_g']:.0f} / У {d['carb_g']:.0f}.")

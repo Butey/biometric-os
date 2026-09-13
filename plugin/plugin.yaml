@@ -39,6 +39,7 @@ provides_tools:
   - plan_day
   - log_workout
   - refeed
+  - sick
   - forecast
   - style
   - explain_target
