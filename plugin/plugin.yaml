@@ -25,6 +25,7 @@ provides_tools:
   - log_anthropometry
   - log_med
   - pharma
+  - drug_card_draft
   - plans
   - import_scale_export
   - get_day_summary

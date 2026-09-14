@@ -3211,6 +3211,67 @@ def handle_pharma(params: dict) -> str:
                       ensure_ascii=False)
 
 
+@_handler_wrapper
+def handle_drug_card_draft(params: dict) -> str:
+    """Черновик карты препарата (CONTEXT.md «Черновик карты», docs/adr/0002):
+    для препарата без карты (pharma/card не находит лестницу). action=fetch —
+    официальные тексты по МНН латиницей (openFDA, а если там пусто —
+    ClinicalTrials.gov), без веб-поиска и без памяти модели. action=save —
+    черновик ИЗ ЭТИХ ТЕКСТОВ на одобрение админу; до одобрения в панели
+    (/drafts) карта не действует — работает только учёт приёма."""
+    from health_core import card_drafts
+
+    action = (params.get("action") or "fetch").lower()
+
+    if action == "fetch":
+        inn = (params.get("inn") or "").strip()
+        if not inn:
+            return json.dumps({"error": "Нужен inn — МНН препарата латиницей"}, ensure_ascii=False)
+        return json.dumps(card_drafts.fetch_sources(inn), ensure_ascii=False)
+
+    if action == "save":
+        substance = (params.get("substance") or "").strip()
+        if not substance:
+            return json.dumps({"error": "Нужно substance — имя препарата для заголовка карты"}, ensure_ascii=False)
+        fields = params.get("fields")
+        if fields is not None and not isinstance(fields, dict):
+            return json.dumps({"error": "fields должен быть объектом"}, ensure_ascii=False)
+        sources = params.get("sources")
+        if sources is not None and not isinstance(sources, list):
+            return json.dumps({"error": "sources должен быть списком ссылок"}, ensure_ascii=False)
+
+        conn = connect()
+        migrate(conn)
+        user_id = _get_user_id(params, conn)
+        who = conn.execute("SELECT telegram_user_id FROM users WHERE id=?", (user_id,)).fetchone()
+        telegram_id = who["telegram_user_id"] if who else user_id
+        draft_id = card_drafts.save_draft(conn, user_id, substance, fields or {}, sources or [])
+        conn.close()
+
+        # Тот же _PENDING_USER_NOTIFICATIONS, которым бот уведомляет админов о
+        # заявках на доступ (bot/main.py._notify_admins_of_request) — второй
+        # очереди не заводим. Ленивый импорт: bot.main тянет aiogram и сам
+        # импортирует registry -> plugin.tools, прямой импорт наверху модуля
+        # был бы циклом.
+        try:
+            from bot.main import _PENDING_USER_NOTIFICATIONS, admin_user_ids
+            text = (f"Новый черновик карты: {substance} (от пользователя {telegram_id}). "
+                    f"Сверь с источниками и одобри в панели: /drafts")
+            for admin_id in admin_user_ids():
+                _PENDING_USER_NOTIFICATIONS.append((admin_id, text))
+        except ImportError:
+            pass  # standalone-запуск (самопроверка) без бота — уведомлять некого
+
+        return json.dumps({
+            "draft_id": draft_id,
+            "status": "pending",
+            "note": "Черновик отправлен на одобрение админу. До одобрения по этому препарату "
+                    "работает только учёт приёма, без рекомендаций дозы.",
+        }, ensure_ascii=False)
+
+    return json.dumps({"error": f"Неизвестное действие: {action}. Допустимо: fetch, save"}, ensure_ascii=False)
+
+
 _PLAN_SLOT_LABELS = {"breakfast": "🍳 Завтрак", "lunch": "🍲 Обед", "dinner": "🍛 Ужин", "snack": "🍎 Перекус"}
 
 
@@ -4886,6 +4947,7 @@ def register(ctx):
         ("log_anthropometry", handle_log_anthropometry, schemas.log_anthropometry_schema),
         ("log_med", handle_log_med, schemas.log_med_schema),
         ("pharma", handle_pharma, schemas.pharma_schema),
+        ("drug_card_draft", handle_drug_card_draft, schemas.drug_card_draft_schema),
         ("plans", handle_plans, schemas.plans_schema),
         ("import_scale_export", handle_import_scale_export, schemas.import_scale_export_schema),
         ("get_day_summary", handle_get_day_summary, schemas.get_day_summary_schema),
@@ -5004,7 +5066,7 @@ if __name__ == "__main__":
         expected_tools = {
             "log_food", "log_water", "log_glucose", "log_side_effect", "log_labs", "log_sleep", "log_weight",
             "equipment", "plan_day", "log_workout", "refeed", "sick", "forecast",
-            "log_anthropometry", "log_med", "pharma", "plans", "import_scale_export",
+            "log_anthropometry", "log_med", "pharma", "drug_card_draft", "plans", "import_scale_export",
             "get_day_summary", "get_trends", "get_status_bar",
             "query_metrics", "query_food", "pantry", "style", "explain_target", "get_progress",
             "get_evening_report", "register_user", "set_milestone", "admin_cmd", "help",
@@ -6279,6 +6341,11 @@ if __name__ == "__main__":
             "log_anthropometry": {"site": "талия", "value_cm": 85.0},
             "log_med": {"drug": "Тест", "dose": "1", "route": "oral"},
             "log_workout": {"sport": "Бег", "duration_min": 30, "kcal": 250},
+            # action=fetch бьёт в сеть (openFDA/ClinicalTrials.gov) — самотесты сеть
+            # не трогают (см. TEST в card_drafts.py, где HTTP подменяется). save не
+            # сетевой, им и проверяем контракт полей.
+            "drug_card_draft": {"action": "save", "substance": "Тестовый Драфт-Смоук",
+                                 "fields": {"status": "не зарегистрирован"}, "sources": ["https://example.com"]},
         }
 
         _gen_saved_caller = tools_module._caller_telegram_id

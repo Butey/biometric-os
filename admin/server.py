@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root: for `migrate` and `plugin`
 
 from admin import auth, pages, upload
+from health_core import card_drafts
 from health_core.config import CONFIG_PATH, load as load_config, user_today
 from health_core.db import DB_PATH, connect, migrate as db_migrate
 _connect = connect
@@ -564,6 +565,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/personas": self._get_personas,
                 "/actions": self._get_actions,
                 "/knowledge": self._get_knowledge,
+                "/drafts": self._get_drafts,
             }
             if parsed.path == "/alerts":
                 return self._get_alerts(query)
@@ -603,6 +605,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/plans/template/delete": self._post_plans_template_delete,
                 "/workouts/save": self._post_workouts_save,
                 "/workouts/delete": self._post_workouts_delete,
+                "/drafts": self._post_drafts,
             }
             handler = routes.get(parsed.path)
             if handler is None:
@@ -1467,6 +1470,80 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = pages.personas_page(self._persona_rows(conn), sess["csrf"])
             self._html(200, self._layout("Персоны", body, sess["csrf"], active="personas"))
+        finally:
+            conn.close()
+
+    # ---------------------------------------------------------------- drug card drafts
+
+    def _draft_rows(self, conn) -> list[dict]:
+        """Pending-черновики (health_core/card_drafts.py) с полями/источниками из
+        JSON и telegram_user_id запросившего — ровно то, что рисует drafts_page."""
+        out = []
+        for row in card_drafts.pending_drafts(conn):
+            who = conn.execute(
+                "SELECT telegram_user_id FROM users WHERE id=?", (row["requested_by_user_id"],)
+            ).fetchone()
+            out.append({
+                "id": row["id"],
+                "substance": row["substance"],
+                "fields": json.loads(row["fields_json"] or "{}"),
+                "sources": json.loads(row["sources_json"] or "[]"),
+                "requested_by": who["telegram_user_id"] if who else row["requested_by_user_id"],
+                "created_at": row["created_at"],
+            })
+        return out
+
+    def _get_drafts(self):
+        ctx = self._require_auth()
+        if ctx is None:
+            return
+        conn, _user_id, _token, sess = ctx
+        try:
+            body = pages.drafts_page(self._draft_rows(conn), sess["csrf"])
+            self._html(200, self._layout("Черновики карт", body, sess["csrf"], active="drafts"))
+        finally:
+            conn.close()
+
+    def _post_drafts(self):
+        ctx = self._require_auth()
+        if ctx is None:
+            return
+        conn, _user_id, _token, sess = ctx
+        try:
+            form = self._read_form()
+            if not auth.csrf_ok(sess, form.get("csrf_token")):
+                return self._error_page(403, "Неверный CSRF-токен.")
+            try:
+                draft_id = int(form.get("id", ""))
+            except ValueError:
+                return self._error_page(400, "Некорректный id черновика.")
+
+            action = form.get("action")
+            error = None
+            if action == "reject":
+                card_drafts.reject(conn, draft_id)
+            elif action == "approve":
+                fields = {
+                    "status": form.get("status") or "",
+                    "ladder": form.get("ladder") or "",
+                    "min_weeks": form.get("min_weeks") or "",
+                    "interval_days": form.get("interval_days") or "",
+                    "half_life_days": form.get("half_life_days") or "",
+                    "tmax_h": form.get("tmax_h") or "",
+                    "synonyms": form.get("synonyms") or "",
+                    "source": form.get("source") or "",
+                }
+                try:
+                    card_drafts.approve(conn, draft_id, fields)
+                except ValueError as e:
+                    error = str(e)
+            else:
+                error = "Неизвестное действие."
+
+            if error:
+                body = pages.drafts_page(self._draft_rows(conn), sess["csrf"], error=error)
+                return self._html(400, self._layout("Черновики карт", body, sess["csrf"], active="drafts"))
+            self._redirect("/drafts")
         finally:
             conn.close()
 

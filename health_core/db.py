@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -393,6 +393,25 @@ CREATE TABLE IF NOT EXISTS side_effects (
     notes TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_side_effects_user_time ON side_effects(user_id, at);
+
+-- v21: черновики карт препаратов (health_core/card_drafts.py, docs/adr/0002 и
+-- CONTEXT.md «Черновик карты»). Модель составляет черновик по официальным
+-- источникам (openFDA/ClinicalTrials.gov) для препарата без карты; админ
+-- одобряет или отклоняет в панели (/drafts). До одобрения черновик не
+-- действует — substance держит только учёт приёма. Один pending-черновик на
+-- канонический препарат: save_draft() при повторном запросе отдаёт тот же id,
+-- а не плодит дубликаты.
+CREATE TABLE IF NOT EXISTS card_drafts (
+    id INTEGER PRIMARY KEY,
+    requested_by_user_id INTEGER NOT NULL REFERENCES users(id),
+    substance TEXT NOT NULL,
+    fields_json TEXT NOT NULL,
+    sources_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+    created_at TEXT NOT NULL,
+    decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_card_drafts_status ON card_drafts(status);
 """
 
 
@@ -516,6 +535,21 @@ def _migrate_v19_to_v20(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_side_effects_user_time ON side_effects(user_id, at)")
 
 
+def _migrate_v20_to_v21(conn: sqlite3.Connection) -> None:
+    """v20->v21: card_drafts — новая таблица, CREATE TABLE IF NOT EXISTS в DDL
+    уже создаёт её идемпотентно (тот же путь, что _migrate_v19_to_v20 для
+    side_effects). Отдельный шаг — только чтобы номер версии не перепрыгивал
+    молча мимо card_drafts на базах со старой версией."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS card_drafts ("
+        "id INTEGER PRIMARY KEY, requested_by_user_id INTEGER NOT NULL REFERENCES users(id), "
+        "substance TEXT NOT NULL, fields_json TEXT NOT NULL, sources_json TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')), "
+        "created_at TEXT NOT NULL, decided_at TEXT)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_card_drafts_status ON card_drafts(status)")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
     row = conn.execute("SELECT version FROM schema_version").fetchone()
@@ -552,6 +586,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v18_to_v19(conn)
         if row["version"] < 20:
             _migrate_v19_to_v20(conn)
+        if row["version"] < 21:
+            _migrate_v20_to_v21(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 
