@@ -3795,6 +3795,19 @@ def handle_register_user(params: dict) -> str:
     # {"start": "HH:MM", "end": "HH:MM"}, частичный — health_core.chrono.meal_windows
     # мержит его с config.yaml meals.* по каждому приёму отдельно.
     meal_windows_param = params.get("meal_windows")
+    if meal_windows_param is not None:
+        # окна сравниваются строками ЧЧ:ММ, а скрипт напоминаний делает int(); "7:00" сломал бы оба
+        _hhmm = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
+        if not (isinstance(meal_windows_param, dict) and meal_windows_param and all(
+            name in ("breakfast", "lunch", "dinner") and isinstance(w, dict) and w and set(w) <= {"start", "end"}
+            and all(isinstance(v, str) and _hhmm.fullmatch(v) for v in w.values())
+            and not ("start" in w and "end" in w and w["start"] >= w["end"])
+            for name, w in meal_windows_param.items()
+        )):
+            conn.close()
+            return json.dumps({"error": "meal_windows: объект {breakfast|lunch|dinner: {start, end}}, "
+                                        "время строго ЧЧ:ММ (например \"07:00\"), start раньше end"},
+                              ensure_ascii=False)
     meal_windows_json = (
         json.dumps(meal_windows_param, ensure_ascii=False) if meal_windows_param is not None else None
     )
@@ -6711,6 +6724,15 @@ if __name__ == "__main__":
                 f"личное окно завтрака должно сохраниться, получили {a_windows['breakfast']}"
             assert a_windows["lunch"]["start"] == "12:00", "частичное переопределение не трогает lunch"
             print("OK: meal_windows задаётся через register_user, частично переопределяя умолчание")
+
+            bad = json.loads(ctx.tools["register_user"]["handler"]({
+                "height_cm": 185, "birth_date": "1992-08-09", "sex": "m",
+                "meal_windows": {"breakfast": {"start": "7:00", "end": "11:00"}},
+            }))
+            assert "error" in bad, f"окно без ведущего нуля должно отклоняться: {bad}"
+            assert _mw(conn, user_a_id)["breakfast"] == {"start": "06:00", "end": "09:00"}, \
+                "отклонённый запрос не должен менять сохранённые окна"
+            print("OK: некорректные meal_windows отклоняются, сохранённые окна не трогаются")
 
         finally:
             tools_module._CALLER_FALLBACK.set(None)
