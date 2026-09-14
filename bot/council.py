@@ -148,7 +148,10 @@ async def _call_one(session: aiohttp.ClientSession, system: str, user_text: str,
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
     for attempt in range(max_retries + 1):
         try:
-            message = await llm.chat(session, messages, [], [provider], timeout_s=timeout_s)
+            # timeout_s провайдера — короткий чатовый (быстрый фолбэк), консилиуму
+            # нужен свой в минуты, иначе он перебивает council.timeout_s.
+            message = await llm.chat(session, messages, [], [{**provider, "timeout_s": timeout_s}],
+                                     timeout_s=timeout_s)
             text = (message.get("content") or "").strip()
             if text:
                 return text

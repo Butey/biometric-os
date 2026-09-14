@@ -7,12 +7,12 @@
 """
 import argparse
 import sys
-from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")
 
+from health_core.config import user_today
 from health_core.db import connect, migrate
 
 
@@ -36,10 +36,10 @@ def main() -> int:
         return 1
 
     blocks = []
-    today = date.today().isoformat()
 
     for u in users:
         try:
+            today = user_today(conn, u["id"])
             # Запрос инъекций, расписанных для этого пользователя
             rows = conn.execute(
                 "SELECT substance, dose, unit, next_at FROM med_schedule "

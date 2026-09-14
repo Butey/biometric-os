@@ -79,11 +79,14 @@ def user_now(conn: sqlite3.Connection, user_id: int) -> datetime:
     день, а гардрейлы недоедания срабатывают на пустом месте. Живой случай,
     пойман 2026-08-22.
 
-    Пояс берём из профиля (users.timezone). Не задан или неизвестен — падаем
-    на время сервера: это хуже, но предсказуемо, и не роняет запись.
+    Пояс берём из профиля (users.timezone). Не задан или неизвестен — берём
+    default_timezone из config.yaml, и только при его отсутствии падаем на
+    время сервера.
     """
     row = conn.execute("SELECT timezone FROM users WHERE id=?", (user_id,)).fetchone()
     name = row["timezone"] if row is not None else None
+    if not name:
+        name = (load().get("schedule") or {}).get("default_timezone")
     if name:
         try:
             return datetime.now(ZoneInfo(name)).replace(tzinfo=None)

@@ -410,6 +410,54 @@ def test_log_food_without_meal_slot_assigns_by_window():
         conn.close()
 
 
+def test_log_food_without_eaten_at_uses_user_timezone():
+    """Запись еды без eaten_at и со сброшенным _TZ ContextVar обязана использовать
+    часовой пояс пользователя из БД (users.timezone), а не системное время сервера."""
+    conn = connect()
+    conn.execute("DELETE FROM alerts WHERE user_id=780")
+    conn.execute("DELETE FROM food_log WHERE user_id=780")
+    conn.execute("DELETE FROM users WHERE id=780")
+    conn.execute(
+        "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+        "base_weight_kg,base_weight_date,created_at) VALUES(780,'780',170,'1990-01-01',"
+        "'m','Asia/Tokyo',70,'2026-01-01','2026-01-01 00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from health_core import config
+    from bot.registry import _tools
+    _tools._CALLER_FALLBACK.set(None)
+    config.set_tz(None)
+
+    try:
+        from plugin.tools import handle_log_food
+        out = json.loads(handle_log_food({
+            "user_id": 780,
+            "items": [{"name": "Тофу", "kcal": 100, "protein_g": 10, "fat_g": 5, "carbs_g": 2}],
+        }))
+        assert "error" not in out, f"Ошибка записи: {out}"
+        conn = connect()
+        row = conn.execute("SELECT eaten_at FROM food_log WHERE user_id=780 ORDER BY id DESC LIMIT 1").fetchone()
+        conn.close()
+        assert row is not None
+        eaten_dt = datetime.strptime(row["eaten_at"], "%Y-%m-%d %H:%M:%S")
+        tokyo_now = datetime.now(ZoneInfo("Asia/Tokyo")).replace(tzinfo=None)
+        assert abs((eaten_dt - tokyo_now).total_seconds()) < 60, (
+            f"Запись должна быть в поясе Токио (~{tokyo_now}), получили {eaten_dt}"
+        )
+    finally:
+        config.set_tz(None)
+        conn = connect()
+        conn.execute("DELETE FROM alerts WHERE user_id=780")
+        conn.execute("DELETE FROM food_log WHERE user_id=780")
+        conn.execute("DELETE FROM users WHERE id=780")
+        conn.commit()
+        conn.close()
+
+
 def test_long_answer_split():
     text = "\n\n".join(["абзац " + "я" * 300 for _ in range(40)])
     parts = main._chunks(text, main.TELEGRAM_LIMIT)
@@ -690,6 +738,36 @@ def test_council_request_creates_running_and_answers_immediately():
         council._PENDING_RUNS.clear()
     finally:
         conn.close()
+
+
+def test_council_timeout_and_shared_nvidia_quota():
+    """Консилиум не должен получать короткий чатовый timeout_s провайдера, а 429
+    одной модели из пула NVIDIA (quota_group) охлаждает ключ и для соседней."""
+    import time
+    from bot import council
+    seen = []
+
+    async def _post(session, url, headers, payload, timeout_s=None):
+        seen.append((payload["model"], timeout_s))
+        if payload["model"] == "kimi":
+            return 429, {"error": {"message": "retry in 30s"}}
+        return 200, {"choices": [{"message": {"content": "ok"}}]}
+
+    llm._post = _post
+    llm._KEY_STATES.clear()
+    base = {"base_url": "http://nv", "api_key_env": "FAKE_KEY", "quota_group": "nvidia", "timeout_s": 15}
+    try:
+        asyncio.run(llm.chat(None, [{"role": "user", "content": "?"}], [], [{**base, "model": "kimi"}]))
+    except Exception:
+        pass
+    assert llm._get_key_state("test", model="nvidia").cooldown_until > time.time()
+    assert seen[-1] == ("kimi", 15), seen
+
+    text = asyncio.run(council._call_one(None, "s", "u", {**base, "model": "ds"},
+                                         timeout_s=300, retry_delay_s=0, max_retries=0))
+    assert text == "ok"
+    assert seen[-1] == ("ds", 300), seen
+    llm._KEY_STATES.clear()
 
 
 if __name__ == "__main__":

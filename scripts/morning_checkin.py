@@ -19,7 +19,7 @@ from health_core.guards import check_all
 from health_core.chrono import caffeine_cutoff
 from health_core.meds import stock_runs_out
 from health_core import sick, council_data
-from health_core.config import local_now
+from health_core.config import user_today
 from bot import council as bot_council
 from admin.auth import load_env_file
 import notify  # рядом лежащий скрипт (scripts/), тот же способ доставки, что и у него
@@ -59,7 +59,7 @@ def main() -> int:
             for w in stock_runs_out(conn, u["id"]):
                 ra = w["runs_out_at"]
                 block_lines.append(f"💊 {w['substance']}: запаса хватит до {ra[8:10]}.{ra[5:7]} — пополни")
-            today = local_now().date().isoformat()
+            today = user_today(conn, u["id"])
             st = sick.status(conn, u["id"], today)
             if st["sick"]:
                 until = st["until"]
