@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 24
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS users (
     base_weight_date TEXT,
     created_at TEXT NOT NULL,
     health_notes TEXT,
-    meal_windows TEXT
+    meal_windows TEXT,
+    hr_max_bpm INTEGER,
+    hr_max_source TEXT CHECK(hr_max_source IN ('test','watch'))
 );
 
 CREATE TABLE IF NOT EXISTS user_targets (
@@ -582,6 +584,17 @@ def _migrate_v21_to_v22(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_council_runs_user_time ON council_runs(user_id, started_at)")
 
 
+def _migrate_v23_to_v24(conn: sqlite3.Connection) -> None:
+    """v23->v24: users.hr_max_bpm/hr_max_source — личный максимальный пульс
+    (CONTEXT.md «Максимальный пульс»): из нагрузочного теста или с часов,
+    хранится с пометкой источника; без него health_core.hr_zones падает на
+    формулу Tanaka. Независим от параллельной миграции v22->v23 (Open Food
+    Facts/мои продукты) — оба шага идут через идемпотентный _add_column и не
+    читают состояние друг друга."""
+    _add_column(conn, "users", "hr_max_bpm", "INTEGER")
+    _add_column(conn, "users", "hr_max_source", "TEXT CHECK(hr_max_source IN ('test','watch'))")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
     row = conn.execute("SELECT version FROM schema_version").fetchone()
@@ -622,6 +635,10 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v20_to_v21(conn)
         if row["version"] < 22:
             _migrate_v21_to_v22(conn)
+        # v22->v23 (Open Food Facts/мои продукты) — параллельная миграция, не
+        # этот шаг; v23->v24 не зависит от неё (см. _migrate_v23_to_v24).
+        if row["version"] < 24:
+            _migrate_v23_to_v24(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 

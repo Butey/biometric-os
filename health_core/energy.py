@@ -376,13 +376,18 @@ def _deadline_deficit(conn: sqlite3.Connection, user_id: int, milestone: sqlite3
     жира/FFMI в §09 нет формулы перевода в ккал, и придумывать её здесь не
     будем; такая веха срока дефицита не диктует (как если бы у неё не было
     deadline). Возвращает None, если дефицит неприменим, float('inf'), если
-    срок уже наступил/прошёл (дефицит физически недостижим за 0 дней)."""
+    срок уже наступил/прошёл (дефицит физически недостижим за 0 дней).
+
+    Отправная точка — сглаженный вес (_smoothed_weight_kg), а не последнее
+    единичное взвешивание: один шумный день на весах не обязан двигать
+    требуемый дефицит так же, как он не двигает потолок дефицита (см.
+    _deficit_cap_kcal)."""
     if milestone["metric"] != "weight_kg":
         return None
-    metric_row = _latest_metric(conn, user_id)
-    if metric_row is None:
+    weight = _smoothed_weight_kg(conn, user_id)
+    if weight is None:
         return None
-    required_kg = metric_row["weight_kg"] - milestone["threshold"]
+    required_kg = weight - milestone["threshold"]
     if required_kg <= 0:
         return 0.0  # порог уже физически достигнут, achieved_at просто не проставлен
     days_remaining = (
@@ -429,6 +434,78 @@ def _weekday_multiplier(date_: str) -> float:
         return 1.0
     weekday = date.fromisoformat(date_[:10]).weekday()  # Monday=0 ... Sunday=6
     return mults[weekday] / avg
+
+
+def deadline_verdict(conn: sqlite3.Connection, user_id: int, date_: str | None = None) -> dict | None:
+    """Честный вердикт по сроку активной вехи (CONTEXT.md «Недостижимый срок»).
+
+    None — активной вехи со сроком нет (см. _active_milestone). Иначе:
+      milestone/deadline    — имя и срок вехи.
+      plan_below_floor      — план питания требует дефицита глубже пола
+                               калоража (kcal_floor): то же условие, что
+                               daily_target() кладёт в тег "deadline_unreachable"
+                               внутри computed_from, — только план, не факт.
+      forecast_reach         — health_core.forecast.reach() по фактически
+                               залогированному питанию к порогу вехи, если
+                               данных хватило, иначе None.
+      unreachable             — True, только когда ОБА признака недостижимости
+                               выполнены разом: план ниже пола И прогноз по
+                               факту не доходит до цели к сроку (не уложился в
+                               горизонт, или уложился позже дедлайна). False —
+                               план ниже пола, но факт всё же успевает (или
+                               план в пол укладывается вовсе — тогда вопрос о
+                               недостижимости не встаёт). None — прогноза нет
+                               (еды залогировано меньше 11 дней из 14 и т.п.):
+                               подтвердить или опровергнуть срок нечем.
+      forecast_note           — причина отсутствия прогноза, только когда
+                               unreachable is None.
+    """
+    if date_ is None:
+        date_ = local_now().date().isoformat()
+    milestone = _active_milestone(conn, user_id)
+    if milestone is None:
+        return None
+
+    # Те же примитивы (шаг 1 и пол §09), что daily_target() уже считает для
+    # этой же даты — деривация одна и та же, вызвана заново для вехи-вердикта.
+    milestone_deficit = _deadline_deficit(conn, user_id, milestone, date_)
+    adaptive = adaptive_tdee(conn, user_id, for_date=date_)
+    if adaptive is not None:
+        base = adaptive
+    else:
+        base = bmr_floor(conn, user_id) * (load()["policy"].get("activity_factor") or 1.0)
+    full_tdee = base + _tcx_net(conn, user_id, date_)
+    floor, _ = kcal_floor(conn, user_id, full_tdee)
+    # milestone_deficit истинный: не None, не 0.0 (порог уже достигнут), не
+    # inf-нейтральный по умолчанию — тот же гейт, что в daily_target().
+    plan_below_floor = bool(milestone_deficit) and (full_tdee - milestone_deficit) < floor
+
+    verdict = {
+        "milestone": milestone["name"],
+        "deadline": milestone["deadline"],
+        "plan_below_floor": plan_below_floor,
+    }
+    if not plan_below_floor:
+        verdict["forecast_reach"] = None
+        verdict["unreachable"] = False
+        return verdict
+
+    from health_core import forecast  # локальный импорт: forecast.py сам импортирует energy.py
+    fr = forecast.reach(conn, user_id, milestone["threshold"])
+    if "error" in fr:
+        verdict["forecast_reach"] = None
+        verdict["unreachable"] = None
+        verdict["forecast_note"] = fr["error"]
+        return verdict
+
+    verdict["forecast_reach"] = fr
+    if fr.get("reached"):
+        verdict["unreachable"] = (
+            date.fromisoformat(fr["earliest"][:10]) > date.fromisoformat(milestone["deadline"][:10])
+        )
+    else:
+        verdict["unreachable"] = True  # цель за горизонт модели тоже не встречает срок
+    return verdict
 
 
 def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
@@ -564,6 +641,7 @@ def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
         "tcx_net": tcx_net,
         "active_milestone": active_milestone_name,
         "deadline_unreachable": deadline_unreachable,
+        "deadline_verdict": deadline_verdict(conn, user_id, date),
         "refeed": refeed,
         "sick": sick,
     }
@@ -880,6 +958,68 @@ if __name__ == "__main__":
         assert nofat_reason == "bmr" and abs(nofat_floor - bmr_floor(conn, uid)) < 1e-6
         print("OK: пол считается от доли предела Alpert по проценту жира, "
               "подпёрт макро-минимумом и падает на BMR без биоимпеданса")
+
+        # ---- deadline_verdict: честный вердикт срока (CONTEXT.md «Недостижимый срок») ----
+        # План ниже пола (8 кг за 20/40 дней требует дефицита сильно глубже пола
+        # для 100кг/30% жира) в обоих случаях — различается только срок, поэтому
+        # прогноз по фактическому логу (1400 ккал/сут, 12 из 14 дней) один и тот же.
+        _reset_metrics()
+        today = local_now().date()
+        for days_ago in range(13, -1, -1):
+            _add_metric(days_ago, 100.0, fat_pct=30.0, ffm_kg=70.0)
+        conn.execute("DELETE FROM food_log WHERE user_id=?", (uid,))
+        for days_ago in range(13, 1, -1):
+            d = (today - timedelta(days=days_ago)).isoformat()
+            cur = conn.execute(
+                "INSERT INTO food_log(user_id, eaten_at, meal_slot) VALUES (?, ?, 'lunch')",
+                (uid, f"{d} 12:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO food_items(food_log_id, name, kcal) VALUES (?, 'selfcheck-food', 1400)",
+                (cur.lastrowid,),
+            )
+        conn.commit()
+
+        # плана хватает — дефицит успевает в срок (40 дней)
+        conn.execute("DELETE FROM milestones WHERE user_id=?", (uid,))
+        conn.execute(
+            "INSERT INTO milestones(user_id, name, metric, threshold, deadline) VALUES (?, 'dv-loose', 'weight_kg', 92, ?)",
+            (uid, (today + timedelta(days=40)).isoformat()),
+        )
+        conn.commit()
+        v_ok = deadline_verdict(conn, uid, today.isoformat())
+        assert v_ok is not None and v_ok["plan_below_floor"] is True, v_ok
+        assert v_ok["forecast_reach"] is not None and v_ok["forecast_reach"]["reached"] is True, v_ok
+        assert v_ok["unreachable"] is False, v_ok
+        print(f"OK: план ниже пола, прогноз успевает к {v_ok['deadline']} "
+              f"(earliest={v_ok['forecast_reach']['earliest']}) -> unreachable False")
+
+        # тот же план и лог, но срок туже — прогноз по факту к сроку не успевает
+        conn.execute("DELETE FROM milestones WHERE user_id=?", (uid,))
+        conn.execute(
+            "INSERT INTO milestones(user_id, name, metric, threshold, deadline) VALUES (?, 'dv-tight', 'weight_kg', 92, ?)",
+            (uid, (today + timedelta(days=20)).isoformat()),
+        )
+        conn.commit()
+        v_bad = deadline_verdict(conn, uid, today.isoformat())
+        assert v_bad["plan_below_floor"] is True, v_bad
+        assert v_bad["unreachable"] is True, v_bad
+        print(f"OK: план ниже пола, прогноз к {v_bad['deadline']} не успевает "
+              f"(earliest={v_bad['forecast_reach']['earliest']}) -> unreachable True")
+
+        # тот же план и срок, но еды залогировано меньше 11/14 дней -> прогноза нет
+        conn.execute("DELETE FROM food_log WHERE user_id=?", (uid,))
+        conn.commit()
+        v_none = deadline_verdict(conn, uid, today.isoformat())
+        assert v_none["plan_below_floor"] is True, v_none
+        assert v_none["forecast_reach"] is None and v_none["unreachable"] is None, v_none
+        assert v_none.get("forecast_note"), "unreachable=None обязан объяснять причину в forecast_note"
+        print(f"OK: план ниже пола, прогноза нет ({v_none['forecast_note']}) -> unreachable None")
+
+        conn.execute("DELETE FROM milestones WHERE user_id=?", (uid,))
+        conn.commit()
+        assert deadline_verdict(conn, uid, today.isoformat()) is None, "без активной вехи со сроком вердикта нет"
+        print("OK: без активной вехи со сроком deadline_verdict возвращает None")
 
         conn.close()
         print("OK: energy.py self-check passed")

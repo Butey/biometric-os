@@ -1,7 +1,9 @@
 """Пульсовые зоны по формуле Tanaka: HRmax = 208 − 0.7 × возраст.
 
 После 30 лет эта формула точнее, чем классическая «220 − возраст». Все зоны —
-проценты от HRmax. Калибровка через hr_max_offset (измеренный максимум − формула).
+проценты от HRmax. Личный максимум (нагрузочный тест или часы, CONTEXT.md
+«Максимальный пульс») заменяет формулу целиком, а не поправляет её оффсетом —
+без него используется оценка по возрасту.
 """
 
 from datetime import datetime
@@ -9,17 +11,16 @@ from datetime import datetime
 from health_core.config import load, local_now
 
 
-def hr_max(age: int, offset: int = 0) -> float:
-    """HRmax по Tanaka (208 − 0.7 × возраст), плюс калибровка.
+def hr_max(age: int) -> float:
+    """HRmax по Tanaka (208 − 0.7 × возраст) — оценка, когда личного максимума нет.
 
     Args:
         age: Полные годы.
-        offset: Поправка к формуле (разница между измеренным и расчётным максимумом).
 
     Returns:
         Максимальная ЧСС, не округлено.
     """
-    return 208 - 0.7 * age + offset
+    return 208 - 0.7 * age
 
 
 def zones(conn, user_id, on_date: str | None = None) -> dict | None:
@@ -31,14 +32,15 @@ def zones(conn, user_id, on_date: str | None = None) -> dict | None:
         on_date: Дата в формате YYYY-MM-DD. По умолчанию — текущая дата.
 
     Returns:
-        Словарь {"age": int, "hr_max": int, "zone2": [int, int], "ceiling": int}
-        или None, если дата рождения отсутствует в профиле.
+        Словарь {"age": int, "hr_max": int, "hr_max_source": str, "zone2": [int, int],
+        "ceiling": int} или None, если дата рождения отсутствует в профиле.
+        hr_max_source — "test"/"watch" при личном максимуме, иначе "formula".
     """
     if on_date is None:
         on_date = local_now().date().isoformat()
 
     user = conn.execute(
-        "SELECT birth_date FROM users WHERE id=?", (user_id,)
+        "SELECT birth_date, hr_max_bpm, hr_max_source FROM users WHERE id=?", (user_id,)
     ).fetchone()
 
     if user is None or user["birth_date"] is None:
@@ -51,10 +53,16 @@ def zones(conn, user_id, on_date: str | None = None) -> dict | None:
     if (target.month, target.day) < (birth.month, birth.day):
         age -= 1
 
-    cfg = load()["training"]
-    hr_max_offset = cfg.get("hr_max_offset", 0)
-    m = hr_max(age, hr_max_offset)
+    # Личный максимум (тест/часы) заменяет формулу целиком — CONTEXT.md
+    # «Максимальный пульс»: у конкретного человека формула ошибается на ±10.
+    if user["hr_max_bpm"]:
+        m = user["hr_max_bpm"]
+        source = user["hr_max_source"]
+    else:
+        m = hr_max(age)
+        source = "formula"
 
+    cfg = load()["training"]
     zone2_low_pct = cfg["zone2_low_pct"]
     zone2_high_pct = cfg["zone2_high_pct"]
     hr_ceiling_pct = cfg["hr_ceiling_pct"]
@@ -62,6 +70,7 @@ def zones(conn, user_id, on_date: str | None = None) -> dict | None:
     return {
         "age": age,
         "hr_max": round(m),
+        "hr_max_source": source,
         "zone2": [round(m * zone2_low_pct), round(m * zone2_high_pct)],
         "ceiling": round(m * hr_ceiling_pct),
     }
@@ -108,11 +117,12 @@ if __name__ == "__main__":
     )
     uid = conn.execute("SELECT id FROM users WHERE telegram_user_id=1").fetchone()["id"]
 
-    # zones() на 2026-09-13 -> возраст 34
+    # zones() на 2026-09-13 -> возраст 34, без личного максимума -> формула
     z = zones(conn, uid, "2026-09-13")
     assert z is not None
     assert z["age"] == 34, f"expected age 34, got {z['age']}"
     assert z["hr_max"] == 184, f"expected hr_max 184, got {z['hr_max']}"
+    assert z["hr_max_source"] == "formula", z["hr_max_source"]
     assert z["zone2"] == [120, 134], f"expected zone2 [120, 134], got {z['zone2']}"
     assert z["ceiling"] == 140, f"expected ceiling 140, got {z['ceiling']}"
 
@@ -138,5 +148,12 @@ if __name__ == "__main__":
     z_none = zones(conn, uid_no_bd, "2026-09-13")
     assert z_none is None, "zones() should return None if birth_date is missing"
 
+    # Личный максимум из теста заменяет формулу целиком, source == "test"
+    conn.execute("UPDATE users SET hr_max_bpm=185, hr_max_source='test' WHERE id=?", (uid,))
+    z3 = zones(conn, uid, "2026-09-13")
+    assert z3["hr_max"] == 185, f"expected personal hr_max 185, got {z3['hr_max']}"
+    assert z3["hr_max_source"] == "test", z3["hr_max_source"]
+    assert z3["zone2"] == [round(185 * 0.65), round(185 * 0.73)], z3["zone2"]
+
     conn.close()
-    print("OK: hr_zones — hr_max, zones (age calc, date logic), classify")
+    print("OK: hr_zones — hr_max, zones (age calc, personal max with source, date logic), classify")
