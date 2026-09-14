@@ -703,6 +703,7 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
         return
 
     await asyncio.to_thread(_close_turn, uid, full[len(prefix):])
+    await _flush_pending_notifications(message.bot)
     await send_long(message, answer)
 
 
@@ -793,6 +794,11 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
         return
 
     await asyncio.to_thread(_close_turn, uid, full[len(prefix):])
+    # drug_card_draft save (plugin/tools.py) ставит уведомление админам в ту же
+    # очередь, что заявки на доступ (_notify_admins_of_request) — здесь, а не
+    # только после run_command, потому что модель зовёт этот тул из обычного
+    # хода диалога, не только из слэш-команды.
+    await _flush_pending_notifications(message.bot)
     await send_long(message, answer)
 
 

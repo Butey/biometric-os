@@ -35,6 +35,7 @@ DESCRIPTIONS = {
     "log_anthropometry": "Записать замер тела сантиметровой лентой: талия, таз, грудь, бедро, шея, бицепс. Также action=list для списка записей (limit опционален), action=delete для удаления по anthropometry_id или последнего замера (без anthropometry_id).",
     "log_med": "Записать приём препарата или инъекцию: название, доза, путь введения. Также action=list для списка записей (limit опционален), action=delete для удаления по med_id или последнего приёма (без med_id).",
     "pharma": "Фарма-расписание: статус и следующая доза, задать/обновить препарат, пополнить остаток, убрать из расписания. schedule держит рамки лестницы титрации из карты препарата (ступень, не выше максимума, сосед по ступени не раньше минимального срока, после перерыва в терапии — не выше прежней дозы); by_doctor=true снимает рамки.",
+    "drug_card_draft": "Черновик карты препарата без карты: fetch — официальные тексты по МНН латиницей (openFDA, а если пусто — ClinicalTrials.gov), без веб-поиска; save — черновик ИЗ ЭТИХ текстов на одобрение админу в панели (/drafts). До одобрения по препарату работает только учёт приёма, без рамок дозы.",
     "plans": "Недельный план питания и тренировок: show — показать, set_meal/set_workout — задать, vs_actual — план vs факт, remove_meal/remove_workout/clear — удалить позицию или очистить шаблон.",
     "import_scale_export": "Импортировать файл выгрузки с весов или тренировки (xlsx/xls/csv/tcx, включая путь на Google Диске).",
     "get_day_summary": "Сводка дня: КБЖУ-дашборд, детальный журнал еды по приёмам или общий метаболический пульт.",
@@ -250,7 +251,7 @@ if __name__ == "__main__":
     expected_tools = {
         "log_food", "log_water", "log_glucose", "log_side_effect", "log_labs", "log_sleep", "log_weight",
         "equipment", "plan_day", "log_workout", "refeed", "sick", "forecast",
-        "log_anthropometry", "log_med", "pharma", "plans", "import_scale_export",
+        "log_anthropometry", "log_med", "pharma", "drug_card_draft", "plans", "import_scale_export",
         "get_day_summary", "get_trends", "get_status_bar",
         "query_metrics", "query_food", "pantry", "style", "explain_target", "get_progress",
         "get_evening_report", "register_user", "set_milestone", "admin_cmd", "help",

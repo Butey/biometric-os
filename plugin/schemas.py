@@ -877,3 +877,45 @@ sick_schema = {
     },
     "required": []
 }
+
+drug_card_draft_schema = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["fetch", "save"],
+            "description": "fetch — получить официальные тексты по МНН (openFDA, а если там пусто — ClinicalTrials.gov); save — создать черновик карты из ПОЛУЧЕННЫХ fetch текстов и поставить его на одобрение админу. Ни одно из действий не меняет карту препарата сразу — до одобрения в панели действует только учёт приёма"
+        },
+        "inn": {
+            "type": "string",
+            "description": "Для action=fetch: международное непатентованное название препарата ЛАТИНИЦЕЙ (например tirzepatide)"
+        },
+        "substance": {
+            "type": "string",
+            "description": "Для action=save: имя препарата для заголовка карты, как в Knowledge/drug_cards.md (например 'Ретатрутид (Retatrutide)')"
+        },
+        "fields": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "'зарегистрирован' или 'не зарегистрирован (данные исследований)' — только по тексту источника"},
+                "ladder": {"type": "string", "description": "Ступени лестницы титрации через запятую с единицей, например '2, 4, 6, 9, 12 мг'"},
+                "min_weeks": {"type": "string", "description": "Минимум недель на ступени, число"},
+                "interval_days": {"type": "string", "description": "Интервал приёма в днях"},
+                "half_life_days": {"type": "string", "description": "Период полувыведения, например '6 сут'"},
+                "tmax_h": {"type": "string", "description": "Пик концентрации, например '48 ч'"},
+                "synonyms": {"type": "string", "description": "Прочие названия того же препарата через ' / ', если встретились в источниках"}
+            },
+            "description": "Поля карты, составленные ТОЛЬКО из текстов, которые вернул action=fetch — не из памяти. Отсутствующее в источнике поле не передавай"
+        },
+        "sources": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Ссылки на источники (url из fetch, plus https://clinicaltrials.gov/study/<NCTId> для протоколов) — попадают в поле 'Источник' карты после одобрения"
+        },
+        "user_id": {
+            "type": "integer",
+            "description": "ID пользователя"
+        }
+    },
+    "required": []
+}

@@ -59,7 +59,7 @@ os.environ["FAKE_KEY"] = "test"
 def test_tool_specs():
     specs = main.tool_specs()
     names = [s["function"]["name"] for s in specs]
-    assert len(names) == 34, f"33 инструмента плагина + knowledge, получено {len(names)}"
+    assert len(names) == 35, f"34 инструмента плагина + knowledge, получено {len(names)}"
     assert "knowledge" in names, "инструмент знаний не подключён"
     assert "log_food" in names and "get_status_bar" in names
     for s in specs:
@@ -583,6 +583,63 @@ def test_log_side_effect_add_list_delete():
         assert not found2, f"side_effect_id {side_effect_id} всё ещё есть в list после удаления"
     finally:
         conn.close()
+
+
+def test_drug_card_draft_save_queues_notification():
+    """drug_card_draft save (docs/adr/0002, health_core/card_drafts.py) создаёт
+    pending-черновик и ставит уведомление админам в ту же очередь, что заявки
+    на доступ — _cmd_approve её уже использует (test_access_approval_flow)."""
+    from health_core import card_drafts
+
+    registry.set_caller("997")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM users WHERE id=997")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(997,'997',170,'1990-01-01',"
+            "'female','UTC',65,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+        conn.execute("DELETE FROM card_drafts WHERE substance='Тестовый Смоук-Препарат'")
+        conn.commit()
+
+        main._PENDING_USER_NOTIFICATIONS.clear()
+        admin = next(iter(main.admin_user_ids()))
+
+        result = json.loads(main.dispatch("drug_card_draft", {
+            "action": "save",
+            "substance": "Тестовый Смоук-Препарат",
+            "fields": {"status": "не зарегистрирован (данные исследований)", "ladder": "2, 4, 6 мг"},
+            "sources": ["https://clinicaltrials.gov/study/NCT00000000"],
+        }))
+        assert "draft_id" in result, f"нет draft_id в ответе: {result}"
+        assert result["status"] == "pending", result
+
+        row = conn.execute(
+            "SELECT status FROM card_drafts WHERE id=?", (result["draft_id"],)
+        ).fetchone()
+        assert row is not None and row["status"] == "pending", "черновик не создан или не pending"
+
+        assert any(target == admin and "Новый черновик карты" in text and "/drafts" in text
+                   for target, text in main._PENDING_USER_NOTIFICATIONS), \
+            f"уведомление админу не поставлено в очередь: {main._PENDING_USER_NOTIFICATIONS}"
+
+        # Повторный save по тому же препарату не плодит второй черновик и второе
+        # уведомление — save_draft (health_core/card_drafts.py) отдаёт тот же id.
+        main._PENDING_USER_NOTIFICATIONS.clear()
+        result2 = json.loads(main.dispatch("drug_card_draft", {
+            "action": "save",
+            "substance": "Тестовый Смоук-Препарат",
+            "fields": {}, "sources": [],
+        }))
+        assert result2["draft_id"] == result["draft_id"], "повторный save должен вернуть тот же черновик"
+    finally:
+        conn.execute("DELETE FROM card_drafts WHERE substance='Тестовый Смоук-Препарат'")
+        conn.execute("DELETE FROM users WHERE id=997")
+        conn.commit()
+        conn.close()
+        main._PENDING_USER_NOTIFICATIONS.clear()
 
 
 if __name__ == "__main__":

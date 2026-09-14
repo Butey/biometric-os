@@ -290,6 +290,7 @@ NAV = [
     ("keys", "/keys", "Ключи и Модели"),
     ("alerts", "/alerts", "Алерты"),
     ("personas", "/personas", "Персоны"),
+    ("drafts", "/drafts", "Черновики карт"),
     ("actions", "/actions", "Действия"),
     ("knowledge", "/knowledge", "Знания"),
     ("plans", "/plans", "Планы"),
@@ -1322,6 +1323,69 @@ def personas_page(personas: list[dict], csrf_token: str, error: str | None = Non
         cards = "".join(blocks)
 
     return f"<h2>Персоны</h2>{error_html}{summary_html}{cards}"
+
+
+# ---------------------------------------------------------------- drug card drafts
+
+def drafts_page(drafts: list[dict], csrf_token: str, error: str | None = None) -> str:
+    """Pending-черновики карт (health_core/card_drafts.py, CONTEXT.md «Черновик
+    карты», docs/adr/0002): одна карточка на черновик, поля редактируемые —
+    цифры составила модель по официальным источникам, но подтверждает их
+    администратор, а не код. Одобрение (approve) дописывает карту в
+    Knowledge/drug_cards.md именно с этими, возможно отредактированными,
+    значениями.
+
+    drafts — [{"id", "substance", "fields": {...}, "sources": [...],
+    "requested_by", "created_at"}, ...], как собирает admin/server.py::_draft_rows.
+    """
+    error_html = f'<p class="error">{_e(error)}</p>' if error else ""
+    if not drafts:
+        return f'<h2>Черновики карт</h2>{error_html}<div class="card"><p>Черновиков, ждущих решения, нет.</p></div>'
+
+    def field(label: str, name: str, value) -> str:
+        return (f'<div><label>{_e(label)}</label>'
+                f'<input type="text" name="{name}" value="{_e(value)}"></div>')
+
+    blocks = []
+    for d in drafts:
+        f = d["fields"] if isinstance(d.get("fields"), dict) else {}
+        sources = d.get("sources") or []
+        sources_html = "".join(
+            f'<li><a href="{_e(u)}" target="_blank" rel="noopener">{_e(u)}</a></li>' for u in sources
+        ) or "<li>—</li>"
+        source_default = f.get("source") or "; ".join(sources)
+        blocks.append(f"""
+<div class="card">
+  <h3>#{_e(d['id'])} · {_e(d['substance'])}</h3>
+  <p class="comment">Запросил пользователь {_e(d['requested_by'])} · {_e(d['created_at'])}</p>
+  <p class="comment error">Составлено моделью по официальным источникам — сверь цифры перед одобрением.</p>
+  <ul>{sources_html}</ul>
+  <form method="post" action="/drafts">
+    {_csrf_field(csrf_token)}
+    <input type="hidden" name="id" value="{_e(d['id'])}">
+    <div class="row">
+      {field("Статус", "status", f.get("status", ""))}
+      {field("Лестница", "ladder", f.get("ladder", ""))}
+    </div>
+    <div class="row">
+      {field("Минимум недель на ступени", "min_weeks", f.get("min_weeks", ""))}
+      {field("Интервал приёма", "interval_days", f.get("interval_days", ""))}
+    </div>
+    <div class="row">
+      {field("Период полувыведения", "half_life_days", f.get("half_life_days", ""))}
+      {field("Пик концентрации", "tmax_h", f.get("tmax_h", ""))}
+    </div>
+    <div class="row">
+      {field("Синонимы (через /)", "synonyms", f.get("synonyms", ""))}
+      {field("Источник", "source", source_default)}
+    </div>
+    <div class="row">
+      <div><button type="submit" name="action" value="approve">Одобрить</button></div>
+      <div><button type="submit" name="action" value="reject" class="danger">Отклонить</button></div>
+    </div>
+  </form>
+</div>""")
+    return f"<h2>Черновики карт</h2>{error_html}{''.join(blocks)}"
 
 
 # ---------------------------------------------------------------- actions
