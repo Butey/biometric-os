@@ -440,16 +440,21 @@ def handle_log_food(params: dict) -> str:
     for i in items:
         nm = str(i.get("name") or "").strip()
         i["name"] = nm if nm else "Блюдо"
-    # meal_slot required в схеме — до сих пор было подсказкой без гейта, а
-    # food_log физически не имел этой колонки: значение писала модель, но оно
-    # молча терялось (schema v5 добавила food_log.meal_slot). Без него нет
-    # разбивки по приёмам и окно LIPID_GUARD (±3ч) не привязано ни к чему —
-    # "запишем как snack по умолчанию" тут хуже честного отказа.
-    if meal_slot not in _MEAL_SLOTS:
+    # meal_slot необязателен (CONTEXT.md «Приём пищи»): передан — используется
+    # как есть, после проверки enum (прямое слово человека побеждает всегда).
+    # Не передан — код сам определяет приём по окнам (health_core.chrono.
+    # meal_slot): в окне и без более раннего приёма этого типа — основной
+    # приём этого окна; иначе (вне окон или позже snack_after_main_minutes
+    # после начала уже состоявшегося приёма) — snack. Больше не подсказка без
+    # гейта: модель либо называет приём словом, либо не передаёт его вовсе.
+    if meal_slot is not None and meal_slot not in _MEAL_SLOTS:
         conn.close()
         return json.dumps(
-            {"error": f"meal_slot обязателен и должен быть одним из {sorted(_MEAL_SLOTS)}, получено {meal_slot!r}"},
+            {"error": f"meal_slot должен быть одним из {sorted(_MEAL_SLOTS)}, получено {meal_slot!r}"},
             ensure_ascii=False)
+    if meal_slot is None:
+        from health_core.chrono import meal_slot as _assign_meal_slot
+        meal_slot = _assign_meal_slot(conn, user_id, datetime.strptime(eaten_at, "%Y-%m-%d %H:%M:%S"))
     # required в схеме — только подсказка модели: Gemini соблюдает её не всегда
     # (наблюдалось на проде — grams в required, а модель всё равно прислала
     # None). Реальный гейт — здесь. kcal/protein_g/fat_g/carbs_g обязательны:
@@ -538,7 +543,7 @@ def handle_log_food(params: dict) -> str:
     conn.close()
 
     return json.dumps(
-        {"status_bar": bar, "alerts": alerts},
+        {"status_bar": bar, "alerts": alerts, "meal_slot": meal_slot},
         ensure_ascii=False,
     )
 
@@ -1686,9 +1691,9 @@ _MEAL_LABELS = {
 
 def _meal_labels_for_day(meals: list[dict]) -> list[tuple[str, str]]:
     """Ярлык каждому приёму дня, в порядке meals_of_day. Слот приходит из базы —
-    его пишет и валидирует log_food (meal_slot там обязателен), и по часам или
-    калориям мы его НЕ угадываем: правило «слот ставится только по прямому слову
-    человека, иначе перекус» живёт в схеме log_food, а не здесь.
+    его пишет log_food: по прямому слову человека или, если слова не было,
+    определяет health_core.chrono.meal_slot по окнам приёма пищи. Часы и
+    калории здесь ни при чём — правило живёт в chrono.meal_slot, а не тут.
 
     Перекусы нумеруются: два «Перекуса» за день иначе неразличимы в журнале.
     None приходит только от строк старше schema v5, когда колонки ещё не было.
@@ -3785,6 +3790,14 @@ def handle_register_user(params: dict) -> str:
     base_weight_kg = params.get("base_weight_kg")
     base_weight_date = params.get("base_weight_date")
     health_notes = params.get("health_notes")
+    # Личные окна приёмов пищи (CONTEXT.md «Окно приёма пищи»), тот же механизм,
+    # что и часовой пояс выше: JSON-объект с ключами breakfast/lunch/dinner ->
+    # {"start": "HH:MM", "end": "HH:MM"}, частичный — health_core.chrono.meal_windows
+    # мержит его с config.yaml meals.* по каждому приёму отдельно.
+    meal_windows_param = params.get("meal_windows")
+    meal_windows_json = (
+        json.dumps(meal_windows_param, ensure_ascii=False) if meal_windows_param is not None else None
+    )
 
     # Профиль без роста, даты рождения и пола бесполезен: BMR по Mifflin считается
     # именно по ним, а без BMR нет ни пола цели, ни гардрейла BMR_FLOOR. Запись,
@@ -3815,17 +3828,19 @@ def handle_register_user(params: dict) -> str:
         "UPDATE users SET height_cm=COALESCE(?,height_cm), birth_date=COALESCE(?,birth_date), "
         "sex=COALESCE(?,sex), timezone=COALESCE(?,timezone), "
         "base_weight_kg=COALESCE(?,base_weight_kg), base_weight_date=COALESCE(?,base_weight_date), "
-        "health_notes=COALESCE(?,health_notes) "
+        "health_notes=COALESCE(?,health_notes), meal_windows=COALESCE(?,meal_windows) "
         "WHERE telegram_user_id=?",
-        (height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes, telegram_user_id),
+        (height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes,
+         meal_windows_json, telegram_user_id),
     )
     created = cur.rowcount == 0
 
     if created:
         cur = conn.execute(
-            "INSERT INTO users(telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes, _now_iso()),
+            "INSERT INTO users(telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes, meal_windows, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes,
+             meal_windows_json, _now_iso()),
         )
         err = _zero_write_error(cur, "register_user: INSERT had no effect")
         if err:
@@ -5818,37 +5833,47 @@ if __name__ == "__main__":
         print("OK: log_med отклоняет отсутствующий и неизвестный route без записи строки, валидный route проходит")
 
         print("\n" + "="*60)
-        print("TEST 23b: log_food meal_slot — required, enum-gated, actually stored (schema v5)")
+        print("TEST 23b: log_food meal_slot — optional, code assigns by window, enum-gated when passed (schema v18)")
         print("="*60)
 
         handler_food = ctx.tools["log_food"]["handler"]
         _food_item = {"name": "Овсянка", "kcal": 300, "protein_g": 10, "fat_g": 8, "carbs_g": 45}
         food_before = conn.execute("SELECT COUNT(*) c FROM food_log").fetchone()["c"]
 
-        r_missing_slot = json.loads(handler_food({"items": [_food_item], "user_id": uid}))
-        assert "error" in r_missing_slot, f"log_food без meal_slot должен вернуть error, получили {r_missing_slot}"
-        assert conn.execute("SELECT COUNT(*) c FROM food_log").fetchone()["c"] == food_before, \
-            "log_food без meal_slot не должен писать строку"
+        # Без meal_slot — код определяет сам по окну (health_core.chrono.meal_slot):
+        # 07:30 без прежнего завтрака в этот день -> breakfast.
+        r_missing_slot = json.loads(handler_food(
+            {"items": [_food_item], "eaten_at": "2026-09-10 07:30:00", "user_id": uid}
+        ))
+        assert "error" not in r_missing_slot, f"log_food без meal_slot не должен быть ошибкой: {r_missing_slot}"
+        assert r_missing_slot.get("meal_slot") == "breakfast", \
+            f"log_food без meal_slot в 07:30 должен назначить breakfast, получили {r_missing_slot}"
+        assert conn.execute("SELECT COUNT(*) c FROM food_log").fetchone()["c"] == food_before + 1, \
+            "log_food без meal_slot обязан писать строку с назначенным приёмом"
+
+        food_after_missing = conn.execute("SELECT COUNT(*) c FROM food_log").fetchone()["c"]
 
         r_bad_slot = json.loads(handler_food(
             {"items": [_food_item], "meal_slot": "brunch", "user_id": uid}
         ))
         assert "error" in r_bad_slot, f"log_food с неизвестным meal_slot должен вернуть error, получили {r_bad_slot}"
-        assert conn.execute("SELECT COUNT(*) c FROM food_log").fetchone()["c"] == food_before, \
+        assert conn.execute("SELECT COUNT(*) c FROM food_log").fetchone()["c"] == food_after_missing, \
             "log_food с неизвестным meal_slot не должен писать строку"
 
         r_ok_slot = json.loads(handler_food(
             {"items": [_food_item], "meal_slot": "breakfast", "user_id": uid}
         ))
         assert "error" not in r_ok_slot, f"валидный log_food с meal_slot='breakfast' сломан: {r_ok_slot}"
+        assert r_ok_slot.get("meal_slot") == "breakfast", \
+            f"переданный meal_slot должен вернуться как есть, получили {r_ok_slot}"
         stored_slot = conn.execute(
             "SELECT meal_slot FROM food_log WHERE user_id=? ORDER BY id DESC LIMIT 1", (uid,)
         ).fetchone()["meal_slot"]
         assert stored_slot == "breakfast", \
             f"meal_slot должен читаться обратно из food_log как 'breakfast', получили {stored_slot!r}"
 
-        print("OK: log_food отклоняет отсутствующий и неизвестный meal_slot без записи строки, "
-              "валидный meal_slot сохраняется в food_log и читается обратно")
+        print("OK: log_food без meal_slot назначает приём сам и пишет строку, "
+              "неизвестный meal_slot отклоняется без записи, переданный валидный сохраняется как есть")
 
         print("\n" + "="*60)
         print("TEST 24: import_scale_export magic-byte dispatch (Gap 2)")
@@ -6670,6 +6695,22 @@ if __name__ == "__main__":
                 f"COALESCE should preserve health_notes when not provided, got {a_notes_after}"
 
             print("OK: health_notes stored and preserved with COALESCE")
+
+            # Test meal_windows via register_user — тот же механизм, что timezone/health_notes.
+            result_json = ctx.tools["register_user"]["handler"]({
+                "height_cm": 185,
+                "birth_date": "1992-08-09",
+                "sex": "m",
+                "meal_windows": {"breakfast": {"start": "06:00", "end": "09:00"}}
+            })
+            result = json.loads(result_json)
+            assert "error" not in result, f"register_user с meal_windows сломан: {result}"
+            from health_core.chrono import meal_windows as _mw
+            a_windows = _mw(conn, user_a_id)
+            assert a_windows["breakfast"] == {"start": "06:00", "end": "09:00"}, \
+                f"личное окно завтрака должно сохраниться, получили {a_windows['breakfast']}"
+            assert a_windows["lunch"]["start"] == "12:00", "частичное переопределение не трогает lunch"
+            print("OK: meal_windows задаётся через register_user, частично переопределяя умолчание")
 
         finally:
             tools_module._CALLER_FALLBACK.set(None)

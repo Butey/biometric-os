@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 from health_core.config import load, local_now, targets_for
 from health_core.guards import check_all
-from health_core.chrono import eating_window, late_load
+from health_core.chrono import eating_window, late_load, meal_windows
 
 MINUS = "−"  # настоящий минус, не дефис — так в §07
 
@@ -142,24 +142,27 @@ def _active_alerts_today(conn: sqlite3.Connection, user_id: int, date: str) -> l
     ).fetchall()
 
 
+_MEAL_LABELS_RU = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин"}
+
+
 def _meal_clause(conn: sqlite3.Connection, user_id: int, date: str, now: datetime) -> str | None:
-    hour = now.hour
-    if hour < 10:
-        meal, since_hour = "Завтрак", 0
-    elif hour < 15:
-        meal, since_hour = "Обед", 10
-    elif hour < 21:
-        meal, since_hour = "Ужин", 15
-    else:
-        return None
-    since = f"{date} {since_hour:02d}:00:00"
-    row = conn.execute(
-        "SELECT COUNT(*) n FROM food_log WHERE user_id=? AND eaten_at>=? AND date(eaten_at)=?",
-        (user_id, since, date),
-    ).fetchone()
-    if row["n"] > 0:
-        return None
-    return f"{meal} не записан."
+    """«Не записан» — в текущем окне приёма пищи (CONTEXT.md, health_core.chrono.
+    meal_windows) нет ни одной строки food_log с этим meal_slot, а не «нет еды с
+    часа N»: время еды может отличаться от времени записи, а окна — личные."""
+    t = now.strftime("%H:%M")
+    windows = meal_windows(conn, user_id)
+    for name, label in _MEAL_LABELS_RU.items():
+        w = windows[name]
+        if not (w["start"] <= t <= w["end"]):
+            continue
+        row = conn.execute(
+            "SELECT COUNT(*) n FROM food_log WHERE user_id=? AND date(eaten_at)=? AND meal_slot=?",
+            (user_id, date, name),
+        ).fetchone()
+        if row["n"] > 0:
+            return None
+        return f"{label} не записан."
+    return None
 
 
 def day_summary(conn: sqlite3.Connection, user_id: int, date: str) -> dict:

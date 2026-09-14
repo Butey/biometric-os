@@ -155,6 +155,17 @@ guards:
   binge_breakfast_protein_g: 20
   binge_min_factors: 2
 
+# Окна приёмов пищи (CONTEXT.md «Окно приёма пищи») — health_core/chrono.py::meal_slot.
+# Одно определение на запись (log_food), статус-бар и напоминания (meal_window_check).
+# Не путать с chrono.eating_window ("окно питания" — интервал между первым и
+# последним приёмом за день, отдельное понятие).
+meals:
+  breakfast: {start: "07:00", end: "11:00"}
+  lunch: {start: "12:00", end: "16:00"}
+  dinner: {start: "18:00", end: "22:00"}
+  # еда позже стольких минут от начала уже состоявшегося основного приёма — перекус
+  snack_after_main_minutes: 30
+
 # Хронопитание — health_core/chrono.py. Только чтение уже собранных логов.
 chrono:
   # «поздняя нагрузка»: доля ккал дня, съеденных за столько часов до отбоя
@@ -198,9 +209,9 @@ schedule:
   grace_minutes: 25
   jobs:
     - {script: morning_checkin, at: "08:00"}
-    - {script: meal_window_check, at: "10:00"}
-    - {script: meal_window_check, at: "14:00"}
-    - {script: meal_window_check, at: "20:00"}
+    - {script: meal_window_check, at: "11:00"}
+    - {script: meal_window_check, at: "16:00"}
+    - {script: meal_window_check, at: "22:00"}
     - {script: evening_report, at: "21:30"}
     # ежедневно: скрипт сам молчит у тех, у кого инъекции сегодня нет
     - {script: injection_reminder, at: "09:00"}
