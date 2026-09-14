@@ -14,13 +14,15 @@
 возвращает kcal < kcal_floor ни при каком входе.
 
 Пол считается не от BMR, а от того, сколько энергии способна отдать жировая
-ткань (≈31 ккал/сут на кг жира, с запасом) — см. kcal_floor. BMR не смотрит на
-жировую массу вовсе и потому одинаково неверен в обе стороны: переосторожен при
-большом запасе жира и слишком мягок у сухого человека. Нижняя граница снизу
-подпёрта макро-минимумом: в цель обязана помещаться собственная норма белка.
+ткань (предел Alpert на кг жировой массы, допустимая доля предела убывает по
+шкале процента жира) — см. kcal_floor. BMR не смотрит на жировую массу вовсе и
+потому одинаково неверен в обе стороны: переосторожен при большом запасе жира
+и слишком мягок у сухого человека. Нижняя граница снизу подпёрта
+макро-минимумом: в цель обязана помещаться собственная норма белка.
 """
 import sqlite3
-from datetime import date, datetime
+import statistics
+from datetime import date, datetime, timedelta
 
 from health_core.config import latest_ffm, load, targets_for, local_now
 
@@ -76,17 +78,121 @@ def bmr_floor(conn: sqlite3.Connection, user_id: int) -> float:
 
 
 def fat_mass_kg(conn: sqlite3.Connection, user_id: int) -> float | None:
-    """Жировая масса из последнего замера с процентом жира. Нет биоимпеданса —
-    None: считать жир от веса «на глаз» здесь нельзя, от этого числа зависит
-    нижняя граница калоража."""
-    row = conn.execute(
-        "SELECT weight_kg, fat_pct FROM body_metrics WHERE user_id=? AND fat_pct IS NOT NULL "
+    """Жировая масса — медиана (вес × %жира) по замерам с процентом жира за
+    policy.fat_mass_window_days от последнего такого замера: шум биоимпеданса
+    не должен двигать цель день ко дню. Нет биоимпеданса — None: считать жир
+    от веса «на глаз» здесь нельзя, от этого числа зависит нижняя граница
+    калоража."""
+    window_days = load()["policy"].get("fat_mass_window_days", 7)
+    last = conn.execute(
+        "SELECT measured_at FROM body_metrics WHERE user_id=? AND fat_pct IS NOT NULL "
         "AND fat_pct > 0 ORDER BY measured_at DESC LIMIT 1",
         (user_id,),
     ).fetchone()
-    if row is None or not row["weight_kg"]:
+    if last is None:
         return None
-    return row["weight_kg"] * row["fat_pct"] / 100
+    end = date.fromisoformat(last["measured_at"][:10])
+    start = end.fromordinal(end.toordinal() - window_days + 1)
+    rows = conn.execute(
+        "SELECT weight_kg, fat_pct FROM body_metrics WHERE user_id=? AND fat_pct IS NOT NULL "
+        "AND fat_pct > 0 AND date(measured_at) BETWEEN ? AND ?",
+        (user_id, start.isoformat(), end.isoformat()),
+    ).fetchall()
+    vals = [r["weight_kg"] * r["fat_pct"] / 100 for r in rows if r["weight_kg"]]
+    return statistics.median(vals) if vals else None
+
+
+def lean_share(conn: sqlite3.Connection, user_id: int) -> float | None:
+    """Доказанная доля тощей массы в потере веса за policy.lean_share_window_days:
+    медианы веса и FFM по 5 первым и 5 последним замерам окна. Это
+    доказательство, а не прогноз — без достаточных, свежих данных о реальной
+    потере веса возвращает None (см. fat_share)."""
+    policy = load()["policy"]
+    window_days = policy["lean_share_window_days"]
+    min_points = policy["lean_share_min_points"]
+    min_loss = policy["lean_share_min_loss_kg"]
+    no_measure_days = load()["guards"]["no_measure_days"]
+
+    since = (local_now() - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    rows = conn.execute(
+        "SELECT measured_at, weight_kg, ffm_kg FROM body_metrics WHERE user_id=? "
+        "AND ffm_kg IS NOT NULL AND measured_at >= ? ORDER BY measured_at ASC",
+        (user_id, since),
+    ).fetchall()
+    if len(rows) < min_points:
+        return None
+    gap = (local_now().date() - date.fromisoformat(rows[-1]["measured_at"][:10])).days
+    if gap > no_measure_days:
+        return None
+
+    k = min(5, len(rows))
+    first, last = rows[:k], rows[-k:]
+    d_weight = statistics.median(r["weight_kg"] for r in last) - statistics.median(r["weight_kg"] for r in first)
+    if -d_weight < min_loss:
+        return None  # потери меньше min_loss (в т.ч. набор) — доказательства нет
+    d_lean = statistics.median(r["ffm_kg"] for r in last) - statistics.median(r["ffm_kg"] for r in first)
+    return abs(d_lean) / abs(d_weight)
+
+
+def fat_share(conn: sqlite3.Connection, user_id: int, fat_pct: float) -> float:
+    """Допустимая доля предела Alpert — линейная интерполяция по шкале
+    процента жира от fat_share_lean (≤ нижней границы) до fat_share_fat
+    (≥ верхней). Шкала своя для пола, неизвестный пол — мужская (осторожнее).
+    На жирном конце цель интерполяции — fat_share_fat_proven вместо
+    fat_share_fat, если lean_share доказывает малую долю мышц в потере."""
+    policy = load()["policy"]
+    urow = conn.execute("SELECT sex FROM users WHERE id=?", (user_id,)).fetchone()
+    sex = urow["sex"] if urow else None
+    lo, hi = policy["fat_share_bounds_f"] if sex == "f" else policy["fat_share_bounds_m"]
+
+    fat_end = policy["fat_share_fat"]
+    proven = lean_share(conn, user_id)
+    if proven is not None and proven < load()["guards"]["lbm_ratio_threshold"]:
+        fat_end = policy["fat_share_fat_proven"]
+
+    lean_val = policy["fat_share_lean"]
+    if fat_pct <= lo:
+        return lean_val
+    if fat_pct >= hi:
+        return fat_end
+    t = (fat_pct - lo) / (hi - lo)
+    return lean_val + t * (fat_end - lean_val)
+
+
+def _smoothed_weight_kg(conn: sqlite3.Connection, user_id: int) -> float | None:
+    """Последний сглаженный вес — медиана за policy.weight_trend_window_days
+    дней от последнего замера. Опора потолка дефицита (см. kcal_floor): без
+    сглаживания один шумный день на весах двигал бы потолок сам по себе."""
+    window_days = load()["policy"].get("weight_trend_window_days", 7)
+    last = conn.execute(
+        "SELECT measured_at FROM body_metrics WHERE user_id=? AND weight_kg IS NOT NULL "
+        "ORDER BY measured_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if last is None:
+        return None
+    end = date.fromisoformat(last["measured_at"][:10])
+    start = end.fromordinal(end.toordinal() - window_days + 1)
+    rows = conn.execute(
+        "SELECT weight_kg FROM body_metrics WHERE user_id=? AND weight_kg IS NOT NULL "
+        "AND date(measured_at) BETWEEN ? AND ?",
+        (user_id, start.isoformat(), end.isoformat()),
+    ).fetchall()
+    vals = [r["weight_kg"] for r in rows]
+    return statistics.median(vals) if vals else None
+
+
+def _deficit_cap_kcal(conn: sqlite3.Connection, user_id: int) -> float | None:
+    """Потолок дефицита: темп min(weight_rate_kg_week_max кг,
+    weight_rate_pct_week_max % веса) в неделю, переведённый в ккал/сут через
+    _KCAL_PER_KG — тот же порог, по которому RATE_HIGH предупреждает о риске
+    для желчного пузыря."""
+    weight = _smoothed_weight_kg(conn, user_id)
+    if weight is None:
+        return None
+    guards_cfg = load()["guards"]
+    cap_kg_week = min(guards_cfg["weight_rate_kg_week_max"], weight * guards_cfg["weight_rate_pct_week_max"] / 100)
+    return cap_kg_week * _KCAL_PER_KG / 7
 
 
 def macro_minimum_kcal(conn: sqlite3.Connection, user_id: int) -> float | None:
@@ -111,15 +217,16 @@ def kcal_floor(conn: sqlite3.Connection, user_id: int, full_tdee: float) -> tupl
     жира он переосторожен, у сухого — наоборот, слишком мягок.
 
     Физиологичнее считать от потолка отдачи жировой ткани: жир способен отдать
-    порядка 31 ккал в сутки с килограмма (Alpert; величина в policy). Дефицит
-    сверх этого потолка организм добирает из тощей массы — это и есть та
-    опасность, ради которой пол существует.
+    fat_supply_kcal_per_kg ккал в сутки с килограмма (Alpert), но в дефицит
+    разрешена не вся эта величина, а fat_share — доля, убывающая по шкале
+    процента жира (см. fat_share). Сверху безопасный дефицит дополнительно
+    ограничен потолком темпа снижения веса (см. _deficit_cap_kcal). Дефицит
+    сверх меньшего из двух пределов организм добирает из тощей массы — это и
+    есть та опасность, ради которой пол существует.
 
-        безопасный дефицит = жировая масса × потолок × запас
+        безопасный дефицит = min(жировая масса × fat_supply_kcal_per_kg × доля,
+                                  потолок темпа)
         пол = расход − безопасный дефицит
-
-    Запас (policy.fat_supply_safety) обязателен: 31 — это пиковая способность
-    из голодных исследований, а не режим, в котором живут месяцами.
 
     Пол не опускается ниже макро-минимума (белок + жиры из целей): цель, в
     которую не помещается собственная норма белка, гарантирует потерю мышц.
@@ -129,18 +236,28 @@ def kcal_floor(conn: sqlite3.Connection, user_id: int, full_tdee: float) -> tupl
     """
     policy = load()["policy"]
     bmr = bmr_floor(conn, user_id)
+    fat_row = conn.execute(
+        "SELECT fat_pct FROM body_metrics WHERE user_id=? AND fat_pct IS NOT NULL "
+        "AND fat_pct > 0 ORDER BY measured_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
     fat_kg = fat_mass_kg(conn, user_id)
-    if fat_kg is None:
+    if fat_kg is None or fat_row is None:
         return bmr, "bmr"
 
     per_kg = policy.get("fat_supply_kcal_per_kg")
-    safety = policy.get("fat_supply_safety")
-    if not per_kg or not safety:
+    if not per_kg:
         return bmr, "bmr"        # модель выключена настройкой — прежнее поведение
 
-    safe_deficit = fat_kg * per_kg * safety
+    share = fat_share(conn, user_id, fat_row["fat_pct"])
+    fat_supply_deficit = fat_kg * per_kg * share
+    cap = _deficit_cap_kcal(conn, user_id)
+    if cap is not None and cap < fat_supply_deficit:
+        safe_deficit, reason = cap, "deficit_cap"
+    else:
+        safe_deficit, reason = fat_supply_deficit, "fat_supply"
+
     floor = full_tdee - safe_deficit
-    reason = "fat_supply"
 
     macro_min = macro_minimum_kcal(conn, user_id)
     if macro_min is not None and floor < macro_min:
@@ -635,61 +752,126 @@ if __name__ == "__main__":
         )
         print("OK: взвешивание без состава не двигает BMR_floor и норму белка")
 
-        # ---- пол от жировой массы (kcal_floor) ----
-        # Ради этого блока и переписывался механизм: пол обязан зависеть от
-        # жира, а не от BMR, иначе он одинаково неверен в обе стороны.
-        pol = load()["policy"]
-        per_kg, safety = pol["fat_supply_kcal_per_kg"], pol["fat_supply_safety"]
+        # ---- пол от жировой массы, доли предела и потолка дефицита (kcal_floor) ----
+        # docs/adr/0001-пол-калорий.md: доля предела Alpert убывает по шкале
+        # процента жира (своей для пола), на жирном конце растёт до
+        # fat_share_fat_proven, если lean_share доказывает малую долю мышц в
+        # потере, а сверху дефицит режет потолок темпа снижения веса.
+        def _reset_metrics():
+            conn.execute("DELETE FROM body_metrics WHERE user_id=?", (uid,))
 
-        conn.execute("DELETE FROM body_metrics WHERE user_id=?", (uid,))
-        conn.execute(
-            "INSERT INTO body_metrics(user_id, burst_key, measured_at, weight_kg, ffm_kg, fat_pct) "
-            "VALUES (?, 'floor-fat', '2026-08-21 07:00:00', 120.0, 79.0, 34.0)", (uid,))
+        def _add_metric(days_ago, weight_kg, fat_pct=None, ffm_kg=None, hour=7):
+            ts = (local_now() - timedelta(days=days_ago)).replace(hour=hour, minute=0, second=0, microsecond=0)
+            conn.execute(
+                "INSERT INTO body_metrics(user_id, burst_key, measured_at, weight_kg, fat_pct, ffm_kg) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (uid, f"fs-{days_ago}-{hour}", ts.strftime("%Y-%m-%d %H:%M:%S"), weight_kg, fat_pct, ffm_kg),
+            )
+
+        tdee = 2614.0
+        conn.execute("UPDATE users SET sex='m' WHERE id=?", (uid,))
+
+        # 1) мужчина 118.7 кг / 33.3% жира, доля мышц не доказана -> жирный
+        # конец шкалы = fat_share_fat (0.3) -> дефицит ~822, пол ~1792
+        _reset_metrics()
+        _add_metric(0, 118.7, fat_pct=33.3)
         conn.commit()
-        bmr_now = bmr_floor(conn, uid)
-        fat_kg = fat_mass_kg(conn, uid)
-        assert abs(fat_kg - 40.8) < 0.01, f"жировая масса посчитана неверно: {fat_kg}"
+        assert lean_share(conn, uid) is None, "без истории FFM доля мышц не может быть доказана"
+        share1 = fat_share(conn, uid, 33.3)
+        assert abs(share1 - 0.3) < 1e-9, share1
+        floor1, reason1 = kcal_floor(conn, uid, tdee)
+        assert reason1 == "fat_supply", reason1
+        assert abs(floor1 - 1792.23) < 1, floor1
+        print(f"OK: 118.7кг/33.3%, доля {share1}, пол {floor1:.0f} (ожидание ~1792)")
 
-        tdee = 2600.0
-        floor_v, reason = kcal_floor(conn, uid, tdee)
-        assert reason == "fat_supply", reason
-        assert abs(floor_v - (tdee - fat_kg * per_kg * safety)) < 0.01
-        assert floor_v < bmr_now, (
-            f"смысл всей правки: при {fat_kg:.0f} кг жира пол обязан быть НИЖЕ BMR "
-            f"({floor_v:.0f} против {bmr_now:.0f})")
-
-        # Малый запас жира -> пол поднимается и подходит к BMR: опасность растёт
-        # по мере похудения, и граница должна двигаться навстречу сама.
-        conn.execute("DELETE FROM body_metrics WHERE user_id=?", (uid,))
-        conn.execute(
-            "INSERT INTO body_metrics(user_id, burst_key, measured_at, weight_kg, ffm_kg, fat_pct) "
-            "VALUES (?, 'floor-lean', '2026-08-21 07:00:00', 85.0, 72.0, 12.0)", (uid,))
+        # 2) та же жировая масса, но за 28 дней доказана доля мышц <15% в
+        # потере -> жирный конец шкалы поднимается до fat_share_fat_proven (0.4)
+        _reset_metrics()
+        for days_ago, w, f in (
+            (27, 121.7, 79.6), (24, 121.0, 79.55), (21, 120.4, 79.5), (18, 119.9, 79.45),
+            (14, 119.5, 79.4), (10, 119.1, 79.35), (5, 118.9, 79.3), (0, 118.7, 79.2),
+        ):
+            _add_metric(days_ago, w, ffm_kg=f)
+        conn.execute("UPDATE body_metrics SET fat_pct=33.3 WHERE user_id=? AND burst_key='fs-0-7'", (uid,))
         conn.commit()
-        lean_floor, _ = kcal_floor(conn, uid, tdee)
-        assert lean_floor > floor_v, (
-            f"у сухого человека пол обязан быть выше: {lean_floor:.0f} против {floor_v:.0f}")
+        proven2 = lean_share(conn, uid)
+        assert proven2 is not None and proven2 < 0.15, proven2
+        share2 = fat_share(conn, uid, 33.3)
+        assert abs(share2 - 0.4) < 1e-9, share2
+        floor2, reason2 = kcal_floor(conn, uid, tdee)
+        assert reason2 == "fat_supply", reason2
+        assert abs((tdee - floor2) - 1095.69) < 1, tdee - floor2
+        print(f"OK: доказанная доля мышц {proven2:.3f}<0.15 -> доля {share2}, "
+              f"дефицит {tdee - floor2:.0f} (ожидание ~1096)")
+
+        # 3) худой 85 кг / 12% -> нижняя граница шкалы, доля = fat_share_lean (0.7)
+        _reset_metrics()
+        _add_metric(0, 85.0, fat_pct=12.0)
+        conn.commit()
+        share3 = fat_share(conn, uid, 12.0)
+        assert abs(share3 - 0.7) < 1e-9, share3
+        floor3, reason3 = kcal_floor(conn, uid, tdee)
+        assert reason3 == "fat_supply", reason3
+        assert abs((tdee - floor3) - 494.8) < 1, tdee - floor3
+        print(f"OK: 85кг/12%, доля {share3}, дефицит {tdee - floor3:.0f} (ожидание ~495)")
+
+        # 4) женщина 80 кг / 32% -> женская шкала, интерполяция ~0.433; тот же
+        # человек с полом NULL -> мужская шкала как более осторожная (доля 0.3)
+        _reset_metrics()
+        conn.execute("UPDATE users SET sex='f' WHERE id=?", (uid,))
+        _add_metric(0, 80.0, fat_pct=32.0)
+        conn.commit()
+        share4 = fat_share(conn, uid, 32.0)
+        assert abs(share4 - 0.43333) < 1e-4, share4
+        floor4, reason4 = kcal_floor(conn, uid, tdee)
+        assert reason4 == "fat_supply", reason4
+        assert abs((tdee - floor4) - 768.77) < 1, tdee - floor4
+        conn.execute("UPDATE users SET sex=NULL WHERE id=?", (uid,))
+        conn.commit()
+        share4_unknown = fat_share(conn, uid, 32.0)
+        assert abs(share4_unknown - 0.3) < 1e-9, share4_unknown
+        print(f"OK: женщина 80кг/32% доля {share4:.3f} (~0.433); пол NULL -> "
+              f"мужская шкала, доля {share4_unknown}")
+
+        # 5) очень полный 160 кг / 50%, доля мышц доказана (<15%) -> доля 0.4,
+        # но потолок темпа (min(1.5кг, 1.5% веса)/нед = 1650 ккал/сут) режет раньше
+        conn.execute("UPDATE users SET sex='m' WHERE id=?", (uid,))
+        _reset_metrics()
+        for days_ago, w, f in (
+            (27, 162.5, 95.0), (24, 162.0, 94.9), (21, 161.6, 94.85), (18, 161.2, 94.8),
+            (14, 160.9, 94.75), (10, 160.5, 94.7), (5, 160.2, 94.65), (0, 160.0, 94.6),
+        ):
+            _add_metric(days_ago, w, ffm_kg=f)
+        conn.execute("UPDATE body_metrics SET fat_pct=50.0 WHERE user_id=? AND burst_key='fs-0-7'", (uid,))
+        conn.commit()
+        proven5 = lean_share(conn, uid)
+        assert proven5 is not None and proven5 < 0.15, proven5
+        share5 = fat_share(conn, uid, 50.0)
+        assert abs(share5 - 0.4) < 1e-9, share5
+        big_tdee = 3200.0
+        floor5, reason5 = kcal_floor(conn, uid, big_tdee)
+        assert reason5 == "deficit_cap", reason5
+        assert abs((big_tdee - floor5) - 1650.0) < 0.01, big_tdee - floor5
+        print(f"OK: 160кг/50%, доля {share5}, потолок темпа режет дефицит до "
+              f"{big_tdee - floor5:.0f} (reason={reason5})")
 
         # Макро-минимум как нижняя подпорка: жира много, расход мал -> формула
         # уводит пол ниже, чем физически занимают белок и жиры из целей.
-        tiny_tdee = 800.0
-        conn.execute("DELETE FROM body_metrics WHERE user_id=?", (uid,))
-        conn.execute(
-            "INSERT INTO body_metrics(user_id, burst_key, measured_at, weight_kg, ffm_kg, fat_pct) "
-            "VALUES (?, 'floor-macro', '2026-08-21 07:00:00', 120.0, 79.0, 34.0)", (uid,))
+        _reset_metrics()
+        _add_metric(0, 120.0, fat_pct=34.0, ffm_kg=79.0)
         conn.commit()
+        tiny_tdee = 800.0
         macro_floor, macro_reason = kcal_floor(conn, uid, tiny_tdee)
         assert macro_reason == "macro_minimum", macro_reason
         assert abs(macro_floor - macro_minimum_kcal(conn, uid)) < 0.01
 
         # Нет биоимпеданса -> возвращаемся к BMR, а не гадаем о жире.
-        conn.execute("DELETE FROM body_metrics WHERE user_id=?", (uid,))
-        conn.execute(
-            "INSERT INTO body_metrics(user_id, burst_key, measured_at, weight_kg) "
-            "VALUES (?, 'floor-nofat', '2026-08-21 07:00:00', 120.0)", (uid,))
+        _reset_metrics()
+        _add_metric(0, 120.0)
         conn.commit()
         nofat_floor, nofat_reason = kcal_floor(conn, uid, tdee)
         assert nofat_reason == "bmr" and abs(nofat_floor - bmr_floor(conn, uid)) < 1e-6
-        print("OK: пол считается от жировой массы, растёт по мере похудения, "
+        print("OK: пол считается от доли предела Alpert по проценту жира, "
               "подпёрт макро-минимумом и падает на BMR без биоимпеданса")
 
         conn.close()
