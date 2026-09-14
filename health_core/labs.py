@@ -1,7 +1,7 @@
 """Ручной ввод лабораторных анализов + детерминированные клинические формулы.
 
 Зачем: OCR не нужен — бланк с анализами читает человек и диктует текст боту,
-а формулы (HOMA-IR, CKD-EPI, non-HDL, eAG) нужны на связке тирзепатид
+а формулы (HOMA-IR, CKD-EPI, non-HDL, eAG, TyG, TG/HDL, AIP, FIB-4) нужны на связке тирзепатид
 (инсулинорезистентность) + высокобелковая диета (нагрузка на почки), чтобы не
 ждать врача ради арифметики, которую он делает по тем же формулам. Никакой
 интерпретации моделью — только справочные формулы из литературы, посчитанные
@@ -9,6 +9,7 @@
 сети.
 """
 from datetime import datetime
+import math
 
 MARKERS = {
     "glucose": {
@@ -158,6 +159,13 @@ MARKERS = {
         "hi": 10.0,
         "aliases": ("цистатин c", "цистатин с", "cystatin c"),
     },
+    "platelets": {
+        "label": "тромбоциты",
+        "unit": "10^9/л",
+        "lo": 20.0,
+        "hi": 2000.0,
+        "aliases": ("тромбоциты", "plt", "platelets"),
+    },
 }
 
 # Обратная карта псевдоним -> канонический ключ. Канонический ключ сам себе
@@ -284,6 +292,19 @@ def _latest_pair_day(conn, user_id, marker_a, marker_b):
     ).fetchone()
 
 
+def _latest_triple_day(conn, user_id, marker_a, marker_b, marker_c):
+    """Последняя дата, где ВСЕ ТРИ показателя есть одновременно."""
+    return conn.execute(
+        """SELECT a.taken_on AS taken_on, a.value AS va, b.value AS vb, c.value AS vc
+           FROM lab_results a
+             JOIN lab_results b ON a.user_id = b.user_id AND a.taken_on = b.taken_on
+             JOIN lab_results c ON a.user_id = c.user_id AND a.taken_on = c.taken_on
+           WHERE a.user_id=? AND a.marker=? AND b.marker=? AND c.marker=?
+           ORDER BY a.taken_on DESC LIMIT 1""",
+        (user_id, marker_a, marker_b, marker_c),
+    ).fetchone()
+
+
 def _age_years(birth_date, on_date):
     b = datetime.strptime(birth_date, "%Y-%m-%d").date()
     d = datetime.strptime(on_date, "%Y-%m-%d").date()
@@ -376,6 +397,87 @@ def derived(conn, user_id):
             "inputs": {"hba1c": hba1c["value"]},
             "interpretation": "среднее содержание глюкозы за последние ~3 месяца",
         }
+
+    # TyG = ln(ТГ_мг/дл × глюкоза_мг/дл / 2)
+    # Пересчёт из ммоль/л: ТГ×88.57, глюкоза×18.0182
+    tg_glucose = _latest_pair_day(conn, user_id, "tg", "glucose")
+    if tg_glucose is not None:
+        tg_mg_dl = tg_glucose["va"] * 88.57
+        glucose_mg_dl = tg_glucose["vb"] * 18.0182
+        tyg_val = math.log((tg_mg_dl * glucose_mg_dl) / 2)
+        interpretation = (
+            "высокий риск" if tyg_val >= 8.8
+            else "повышенный риск" if tyg_val >= 8.5
+            else "норма"
+        )
+        out["tyg"] = {
+            "value": round(tyg_val, 2),
+            "taken_on": tg_glucose["taken_on"],
+            "inputs": {"tg_mmol_l": tg_glucose["va"], "glucose_mmol_l": tg_glucose["vb"]},
+            "interpretation": interpretation,
+        }
+
+    # TG/HDL (ммоль/л)
+    tg_hdl = _latest_pair_day(conn, user_id, "tg", "hdl")
+    if tg_hdl is not None:
+        tg_hdl_val = tg_hdl["va"] / tg_hdl["vb"]
+        interpretation = (
+            "высокий риск" if tg_hdl_val > 2.0
+            else "норма" if tg_hdl_val < 1.3
+            else "средний риск"
+        )
+        out["tg_hdl"] = {
+            "value": round(tg_hdl_val, 2),
+            "taken_on": tg_hdl["taken_on"],
+            "inputs": {"tg_mmol_l": tg_hdl["va"], "hdl_mmol_l": tg_hdl["vb"]},
+            "interpretation": interpretation,
+        }
+
+    # AIP = log10(ТГ/ЛПВП) в ммоль/л
+    aip_pair = _latest_pair_day(conn, user_id, "tg", "hdl")
+    if aip_pair is not None:
+        if aip_pair["vb"] > 0:
+            aip_val = math.log10(aip_pair["va"] / aip_pair["vb"])
+            interpretation = (
+                "высокий риск" if aip_val > 0.21
+                else "средний риск" if aip_val >= 0.11
+                else "низкий риск"
+            )
+            out["aip"] = {
+                "value": round(aip_val, 2),
+                "taken_on": aip_pair["taken_on"],
+                "inputs": {"tg_mmol_l": aip_pair["va"], "hdl_mmol_l": aip_pair["vb"]},
+                "interpretation": interpretation,
+            }
+
+    # FIB-4 = (возраст × АСТ) / (тромбоциты × √АЛТ)
+    fib4_triple = _latest_triple_day(conn, user_id, "ast", "alt", "platelets")
+    if fib4_triple is not None and fib4_triple["vc"] > 0:  # platelets не должны быть нулём
+        user = conn.execute(
+            "SELECT birth_date FROM users WHERE id=?", (user_id,)
+        ).fetchone()
+        if user is not None and user["birth_date"]:
+            age = _age_years(user["birth_date"], fib4_triple["taken_on"])
+            ast = fib4_triple["va"]
+            alt = fib4_triple["vb"]
+            platelets = fib4_triple["vc"]
+            fib4_val = (age * ast) / (platelets * math.sqrt(alt)) if alt > 0 else None
+            if fib4_val is not None:
+                if age < 35 or age > 65:
+                    accuracy_note = " (низкая точность < 35 или > 65 лет)"
+                else:
+                    accuracy_note = ""
+                interpretation = (
+                    "высокий риск фиброза" if fib4_val > 2.67
+                    else "неопределённый риск" if fib4_val >= 1.3
+                    else "низкий риск фиброза"
+                ) + accuracy_note
+                out["fib4"] = {
+                    "value": round(fib4_val, 2),
+                    "taken_on": fib4_triple["taken_on"],
+                    "inputs": {"age": age, "ast": ast, "alt": alt, "platelets": platelets},
+                    "interpretation": interpretation,
+                }
 
     return out
 
@@ -486,10 +588,12 @@ if __name__ == "__main__":
     assert delete(conn, uid, lab_id) is True
     assert delete(conn, uid, lab_id) is False  # уже удалено
 
-    # --- new markers: GGT, ALP, uric_acid, TSH, FT4, FT3, testosterone, SHBG, hematocrit, ApoB, cystatin_c ---
+    # --- new markers: GGT, ALP, uric_acid, TSH, FT4, FT3, testosterone, SHBG, hematocrit, ApoB, cystatin_c, platelets ---
     assert canon_marker("ГГТ") == "ggt"
     assert canon_marker("Цистатин С") == "cystatin_c"  # Cyrillic С
     assert canon_marker("цистатин с") == "cystatin_c"  # Cyrillic с, lowercase
+    assert canon_marker("тромбоциты") == "platelets"
+    assert canon_marker("plt") == "platelets"
 
     # hematocrit 45 -> saved
     res = save(conn, uid, "2026-09-07", {"hematocrit": 45})
@@ -505,5 +609,43 @@ if __name__ == "__main__":
     assert "uric_acid" in res["rejected"], f"uric_acid 6 should be rejected: {res}"
     assert "мг/дл" in res["rejected"]["uric_acid"], f"expected мг/дл hint: {res['rejected']['uric_acid']}"
 
+    # --- platelets marker save/reject ---
+    res = save(conn, uid, "2026-09-10", {"platelets": 200})
+    assert "platelets" in res["saved"], f"platelets 200 should be saved: {res}"
+
+    # --- TyG: ТГ 1.7 ммоль/л, глюкоза 5.5 ммоль/л
+    # ТГ мг/дл = 1.7 × 88.57 = 150.569
+    # Глюкоза мг/дл = 5.5 × 18.0182 = 99.1
+    # TyG = ln((150.569 × 99.1) / 2) = ln(7463.27) ≈ 8.92 (но это быстро, проверим)
+    # На самом деле: ln(1.7*88.57*5.5*18.0182/2) = ln(7463.27) ≈ 8.918
+    save(conn, uid, "2026-09-11", {"tg": 1.7, "glucose": 5.5})
+    d = derived(conn, uid)
+    # TyG должен быть примерно ln(1.7*88.57*5.5*18.0182/2) ≈ 8.918
+    assert "tyg" in d, f"TyG should be calculated: {d.keys()}"
+    assert d["tyg"]["value"] > 8.5, f"TyG value should be > 8.5: {d['tyg']['value']}"
+
+    # --- TG/HDL: ТГ 1.8 ммоль/л, ЛПВП 1.2 ммоль/л -> 1.5 ---
+    save(conn, uid, "2026-09-12", {"tg": 1.8, "hdl": 1.2})
+    d = derived(conn, uid)
+    assert "tg_hdl" in d, f"TG/HDL should be calculated: {d.keys()}"
+    assert abs(d["tg_hdl"]["value"] - 1.5) < 0.01, f"TG/HDL should be ~1.5: {d['tg_hdl']['value']}"
+
+    # --- AIP: log10(1.8/1.2) = log10(1.5) ≈ 0.176 ---
+    d = derived(conn, uid)
+    assert "aip" in d, f"AIP should be calculated: {d.keys()}"
+    assert abs(d["aip"]["value"] - 0.176) < 0.01, f"AIP should be ~0.176: {d['aip']['value']}"
+
+    # --- FIB-4: возраст 45, АСТ 35, АЛТ 40, тромбоциты 200
+    # FIB-4 = (45 × 35) / (200 × √40) ≈ 1575 / (200 × 6.32) ≈ 1.245
+    uid_fib4_user = conn.execute("SELECT id FROM users WHERE telegram_user_id=1").fetchone()["id"]
+    conn.execute(
+        "UPDATE users SET birth_date='1981-09-14' WHERE id=?",
+        (uid_fib4_user,)
+    )
+    save(conn, uid_fib4_user, "2026-09-13", {"ast": 35, "alt": 40, "platelets": 200})
+    d = derived(conn, uid_fib4_user)
+    assert "fib4" in d, f"FIB-4 should be calculated: {d.keys()}"
+    assert abs(d["fib4"]["value"] - 1.24) < 0.1, f"FIB-4 should be ~1.24: {d['fib4']['value']}"
+
     conn.close()
-    print("OK: labs.py — aliases, save/reject/upsert, HOMA-IR, eGFR (м/ж), non-HDL, eAG, history/delete, new markers")
+    print("OK: labs.py — aliases, save/reject/upsert, HOMA-IR, eGFR (м/ж), non-HDL, eAG, TyG, TG/HDL, AIP, FIB-4, history/delete, new markers")
