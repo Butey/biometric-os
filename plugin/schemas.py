@@ -38,7 +38,7 @@ log_food_schema = {
         "meal_slot": {
             "type": "string",
             "enum": ["breakfast", "lunch", "dinner", "snack"],
-            "description": "Приём пищи. Ставится ТОЛЬКО по прямому слову человека: «завтрак ...» → breakfast, «обед ...» → lunch, «ужин ...» → dinner. Слово не названо — snack, даже если по времени похоже на основной приём. По часам не угадывать. Обязательно: без него не работает разбивка по приёмам и окно LIPID_GUARD"
+            "description": "Передавайте ТОЛЬКО если человек прямо назвал приём: «завтрак ...» → breakfast, «обед ...» → lunch, «ужин ...» → dinner, «перекус ...» → snack. Слово не названо — не передавайте вовсе, код определит приём сам по окнам приёма пищи и времени еды. По часам не угадывать"
         },
         "eaten_at": {
             "type": "string",
@@ -49,7 +49,7 @@ log_food_schema = {
             "description": "ID пользователя"
         }
     },
-    "required": ["items", "meal_slot"]
+    "required": ["items"]
 }
 
 log_water_schema = {
@@ -688,6 +688,15 @@ register_user_schema = {
         "health_notes": {
             "type": "string",
             "description": "Личные ограничения по здоровью: травмы, противопоказания, диагнозы — только со слов самого человека"
+        },
+        "meal_windows": {
+            "type": "object",
+            "properties": {
+                "breakfast": {"type": "object", "properties": {"start": {"type": "string"}, "end": {"type": "string"}}},
+                "lunch": {"type": "object", "properties": {"start": {"type": "string"}, "end": {"type": "string"}}},
+                "dinner": {"type": "object", "properties": {"start": {"type": "string"}, "end": {"type": "string"}}}
+            },
+            "description": "Личные окна приёмов пищи (HH:MM), переопределяют умолчание из config.yaml. Задавайте только по прямой просьбе человека («у меня завтрак с 6 до 9») — можно частично, один приём, остальные останутся умолчанием"
         }
     },
     "required": ["height_cm", "birth_date", "sex"]

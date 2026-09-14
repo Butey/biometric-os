@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS users (
     base_weight_kg REAL,
     base_weight_date TEXT,
     created_at TEXT NOT NULL,
-    health_notes TEXT
+    health_notes TEXT,
+    meal_windows TEXT
 );
 
 CREATE TABLE IF NOT EXISTS user_targets (
@@ -461,6 +462,13 @@ def _migrate_v16_to_v17(conn: sqlite3.Connection) -> None:
     _add_column(conn, "users", "health_notes", "TEXT")
 
 
+def _migrate_v17_to_v18(conn: sqlite3.Connection) -> None:
+    """v17->v18: users.meal_windows — личные окна приёмов пищи (CONTEXT.md
+    «Окно приёма пищи»), JSON с теми же ключами, что config.yaml meals.*
+    (breakfast/lunch/dinner), частичное переопределение допустимо."""
+    _add_column(conn, "users", "meal_windows", "TEXT")
+
+
 def _migrate_v13_to_v14(conn: sqlite3.Connection) -> None:
     """v13->v14: добавляет notes и source в activity, делает file_hash необязательным (для ручных записей)."""
     _add_column(conn, "activity", "notes", "TEXT")
@@ -497,6 +505,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         # v16->v17 — новая таблица access_list (DDL выше) и колонка users.health_notes.
         if row["version"] < 17:
             _migrate_v16_to_v17(conn)
+        if row["version"] < 18:
+            _migrate_v17_to_v18(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 

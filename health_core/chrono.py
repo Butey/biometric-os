@@ -1,7 +1,78 @@
 """Хронопитание и хронотерапия: окна приёмов, поздняя нагрузка перед сном, кофеиновое окно."""
+import json
 import sqlite3
 import statistics
 from datetime import datetime, timedelta
+
+_MEAL_NAMES = ("breakfast", "lunch", "dinner")
+_DEFAULT_WINDOWS = {
+    "breakfast": {"start": "07:00", "end": "11:00"},
+    "lunch": {"start": "12:00", "end": "16:00"},
+    "dinner": {"start": "18:00", "end": "22:00"},
+}
+
+
+def meal_windows(conn: sqlite3.Connection, user_id: int) -> dict:
+    """Окна приёмов пищи (CONTEXT.md «Окно приёма пищи») этого человека.
+
+    Умолчание — config.yaml meals.*, частично переопределяемое users.meal_windows
+    (JSON с теми же ключами breakfast/lunch/dinner, {"start": "HH:MM", "end": "HH:MM"}).
+    Одно определение действует и для записи (meal_slot), и для статус-бара/напоминаний.
+    """
+    from health_core.config import load
+
+    cfg = load().get("meals", {})
+    windows = {name: dict(cfg.get(name, _DEFAULT_WINDOWS[name])) for name in _MEAL_NAMES}
+
+    row = conn.execute("SELECT meal_windows FROM users WHERE id=?", (user_id,)).fetchone()
+    raw = row["meal_windows"] if row else None
+    if raw:
+        try:
+            override = json.loads(raw)
+        except (ValueError, TypeError):
+            override = {}
+        for name in _MEAL_NAMES:
+            w = override.get(name)
+            if isinstance(w, dict):
+                windows[name] = {**windows[name], **w}
+    return windows
+
+
+def meal_slot(conn: sqlite3.Connection, user_id: int, eaten_at: datetime, named: str | None = None) -> str:
+    """Приём пищи (CONTEXT.md «Приём пищи»).
+
+    Прямое слово человека (named) побеждает всегда. Иначе: eaten_at вне всех
+    окон — snack; внутри окна X — X, если только у этого пользователя в этот
+    день ещё нет приёма X, начавшегося (по самой ранней записи) не позже, чем
+    snack_after_main_minutes назад — тогда тоже snack (второй, поздний "приём"
+    в то же окно не основной). Время — локальное время пользователя (eaten_at
+    вызывающий обязан передать уже в этом поясе, см. health_core/config.py).
+    """
+    if named in ("breakfast", "lunch", "dinner", "snack"):
+        return named
+
+    windows = meal_windows(conn, user_id)
+    t = eaten_at.strftime("%H:%M")
+    date_str = eaten_at.date().isoformat()
+
+    for name in _MEAL_NAMES:
+        w = windows[name]
+        if not (w["start"] <= t <= w["end"]):
+            continue
+        row = conn.execute(
+            "SELECT MIN(eaten_at) AS first FROM food_log WHERE user_id=? AND date(eaten_at)=? AND meal_slot=?",
+            (user_id, date_str, name),
+        ).fetchone()
+        if row and row["first"]:
+            from health_core.config import load
+
+            after_min = load().get("meals", {}).get("snack_after_main_minutes", 30)
+            first_dt = datetime.strptime(row["first"], "%Y-%m-%d %H:%M:%S")
+            if (eaten_at - first_dt).total_seconds() / 60 > after_min:
+                return "snack"
+        return name
+
+    return "snack"
 
 
 def eating_window(conn: sqlite3.Connection, user_id: int, date: str) -> dict | None:
@@ -358,6 +429,70 @@ if __name__ == "__main__":
         cutoff_none = caffeine_cutoff(conn, uid)
         assert cutoff_none is None, "caffeine_cutoff without bedtimes should return None"
         print("OK: caffeine_cutoff returns None without bedtimes")
+
+        conn.close()
+
+    # Test 7: meal_slot / meal_windows (§ Окно приёма пищи).
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["HEALTH_DB"] = str(Path(tmp) / "health2.db")
+        db.DB_PATH = Path(os.environ["HEALTH_DB"])
+        conn = db.connect()
+        db.migrate(conn)
+        conn.execute(
+            "INSERT INTO users(telegram_user_id, created_at) VALUES (?, ?)",
+            (2, "2026-09-01 00:00:00"),
+        )
+        conn.commit()
+        uid = conn.execute("SELECT id FROM users WHERE telegram_user_id=2").fetchone()["id"]
+
+        # Прямое слово побеждает, даже вне окна и даже как snack в окне основного приёма.
+        assert meal_slot(conn, uid, datetime(2026, 9, 10, 23, 0), named="dinner") == "dinner", \
+            "прямое слово должно побеждать вне окна"
+        assert meal_slot(conn, uid, datetime(2026, 9, 10, 7, 30), named="snack") == "snack", \
+            "прямое слово 'snack' должно побеждать внутри окна основного приёма"
+
+        # 07:30 без слова, окно завтрака свободно -> breakfast.
+        d = "2026-09-10"
+        t1 = datetime(2026, 9, 10, 7, 30)
+        slot1 = meal_slot(conn, uid, t1)
+        assert slot1 == "breakfast", f"07:30 без слова должно быть breakfast, получили {slot1}"
+        conn.execute("INSERT INTO food_log(user_id, eaten_at, meal_slot) VALUES (?, ?, ?)",
+                     (uid, f"{d} 07:30:00", slot1))
+        conn.commit()
+
+        # Вторая запись 07:50 (20 минут от начала завтрака) -> всё ещё breakfast.
+        t2 = datetime(2026, 9, 10, 7, 50)
+        slot2 = meal_slot(conn, uid, t2)
+        assert slot2 == "breakfast", f"07:50 (20 мин) должно быть breakfast, получили {slot2}"
+
+        # Запись 08:15 (45 минут от начала завтрака) -> перекус.
+        t3 = datetime(2026, 9, 10, 8, 15)
+        slot3 = meal_slot(conn, uid, t3)
+        assert slot3 == "snack", f"08:15 (45 мин) должно быть snack, получили {slot3}"
+
+        # 11:30 вне всех окон -> snack.
+        slot4 = meal_slot(conn, uid, datetime(2026, 9, 10, 11, 30))
+        assert slot4 == "snack", f"11:30 вне окон должно быть snack, получили {slot4}"
+
+        # 23:00 вне всех окон -> snack.
+        slot5 = meal_slot(conn, uid, datetime(2026, 9, 10, 23, 0))
+        assert slot5 == "snack", f"23:00 вне окон должно быть snack, получили {slot5}"
+
+        print("OK: meal_slot без прямого слова — окна и правило 30 минут")
+
+        # Личные окна переопределяют умолчание: завтрак у этого пользователя 05:00-06:00,
+        # значит 07:30 больше не в его окне завтрака -> snack.
+        conn.execute("UPDATE users SET meal_windows=? WHERE id=?",
+                     (json.dumps({"breakfast": {"start": "05:00", "end": "06:00"}}), uid))
+        conn.commit()
+        w = meal_windows(conn, uid)
+        assert w["breakfast"] == {"start": "05:00", "end": "06:00"}, \
+            f"личное окно завтрака должно переопределить умолчание, получили {w['breakfast']}"
+        assert w["lunch"] == {"start": "12:00", "end": "16:00"}, \
+            "частичное переопределение не должно трогать lunch/dinner"
+        slot6 = meal_slot(conn, uid, datetime(2026, 9, 11, 7, 30))
+        assert slot6 == "snack", f"07:30 вне личного окна завтрака должно быть snack, получили {slot6}"
+        print("OK: личные окна пользователя переопределяют умолчание (частично)")
 
         conn.close()
 

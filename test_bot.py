@@ -377,6 +377,39 @@ def test_caller_sets_timezone():
     conn.close()
 
 
+def test_log_food_without_meal_slot_assigns_by_window():
+    """CONTEXT.md «Приём пищи»: не назвал приём словом — код определяет сам по
+    окну (health_core.chrono.meal_slot). 13:00 попадает в окно обеда config.yaml
+    meals.lunch (12:00-16:00) по умолчанию -> lunch."""
+    conn = connect()
+    conn.execute("DELETE FROM alerts WHERE user_id=779")
+    conn.execute("DELETE FROM food_log WHERE user_id=779")
+    conn.execute("DELETE FROM users WHERE id=779")
+    conn.execute(
+        "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+        "base_weight_kg,base_weight_date,created_at) VALUES(779,'779',170,'1990-01-01',"
+        "'f','UTC',65,'2026-01-01','2026-01-01 00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    registry.set_caller("779")  # предыдущий тест оставляет свой caller_id в ContextVar
+    try:
+        out = json.loads(main.dispatch("log_food", {
+            "eaten_at": "2026-09-10 13:00:00",
+            "items": [{"name": "Суп", "kcal": 300, "protein_g": 15, "fat_g": 10, "carbs_g": 30}],
+        }))
+        assert "error" not in out, f"log_food без meal_slot не должен быть ошибкой: {out}"
+        assert out.get("meal_slot") == "lunch", f"13:00 без meal_slot должно дать lunch, получили {out}"
+    finally:
+        conn = connect()
+        conn.execute("DELETE FROM alerts WHERE user_id=779")
+        conn.execute("DELETE FROM food_log WHERE user_id=779")
+        conn.execute("DELETE FROM users WHERE id=779")
+        conn.commit()
+        conn.close()
+
+
 def test_long_answer_split():
     text = "\n\n".join(["абзац " + "я" * 300 for _ in range(40)])
     parts = main._chunks(text, main.TELEGRAM_LIMIT)
