@@ -650,10 +650,11 @@ def handle_log_water(params: dict) -> str:
         at += ":00"
 
     # Insert water log
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO water_log(user_id, at, volume_ml) VALUES (?, ?, ?)",
         (user_id, at, ml),
     )
+    water_id = cur.lastrowid
     conn.commit()
 
     # Check guards and record alerts
@@ -670,6 +671,7 @@ def handle_log_water(params: dict) -> str:
 
     return json.dumps(
         {
+            "water_id": water_id,
             "water_ml": water_ml,
             "water_target_ml": water_target_ml,
             "alerts": alerts,
@@ -685,24 +687,57 @@ def handle_log_sleep(params: dict) -> str:
     migrate(conn)
     user_id = _get_user_id(params, conn)
 
-    # ── Удаление ошибочной записи сна ──
-    if (params.get("action") or "add").lower() == "delete":
+    action = (params.get("action") or "add").lower()
+
+    # ── Просмотр записей сна ──
+    if action == "list":
         try:
-            record_id = int(params.get("sleep_id"))
+            limit = min(int(params.get("limit") or 10), 50)
         except (TypeError, ValueError):
-            conn.close()
-            return json.dumps({"error": "Нужен sleep_id — номер записи сна"}, ensure_ascii=False)
-        row = conn.execute(
-            "SELECT night_date, duration_min FROM sleep_log WHERE id=? AND user_id=?",
-            (record_id, user_id)).fetchone()
-        if row is None:
-            conn.close()
-            return json.dumps({"error": f"Записи #{record_id} нет"}, ensure_ascii=False)
+            limit = 10
+        rows = conn.execute(
+            "SELECT id, night_date, duration_min FROM sleep_log WHERE user_id=? ORDER BY night_date DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        entries = [{"sleep_id": r["id"], "night_date": r["night_date"], "duration_min": r["duration_min"]} for r in rows]
+        conn.close()
+        return json.dumps({
+            "entries": entries,
+            "count": len(entries),
+        }, ensure_ascii=False)
+
+    # ── Удаление ошибочной записи сна ──
+    if action == "delete":
+        sleep_id = params.get("sleep_id")
+
+        if sleep_id is None:
+            # Если sleep_id не указан явно, удаляем последнюю запись сна
+            row = conn.execute(
+                "SELECT id, night_date, duration_min FROM sleep_log WHERE user_id=? ORDER BY night_date DESC, id DESC LIMIT 1",
+                (user_id,)
+            ).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": "Записей сна нет"}, ensure_ascii=False)
+            record_id = row["id"]
+        else:
+            try:
+                record_id = int(sleep_id)
+            except (TypeError, ValueError):
+                conn.close()
+                return json.dumps({"error": "Нужен sleep_id — номер записи сна"}, ensure_ascii=False)
+            row = conn.execute(
+                "SELECT night_date, duration_min FROM sleep_log WHERE id=? AND user_id=?",
+                (record_id, user_id)).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": f"Записи #{record_id} нет"}, ensure_ascii=False)
+
         conn.execute("DELETE FROM sleep_log WHERE id=? AND user_id=?", (record_id, user_id))
         conn.commit()
         conn.close()
         return json.dumps({
-            "deleted": {"night_date": row["night_date"], "duration_min": row["duration_min"]},
+            "deleted": {"sleep_id": record_id, "night_date": row["night_date"], "duration_min": row["duration_min"]},
             "id": record_id,
         }, ensure_ascii=False)
 
@@ -760,12 +795,21 @@ def handle_log_sleep(params: dict) -> str:
          params.get("source"), params.get("notes")),
     )
     conn.commit()
+
+    # Получим ID записи сна
+    sleep_row = conn.execute(
+        "SELECT id FROM sleep_log WHERE user_id=? AND night_date=?",
+        (user_id, night),
+    ).fetchone()
+    sleep_id = sleep_row["id"] if sleep_row else None
+
     avg = conn.execute(
         "SELECT AVG(duration_min) d, COUNT(*) n FROM sleep_log WHERE user_id=? AND night_date >= date(?, '-6 day')",
         (user_id, night),
     ).fetchone()
     conn.close()
-    out = {"ok": f"Сон за ночь {night}: {duration // 60} ч {duration % 60:02d} мин",
+    out = {"sleep_id": sleep_id,
+           "ok": f"Сон за ночь {night}: {duration // 60} ч {duration % 60:02d} мин",
            "duration_min": duration}
     if quality is not None:
         out["quality"] = quality
@@ -781,24 +825,57 @@ def handle_log_glucose(params: dict) -> str:
     migrate(conn)
     user_id = _get_user_id(params, conn)
 
-    # ── Удаление ошибочной записи глюкозы ──
-    if (params.get("action") or "add").lower() == "delete":
+    action = (params.get("action") or "add").lower()
+
+    # ── Просмотр записей глюкозы ──
+    if action == "list":
         try:
-            record_id = int(params.get("glucose_id"))
+            limit = min(int(params.get("limit") or 10), 50)
         except (TypeError, ValueError):
-            conn.close()
-            return json.dumps({"error": "Нужен glucose_id — номер записи сахара"}, ensure_ascii=False)
-        row = conn.execute(
-            "SELECT mmol_l, context, at FROM glucose_log WHERE id=? AND user_id=?",
-            (record_id, user_id)).fetchone()
-        if row is None:
-            conn.close()
-            return json.dumps({"error": f"Записи #{record_id} нет"}, ensure_ascii=False)
+            limit = 10
+        rows = conn.execute(
+            "SELECT id, mmol_l, context, at FROM glucose_log WHERE user_id=? ORDER BY at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        entries = [{"glucose_id": r["id"], "mmol_l": r["mmol_l"], "context": r["context"], "at": r["at"]} for r in rows]
+        conn.close()
+        return json.dumps({
+            "entries": entries,
+            "count": len(entries),
+        }, ensure_ascii=False)
+
+    # ── Удаление ошибочной записи глюкозы ──
+    if action == "delete":
+        glucose_id = params.get("glucose_id")
+
+        if glucose_id is None:
+            # Если glucose_id не указан явно, удаляем последнюю запись глюкозы
+            row = conn.execute(
+                "SELECT id, mmol_l, context, at FROM glucose_log WHERE user_id=? ORDER BY at DESC, id DESC LIMIT 1",
+                (user_id,)
+            ).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": "Записей глюкозы нет"}, ensure_ascii=False)
+            record_id = row["id"]
+        else:
+            try:
+                record_id = int(glucose_id)
+            except (TypeError, ValueError):
+                conn.close()
+                return json.dumps({"error": "Нужен glucose_id — номер записи сахара"}, ensure_ascii=False)
+            row = conn.execute(
+                "SELECT mmol_l, context, at FROM glucose_log WHERE id=? AND user_id=?",
+                (record_id, user_id)).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": f"Записи #{record_id} нет"}, ensure_ascii=False)
+
         conn.execute("DELETE FROM glucose_log WHERE id=? AND user_id=?", (record_id, user_id))
         conn.commit()
         conn.close()
         return json.dumps({
-            "deleted": {"mmol_l": row["mmol_l"], "context": row["context"], "at": row["at"]},
+            "deleted": {"glucose_id": record_id, "mmol_l": row["mmol_l"], "context": row["context"], "at": row["at"]},
             "id": record_id,
         }, ensure_ascii=False)
 
@@ -820,10 +897,11 @@ def handle_log_glucose(params: dict) -> str:
         at += ":00"
 
     # Insert glucose log
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO glucose_log(user_id, at, mmol_l, context, confirmed) VALUES (?, ?, ?, ?, ?)",
         (user_id, at, mmol_l, context, 1 if confirmed else 0),
     )
+    glucose_id = cur.lastrowid
     conn.commit()
 
     # Check guards and record alerts
@@ -844,6 +922,7 @@ def handle_log_glucose(params: dict) -> str:
 
     return json.dumps(
         {
+            "glucose_id": glucose_id,
             "confirmed": True,
             "mmol_l": mmol_l,
             "trend": trend,
@@ -950,24 +1029,57 @@ def handle_log_weight(params: dict) -> str:
     migrate(conn)
     user_id = _get_user_id(params, conn)
 
-    # ── Удаление ошибочной записи веса/состава тела ──
-    if (params.get("action") or "add").lower() == "delete":
+    action = (params.get("action") or "add").lower()
+
+    # ── Просмотр записей веса за день / диапазон ──
+    if action == "list":
         try:
-            record_id = int(params.get("weight_id"))
+            limit = min(int(params.get("limit") or 10), 50)
         except (TypeError, ValueError):
-            conn.close()
-            return json.dumps({"error": "Нужен weight_id — номер записи веса"}, ensure_ascii=False)
-        row = conn.execute(
-            "SELECT weight_kg, measured_at FROM body_metrics WHERE id=? AND user_id=?",
-            (record_id, user_id)).fetchone()
-        if row is None:
-            conn.close()
-            return json.dumps({"error": f"Записи #{record_id} нет"}, ensure_ascii=False)
+            limit = 10
+        rows = conn.execute(
+            "SELECT id, weight_kg, measured_at FROM body_metrics WHERE user_id=? ORDER BY measured_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        entries = [{"weight_id": r["id"], "weight_kg": r["weight_kg"], "measured_at": r["measured_at"]} for r in rows]
+        conn.close()
+        return json.dumps({
+            "entries": entries,
+            "count": len(entries),
+        }, ensure_ascii=False)
+
+    # ── Удаление ошибочной записи веса/состава тела ──
+    if action == "delete":
+        weight_id = params.get("weight_id")
+
+        if weight_id is None:
+            # Если weight_id не указан явно, удаляем последнюю запись веса
+            row = conn.execute(
+                "SELECT id, weight_kg, measured_at FROM body_metrics WHERE user_id=? ORDER BY measured_at DESC, id DESC LIMIT 1",
+                (user_id,)
+            ).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": "Записей веса нет"}, ensure_ascii=False)
+            record_id = row["id"]
+        else:
+            try:
+                record_id = int(weight_id)
+            except (TypeError, ValueError):
+                conn.close()
+                return json.dumps({"error": "Нужен weight_id — номер записи веса"}, ensure_ascii=False)
+            row = conn.execute(
+                "SELECT weight_kg, measured_at FROM body_metrics WHERE id=? AND user_id=?",
+                (record_id, user_id)).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": f"Записи #{record_id} нет"}, ensure_ascii=False)
+
         conn.execute("DELETE FROM body_metrics WHERE id=? AND user_id=?", (record_id, user_id))
         conn.commit()
         conn.close()
         return json.dumps({
-            "deleted": {"weight_kg": row["weight_kg"], "measured_at": row["measured_at"]},
+            "deleted": {"weight_id": record_id, "weight_kg": row["weight_kg"], "measured_at": row["measured_at"]},
             "id": record_id,
         }, ensure_ascii=False)
 
@@ -1023,7 +1135,8 @@ def handle_log_weight(params: dict) -> str:
     # Insert body metrics
     placeholders = ", ".join("?" * len(insert_values))
     sql = f"INSERT INTO body_metrics({', '.join(insert_fields)}) VALUES ({placeholders}) ON CONFLICT(user_id, burst_key) DO NOTHING"
-    conn.execute(sql, insert_values)
+    cur = conn.execute(sql, insert_values)
+    weight_id = cur.lastrowid
     conn.commit()
 
     # Check guards and record alerts
@@ -1043,6 +1156,7 @@ def handle_log_weight(params: dict) -> str:
 
     return json.dumps(
         {
+            "weight_id": weight_id,
             "weight_kg": weight_kg,
             "delta_kg": delta,
             "alerts": alerts,
@@ -1059,24 +1173,57 @@ def handle_log_anthropometry(params: dict) -> str:
     migrate(conn)
     user_id = _get_user_id(params, conn)
 
-    # ── Удаление ошибочной записи антропометрии ──
-    if (params.get("action") or "add").lower() == "delete":
+    action = (params.get("action") or "add").lower()
+
+    # ── Просмотр записей антропометрии ──
+    if action == "list":
         try:
-            record_id = int(params.get("anthropometry_id"))
+            limit = min(int(params.get("limit") or 10), 50)
         except (TypeError, ValueError):
-            conn.close()
-            return json.dumps({"error": "Нужен anthropometry_id — номер записи замера"}, ensure_ascii=False)
-        row = conn.execute(
-            "SELECT site, value_cm, measured_on FROM anthropometry WHERE id=? AND user_id=?",
-            (record_id, user_id)).fetchone()
-        if row is None:
-            conn.close()
-            return json.dumps({"error": f"Записи #{record_id} нет"}, ensure_ascii=False)
+            limit = 10
+        rows = conn.execute(
+            "SELECT id, site, value_cm, measured_on FROM anthropometry WHERE user_id=? ORDER BY measured_on DESC, site LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        entries = [{"anthropometry_id": r["id"], "site": r["site"], "value_cm": r["value_cm"], "measured_on": r["measured_on"]} for r in rows]
+        conn.close()
+        return json.dumps({
+            "entries": entries,
+            "count": len(entries),
+        }, ensure_ascii=False)
+
+    # ── Удаление ошибочной записи антропометрии ──
+    if action == "delete":
+        anthropometry_id = params.get("anthropometry_id")
+
+        if anthropometry_id is None:
+            # Если anthropometry_id не указан явно, удаляем последнюю запись антропометрии
+            row = conn.execute(
+                "SELECT id, site, value_cm, measured_on FROM anthropometry WHERE user_id=? ORDER BY measured_on DESC, id DESC LIMIT 1",
+                (user_id,)
+            ).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": "Записей антропометрии нет"}, ensure_ascii=False)
+            record_id = row["id"]
+        else:
+            try:
+                record_id = int(anthropometry_id)
+            except (TypeError, ValueError):
+                conn.close()
+                return json.dumps({"error": "Нужен anthropometry_id — номер записи замера"}, ensure_ascii=False)
+            row = conn.execute(
+                "SELECT site, value_cm, measured_on FROM anthropometry WHERE id=? AND user_id=?",
+                (record_id, user_id)).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": f"Записи #{record_id} нет"}, ensure_ascii=False)
+
         conn.execute("DELETE FROM anthropometry WHERE id=? AND user_id=?", (record_id, user_id))
         conn.commit()
         conn.close()
         return json.dumps({
-            "deleted": {"site": row["site"], "value_cm": row["value_cm"], "measured_on": row["measured_on"]},
+            "deleted": {"anthropometry_id": record_id, "site": row["site"], "value_cm": row["value_cm"], "measured_on": row["measured_on"]},
             "id": record_id,
         }, ensure_ascii=False)
 
@@ -1107,11 +1254,12 @@ def handle_log_anthropometry(params: dict) -> str:
     ).fetchone()
 
     # Insert anthropometry
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO anthropometry(user_id, measured_on, site, value_cm) VALUES (?, ?, ?, ?) "
         "ON CONFLICT(user_id, measured_on, site) DO NOTHING",
         (user_id, measured_on, site, value_cm),
     )
+    anthropometry_id = cur.lastrowid
     conn.commit()
 
     # Check guards and record alerts
@@ -1127,6 +1275,7 @@ def handle_log_anthropometry(params: dict) -> str:
 
     return json.dumps(
         {
+            "anthropometry_id": anthropometry_id,
             "site": site,
             "value_cm": value_cm,
             "delta_cm": delta,
@@ -1155,24 +1304,57 @@ def handle_log_med(params: dict) -> str:
     migrate(conn)
     user_id = _get_user_id(params, conn)
 
-    # ── Удаление ошибочной записи препарата/инъекции ──
-    if (params.get("action") or "add").lower() == "delete":
+    action = (params.get("action") or "add").lower()
+
+    # ── Просмотр записей препаратов ──
+    if action == "list":
         try:
-            record_id = int(params.get("med_id"))
+            limit = min(int(params.get("limit") or 10), 50)
         except (TypeError, ValueError):
-            conn.close()
-            return json.dumps({"error": "Нужен med_id — номер записи препарата"}, ensure_ascii=False)
-        row = conn.execute(
-            "SELECT substance, dose, at FROM med_log WHERE id=? AND user_id=?",
-            (record_id, user_id)).fetchone()
-        if row is None:
-            conn.close()
-            return json.dumps({"error": f"Записи #{record_id} нет"}, ensure_ascii=False)
+            limit = 10
+        rows = conn.execute(
+            "SELECT id, substance, dose, at FROM med_log WHERE user_id=? ORDER BY at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        entries = [{"med_id": r["id"], "substance": r["substance"], "dose": r["dose"], "at": r["at"]} for r in rows]
+        conn.close()
+        return json.dumps({
+            "entries": entries,
+            "count": len(entries),
+        }, ensure_ascii=False)
+
+    # ── Удаление ошибочной записи препарата/инъекции ──
+    if action == "delete":
+        med_id = params.get("med_id")
+
+        if med_id is None:
+            # Если med_id не указан явно, удаляем последнюю запись препарата
+            row = conn.execute(
+                "SELECT id, substance, dose, at FROM med_log WHERE user_id=? ORDER BY at DESC, id DESC LIMIT 1",
+                (user_id,)
+            ).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": "Записей препаратов нет"}, ensure_ascii=False)
+            record_id = row["id"]
+        else:
+            try:
+                record_id = int(med_id)
+            except (TypeError, ValueError):
+                conn.close()
+                return json.dumps({"error": "Нужен med_id — номер записи препарата"}, ensure_ascii=False)
+            row = conn.execute(
+                "SELECT substance, dose, at FROM med_log WHERE id=? AND user_id=?",
+                (record_id, user_id)).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": f"Записи #{record_id} нет"}, ensure_ascii=False)
+
         conn.execute("DELETE FROM med_log WHERE id=? AND user_id=?", (record_id, user_id))
         conn.commit()
         conn.close()
         return json.dumps({
-            "deleted": {"substance": row["substance"], "dose": row["dose"], "at": row["at"]},
+            "deleted": {"med_id": record_id, "substance": row["substance"], "dose": row["dose"], "at": row["at"]},
             "id": record_id,
         }, ensure_ascii=False)
 
@@ -1215,11 +1397,12 @@ def handle_log_med(params: dict) -> str:
         raise ValueError(f"unit должен быть одним из {sorted(_MED_UNITS)}, получено {unit!r}")
 
     # Insert med log
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO med_log(user_id, at, substance, dose, route, unit, site, notes) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (user_id, at, drug, dose, route, unit, site, notes),
     )
+    med_id = cur.lastrowid
     conn.commit()
 
     # Есть расписание по этому препарату — списываем дозу из остатка и двигаем
@@ -1245,6 +1428,7 @@ def handle_log_med(params: dict) -> str:
 
     return json.dumps(
         {
+            "med_id": med_id,
             "confirmed": True,
             "drug": drug,
             "dose": dose,

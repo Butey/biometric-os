@@ -93,8 +93,8 @@ log_sleep_schema = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["add", "delete"],
-            "description": "add (умолчание) — записать сон; delete — удалить ошибочную запись. Для delete нужен sleep_id"
+            "enum": ["add", "delete", "list"],
+            "description": "add (умолчание) — записать сон; delete — удалить ошибочную запись или последнюю ночь (без sleep_id); list — список записей сна"
         },
         "sleep_id": {
             "type": "integer",
@@ -119,6 +119,10 @@ log_sleep_schema = {
         "awake_min": {"type": "integer", "description": "Пробуждения, мин. Только если прибор дал число"},
         "source": {"type": "string", "description": "Откуда данные: scale_app, часы, вручную"},
         "notes": {"type": "string", "description": "Свободный комментарий"},
+        "limit": {
+            "type": "integer",
+            "description": "Для action=list: сколько последних записей вернуть (по умолчанию 10)"
+        },
         "user_id": {"type": "integer", "description": "ID пользователя"}
     },
     "required": []
@@ -223,8 +227,8 @@ log_glucose_schema = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["add", "delete"],
-            "description": "add (умолчание) — записать замер; delete — удалить ошибочную запись. Для delete нужен glucose_id"
+            "enum": ["add", "delete", "list"],
+            "description": "add (умолчание) — записать замер; delete — удалить ошибочную запись или последний замер (без glucose_id); list — список записей глюкозы"
         },
         "glucose_id": {
             "type": "integer",
@@ -246,6 +250,10 @@ log_glucose_schema = {
             "type": "boolean",
             "description": "Подтверждено ли значение"
         },
+        "limit": {
+            "type": "integer",
+            "description": "Для action=list: сколько последних записей вернуть (по умолчанию 10)"
+        },
         "user_id": {
             "type": "integer",
             "description": "ID пользователя"
@@ -259,8 +267,8 @@ log_weight_schema = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["add", "delete"],
-            "description": "add (умолчание) — записать вес; delete — удалить ошибочную запись. Для delete нужен weight_id"
+            "enum": ["add", "delete", "list"],
+            "description": "add (умолчание) — записать вес; delete — удалить ошибочную запись или последний вес (без weight_id); list — список записей веса"
         },
         "weight_id": {
             "type": "integer",
@@ -287,6 +295,10 @@ log_weight_schema = {
             "type": "string",
             "description": "ISO timestamp, по умолчанию сейчас"
         },
+        "limit": {
+            "type": "integer",
+            "description": "Для action=list: сколько последних записей вернуть (по умолчанию 10)"
+        },
         "user_id": {
             "type": "integer",
             "description": "ID пользователя"
@@ -300,8 +312,8 @@ log_anthropometry_schema = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["add", "delete"],
-            "description": "add (умолчание) — записать замер; delete — удалить ошибочную запись. Для delete нужен anthropometry_id"
+            "enum": ["add", "delete", "list"],
+            "description": "add (умолчание) — записать замер; delete — удалить ошибочную запись или последний замер (без anthropometry_id); list — список записей замеров"
         },
         "anthropometry_id": {
             "type": "integer",
@@ -320,6 +332,10 @@ log_anthropometry_schema = {
             "type": "string",
             "description": "ISO date, по умолчанию сегодня"
         },
+        "limit": {
+            "type": "integer",
+            "description": "Для action=list: сколько последних записей вернуть (по умолчанию 10)"
+        },
         "user_id": {
             "type": "integer",
             "description": "ID пользователя"
@@ -333,8 +349,8 @@ log_med_schema = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["add", "delete"],
-            "description": "add (умолчание) — записать приём; delete — удалить ошибочную запись. Для delete нужен med_id"
+            "enum": ["add", "delete", "list"],
+            "description": "add (умолчание) — записать приём; delete — удалить ошибочную запись или последний приём (без med_id); list — список записей препаратов"
         },
         "med_id": {
             "type": "integer",
@@ -369,6 +385,10 @@ log_med_schema = {
         "at": {
             "type": "string",
             "description": "ISO timestamp, по умолчанию сейчас"
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Для action=list: сколько последних записей вернуть (по умолчанию 10)"
         },
         "user_id": {
             "type": "integer",

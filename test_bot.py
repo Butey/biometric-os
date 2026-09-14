@@ -385,6 +385,59 @@ def test_long_answer_split():
     assert "".join(p.replace("\n\n", "") for p in parts).count("абзац") == 40, "текст потерян при разбиении"
 
 
+def test_log_weight_with_id_list_delete():
+    """Запись веса → id в ответе → list содержит этот id → delete без id удаляет."""
+    registry.set_caller("999")
+    conn = connect()
+    migrate(conn)
+    try:
+        # Зарегистрируем пользователя
+        conn.execute("DELETE FROM users WHERE id=999")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(999,'999',180,'1980-01-01',"
+            "'male','UTC',75,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+
+        # Добавляем вес и проверяем ID в ответе
+        result_add = json.loads(main.dispatch("log_weight", {
+            "weight_kg": 75.5,
+            "measured_at": "2026-01-01 12:00:00"
+        }))
+        assert "weight_id" in result_add, f"нет weight_id в ответе: {result_add}"
+        weight_id = result_add["weight_id"]
+        assert weight_id > 0, f"weight_id должен быть положительным, получено {weight_id}"
+
+        # Проверяем что запись есть в list
+        result_list = json.loads(main.dispatch("log_weight", {
+            "action": "list",
+            "limit": 10
+        }))
+        assert "entries" in result_list, f"нет entries в list: {result_list}"
+        assert len(result_list["entries"]) > 0, "list пуст"
+        found = any(e["weight_id"] == weight_id for e in result_list["entries"])
+        assert found, f"weight_id {weight_id} не найден в list: {result_list}"
+
+        # Удаляем последнюю запись без ID и проверяем что удалилась нужная
+        result_del = json.loads(main.dispatch("log_weight", {
+            "action": "delete"
+        }))
+        assert "deleted" in result_del, f"нет deleted в ответе: {result_del}"
+        assert result_del["deleted"]["weight_id"] == weight_id, \
+            f"удалилась не та запись: {result_del['deleted']['weight_id']} != {weight_id}"
+
+        # Проверяем что запись действительно удалена
+        result_list2 = json.loads(main.dispatch("log_weight", {
+            "action": "list",
+            "limit": 10
+        }))
+        found2 = any(e["weight_id"] == weight_id for e in result_list2["entries"])
+        assert not found2, f"weight_id {weight_id} всё ещё есть в list после удаления"
+
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
