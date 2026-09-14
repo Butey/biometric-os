@@ -20,7 +20,7 @@ from health_core.ingest.tcx import import_tcx
 from health_core.ingest.anthro import SITES as _ANTHRO_SITES
 from health_core.plans import get_plan, set_meal_plan, set_workout_plan, plan_vs_actual
 from health_core.export import is_remote_path, rclone_pull
-from health_core.meds import canon as _canon_med
+from health_core.meds import canon as _canon_med, card as _med_card
 from health_core import config
 
 
@@ -1413,9 +1413,10 @@ def handle_log_med(params: dict) -> str:
     # Есть расписание по этому препарату — списываем дозу из остатка и двигаем
     # следующую дозу на каденцию. «Учёт остатков»: факт приёма уменьшает запас.
     sched = conn.execute(
-        "SELECT id, every_days, next_at, stock_doses FROM med_schedule WHERE user_id=? AND substance=?",
+        "SELECT id, every_days, next_at, stock_doses, dose FROM med_schedule WHERE user_id=? AND substance=?",
         (user_id, drug),
     ).fetchone()
+    dose_differs = False
     if sched is not None:
         new_stock = None if sched["stock_doses"] is None else max(0.0, sched["stock_doses"] - 1)
         new_next = sched["next_at"]
@@ -1424,6 +1425,11 @@ def handle_log_med(params: dict) -> str:
         conn.execute("UPDATE med_schedule SET stock_doses=?, next_at=?, updated_at=? WHERE id=?",
                      (new_stock, new_next, _now_iso(), sched["id"]))
         conn.commit()
+        # Фактический приём записывается всегда; несовпадение с расписанием —
+        # просто пометка в ответе, не отказ (docs/adr/0002).
+        actual = _dose_num(dose)
+        if sched["dose"] is not None and actual is not None and abs(actual - sched["dose"]) > 1e-6:
+            dose_differs = True
 
     # Check guards and record alerts
     alerts = check_all(conn, user_id)
@@ -1431,17 +1437,17 @@ def handle_log_med(params: dict) -> str:
 
     conn.close()
 
-    return json.dumps(
-        {
-            "med_id": med_id,
-            "confirmed": True,
-            "drug": drug,
-            "dose": dose,
-            "route": route,
-            "alerts": alerts,
-        },
-        ensure_ascii=False,
-    )
+    resp = {
+        "med_id": med_id,
+        "confirmed": True,
+        "drug": drug,
+        "dose": dose,
+        "route": route,
+        "alerts": alerts,
+    }
+    if dose_differs:
+        resp["dose_differs_from_schedule"] = True
+    return json.dumps(resp, ensure_ascii=False)
 
 
 @_handler_wrapper
@@ -2814,6 +2820,96 @@ def _advance_next(base: str, every_days: int) -> str:
     return (_dt(base) + timedelta(days=every_days)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _dose_num(text) -> float | None:
+    """Число из TEXT дозы ('12.5', '12.5 мг', ...). None, если не нашли."""
+    if text is None:
+        return None
+    m = re.search(r"[-+]?\d*\.?\d+", str(text))
+    return float(m.group()) if m else None
+
+
+def _ladder_step(ladder: list[float], value: float, eps: float = 1e-6) -> int | None:
+    """Индекс ступени лестницы, совпадающей с value (с допуском на float)."""
+    for i, step in enumerate(ladder):
+        if abs(step - value) < eps:
+            return i
+    return None
+
+
+def _ladder_note(ladder: list[float]) -> str:
+    return "Ступени лестницы: " + ", ".join(f"{s:g}" for s in ladder) + "."
+
+
+def _dose_start_date(conn, user_id: int, substance: str, dose_f: float):
+    """Самая ранняя запись med_log с дозой dose_f, идущая от конца истории
+    приёма этого препарата и не прерванная записью другой дозы (docs/adr/
+    0002: «повышение... не раньше минимального срока с даты, когда начался
+    приём текущей дозы»). None, если истории нет вовсе — тогда по сроку не
+    блокируем, а не считаем срок нулевым."""
+    rows = conn.execute(
+        "SELECT at, dose FROM med_log WHERE user_id=? AND substance=? ORDER BY at",
+        (user_id, substance),
+    ).fetchall()
+    start = None
+    for r in rows:
+        d = _dose_num(r["dose"])
+        if d is not None and abs(d - dose_f) < 1e-6:
+            if start is None:
+                start = _dt(r["at"])
+        else:
+            start = None
+    return start
+
+
+def _check_dose_bounds(conn, user_id: int, substance: str, dose_f: float, card_data: dict, now: datetime):
+    """Рамки плана дозы из карты препарата (docs/adr/0002-рекомендация-дозы).
+
+    Возвращает (текст_ошибки_или_None, resume_after_break). Модель предлагает
+    дозу, код только держит рамки: ступень лестницы, не выше максимума,
+    повышение на соседнюю ступень не раньше min_weeks, а после перерыва в
+    терапии (>14 дней без приёма) — не выше прежней дозы."""
+    ladder = card_data["ladder"]
+    note = _ladder_note(ladder)
+    idx_new = _ladder_step(ladder, dose_f)
+    if idx_new is None:
+        return f"{dose_f:g} — не ступень лестницы титрации. {note}", False
+    if dose_f > max(ladder) + 1e-6:
+        return f"{dose_f:g} выше максимума {max(ladder):g}. {note}", False
+
+    last_log = conn.execute(
+        "SELECT at, dose FROM med_log WHERE user_id=? AND substance=? ORDER BY at DESC LIMIT 1",
+        (user_id, substance),
+    ).fetchone()
+    if last_log is not None and (now - _dt(last_log["at"])).days > 14:
+        last_dose = _dose_num(last_log["dose"])
+        if last_dose is not None and dose_f > last_dose + 1e-6:
+            return (f"Перерыв в терапии больше 2 недель (последний приём {_dt(last_log['at']):%Y-%m-%d}) "
+                    f"— новая доза не выше последней принятой ({last_dose:g}). {note}"), False
+        return None, True  # возобновление не выше прежней дозы — resume_after_break
+
+    current = conn.execute(
+        "SELECT dose FROM med_schedule WHERE user_id=? AND substance=?", (user_id, substance)
+    ).fetchone()
+    current_dose = current["dose"] if current else None
+    if current_dose is None or dose_f <= current_dose + 1e-6:
+        return None, False  # снижение/та же ступень/первое расписание — без ограничений
+
+    idx_current = _ladder_step(ladder, current_dose)
+    if idx_current is None or idx_new != idx_current + 1:
+        return f"Повышение только на соседнюю ступень выше {current_dose:g}. {note}", False
+
+    min_weeks = card_data.get("min_weeks")
+    if min_weeks:
+        start = _dose_start_date(conn, user_id, substance, current_dose)
+        if start is not None:
+            weeks = (now - start).days / 7
+            if weeks < min_weeks:
+                can_at = start + timedelta(weeks=min_weeks)
+                return (f"Минимум {min_weeks} нед на ступени {current_dose:g} — повысить можно с "
+                        f"{can_at:%Y-%m-%d}. {note}"), False
+    return None, False
+
+
 def _pharma_due(next_at: str) -> str:
     """Человекочитаемая следующая доза: 'Вс 24.08 22:00 (через 2д)'.
 
@@ -2841,7 +2937,7 @@ def _pharma_due(next_at: str) -> str:
 
 
 def _glp1_line(glp: dict) -> str:
-    """Строка про оценочный уровень тирзепатида для _render_pharma.
+    """Строка про оценочный уровень препарата (GLP-1-класса) для _render_pharma.
 
     Формат оценки, не факта: цифры из health_core.glp1 — фармакокинетическая
     прикидка по вкладышу препарата, а не измерение. Никаких калорий/таргетов
@@ -2856,7 +2952,8 @@ def _glp1_line(glp: dict) -> str:
     return " · ".join(parts) + f" — оценка по T½ {glp.get('half_life_days', 5)} дн"
 
 
-def _render_pharma(rows, last, glp=None) -> str:
+def _render_pharma(rows, last, glp_by_substance=None) -> str:
+    glp_by_substance = glp_by_substance or {}
     lines = ["💊 Фарма"]
     if not rows:
         lines.append("Расписаний нет. Задай: pharma schedule.")
@@ -2866,7 +2963,8 @@ def _render_pharma(rows, last, glp=None) -> str:
         lines.append(f"\n{r['substance']} · {dose}{route}")
         if r["next_at"]:
             lines.append(f"  Следующая: {_pharma_due(r['next_at'])}")
-            if glp is not None and _canon_med(r["substance"]) == _canon_med("Тирзепатид"):
+            glp = glp_by_substance.get(_canon_med(r["substance"]))
+            if glp is not None:
                 lines.append(f"  {_glp1_line(glp)}")
         if r["every_days"]:
             lines.append(f"  Каждые {r['every_days']} дн")
@@ -2882,8 +2980,11 @@ def _render_pharma(rows, last, glp=None) -> str:
 
 @_handler_wrapper
 def handle_pharma(params: dict) -> str:
-    """Фарма-контур: расписание приёма, рекомендованная доза (её задаёт модель, код
-    не считает), остаток доз. action=status|schedule|restock|remove. Фактический
+    """Фарма-контур: расписание приёма, рекомендованная доза (её задаёт модель), остаток
+    доз. action=status|schedule|restock|remove. schedule держит рамки лестницы титрации
+    из карты препарата (docs/adr/0002): доза — ступень лестницы, не выше максимума,
+    повышение только на соседнюю ступень не раньше минимального срока, после перерыва
+    в терапии (>14 дней) — не выше прежней дозы. by_doctor=true снимает рамки. Фактический
     приём — отдельный инструмент log_med; он же списывает дозу и двигает next_at."""
     conn = connect()
     migrate(conn)
@@ -2900,15 +3001,22 @@ def handle_pharma(params: dict) -> str:
             "SELECT at, substance, dose, unit FROM med_log WHERE user_id=? ORDER BY at DESC LIMIT 1",
             (user_id,),
         ).fetchone()
-        # Оценка уровня — вспомогательная; сбой в ней не должен рушить статус фармы.
-        glp = None
+        # Оценка уровня — вспомогательная и отдельная по каждому препарату
+        # расписания, у которого в карте есть t½ и пик (health_core.glp1.profile);
+        # сбой в ней не должен рушить статус фармы.
+        glp_by_substance = {}
         try:
             from health_core import glp1
-            glp = glp1.profile(conn, user_id)
+            for r in rows:
+                c = _med_card(r["substance"])
+                if c and c.get("half_life_days") and c.get("tmax_h"):
+                    p = glp1.profile(conn, user_id, substance=r["substance"])
+                    if p is not None:
+                        glp_by_substance[_canon_med(r["substance"])] = p
         except Exception:
-            glp = None
+            glp_by_substance = {}
         conn.close()
-        return json.dumps({"pharma": _render_pharma(rows, last, glp=glp)}, ensure_ascii=False)
+        return json.dumps({"pharma": _render_pharma(rows, last, glp_by_substance)}, ensure_ascii=False)
 
     substance = _canon_med(params.get("substance"))
     if not substance:
@@ -2916,21 +3024,50 @@ def handle_pharma(params: dict) -> str:
         return json.dumps({"error": "Нужно название препарата (substance)"}, ensure_ascii=False)
 
     if action == "schedule":
+        dose_param = params.get("dose")
+        by_doctor = bool(params.get("by_doctor"))
+        resume_after_break = False
+
+        # Рамки из карты препарата (docs/adr/0002) — только когда есть новая
+        # доза, лестница в карте и приём не по назначению врача. Без карты/
+        # лестницы или с by_doctor=true — как раньше, чистый учёт.
+        if dose_param is not None and not by_doctor:
+            try:
+                dose_f = float(dose_param)
+            except (TypeError, ValueError):
+                conn.close()
+                return json.dumps({"error": "dose должен быть числом"}, ensure_ascii=False)
+            card_data = _med_card(substance)
+            if card_data and card_data.get("ladder"):
+                now = config.local_now().replace(tzinfo=None)
+                err, resume_after_break = _check_dose_bounds(conn, user_id, substance, dose_f, card_data, now)
+                if err:
+                    conn.close()
+                    return json.dumps({"error": err}, ensure_ascii=False)
+
+        # dose_by_doctor привязан к устанавливаемой дозе: не трогаем колонку,
+        # если dose в этом вызове не задаётся (COALESCE с NULL оставит как было).
+        dose_by_doctor_val = (1 if by_doctor else 0) if dose_param is not None else None
+
         conn.execute(
             "INSERT INTO med_schedule(user_id, substance, dose, unit, route, every_days, next_at, "
-            "stock_doses, notes, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "stock_doses, notes, dose_by_doctor, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(user_id, substance) DO UPDATE SET "
             "dose=COALESCE(excluded.dose,dose), unit=COALESCE(excluded.unit,unit), "
             "route=COALESCE(excluded.route,route), every_days=COALESCE(excluded.every_days,every_days), "
             "next_at=COALESCE(excluded.next_at,next_at), stock_doses=COALESCE(excluded.stock_doses,stock_doses), "
-            "notes=COALESCE(excluded.notes,notes), updated_at=excluded.updated_at",
-            (user_id, substance, params.get("dose"), params.get("unit"), params.get("route"),
+            "notes=COALESCE(excluded.notes,notes), dose_by_doctor=COALESCE(excluded.dose_by_doctor,dose_by_doctor), "
+            "updated_at=excluded.updated_at",
+            (user_id, substance, dose_param, params.get("unit"), params.get("route"),
              params.get("every_days"), _norm_ts(params.get("next_at")), params.get("stock_doses"),
-             params.get("notes"), _now_iso()),
+             params.get("notes"), dose_by_doctor_val, _now_iso()),
         )
         conn.commit()
         conn.close()
-        return json.dumps({"ok": f"Расписание обновлено: {substance}"}, ensure_ascii=False)
+        resp = {"ok": f"Расписание обновлено: {substance}"}
+        if resume_after_break:
+            resp["resume_after_break"] = True
+        return json.dumps(resp, ensure_ascii=False)
 
     if action == "restock":
         row = conn.execute(

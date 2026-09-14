@@ -24,6 +24,8 @@ DRUG_CARDS = Path(__file__).resolve().parent.parent / "Knowledge" / "drug_cards.
 
 _CARD_RE = re.compile(r"^#{1,6}[^\S\n]*\S*[^\S\n]*Карта[^\S\n]*\d+[^\S\n]*:[^\S\n]*(.+?)[^\S\n]*$", re.M)
 _PAREN_RE = re.compile(r"\(([^)]*)\)")
+_FIELD_RE = re.compile(r"^-\s*\*\*([^*:]+):\*\*\s*(.+?)\s*$", re.M)
+_NUM_RE = re.compile(r"[-+]?\d*[.,]?\d+")
 
 
 def _key(name: str) -> str:
@@ -51,6 +53,63 @@ def aliases() -> dict[str, str]:
         for n in names:
             out.setdefault(_key(n), names[0])
     return out
+
+
+def _num(text: str) -> float | None:
+    m = _NUM_RE.search(text)
+    return float(m.group().replace(",", ".")) if m else None
+
+
+@lru_cache(maxsize=1)
+def _cards() -> dict[str, dict]:
+    """Каноническое имя (ключ casefold) -> поля карты. Кэш и парсинг тем же
+    файлом и тем же приёмом, что aliases() — второго справочника не заводим."""
+    try:
+        text = DRUG_CARDS.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    headers = list(_CARD_RE.finditer(text))
+    out: dict[str, dict] = {}
+    for i, m in enumerate(headers):
+        first = m.group(1).split("/")[0].strip()
+        canonical = _PAREN_RE.sub("", first).strip()
+        if not canonical:
+            continue
+        block_end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+        fields = {k.strip(): v.strip() for k, v in _FIELD_RE.findall(text[m.end():block_end])}
+        if not fields:
+            continue
+        status = fields.get("Статус")
+        ladder_raw = fields.get("Лестница")
+        ladder = [_num(x) for x in ladder_raw.split(",")] if ladder_raw else None
+        if ladder and any(v is None for v in ladder):
+            ladder = None  # неразборчивая лестница — как будто её нет, не половинка
+        min_weeks_raw = fields.get("Минимум недель на ступени")
+        interval_raw = fields.get("Интервал приёма")
+        half_life_raw = fields.get("Период полувыведения")
+        tmax_raw = fields.get("Пик концентрации")
+        out[_key(canonical)] = {
+            "status": status,
+            "unregistered": bool(status and "не зарегистрирован" in status),
+            "ladder": ladder,
+            "min_weeks": int(_num(min_weeks_raw)) if min_weeks_raw and _num(min_weeks_raw) is not None else None,
+            "interval_days": int(_num(interval_raw)) if interval_raw and _num(interval_raw) is not None else None,
+            "half_life_days": _num(half_life_raw) if half_life_raw else None,
+            "tmax_h": _num(tmax_raw) if tmax_raw else None,
+            "source": fields.get("Источник"),
+        }
+    return out
+
+
+def card(name: str) -> dict | None:
+    """Карта препарата по каноническому имени (или алиасу — сводится сам).
+
+    None, если карты нет или в ней нет полей-строк (напр. карта только с
+    механизмом действия, без лестницы/PK — «Тесторил»). Поля есть, но
+    какие-то из них не заданы (нет лестницы у не полностью описанного
+    препарата) — dict возвращается, просто с None в этих ключах; вызывающий
+    код (рамки дозы, модель концентрации) сам решает, что делать без них."""
+    return _cards().get(_key(canon(name)))
 
 
 def canon(name: str) -> str:
@@ -117,6 +176,23 @@ if __name__ == "__main__":
     assert canon("Тесторил") == "Тесторил"
     assert canon("Ноотропил") == "Ноотропил", "незнакомое имя не трогаем"
     assert canon("") == ""
+
+    tz = card("Тирзетта")  # алиас -> карта канонического имени
+    assert tz is not None and tz["ladder"] == [2.5, 5.0, 7.5, 10.0, 12.5, 15.0], tz
+    assert tz["min_weeks"] == 4 and tz["interval_days"] == 7
+    assert tz["half_life_days"] == 5.0 and tz["tmax_h"] == 24.0
+    assert tz["unregistered"] is False and tz["status"] == "зарегистрирован"
+
+    sm = card("Оземпик")
+    assert sm is not None and sm["ladder"] == [0.25, 0.5, 1.0, 1.7, 2.4], sm
+    assert sm["half_life_days"] == 7.0 and sm["tmax_h"] == 36.0, "семаглутид получает свой профиль, не тирзепатида"
+
+    rt = card("Ретатрутид")
+    assert rt is not None and rt["unregistered"] is True, "ретатрутид помечен незарегистрированным"
+    assert rt["ladder"] == [2.0, 4.0, 6.0, 9.0, 12.0]
+
+    assert card("Тесторил") is None or card("Тесторил").get("ladder") is None, "у Тесторила нет лестницы"
+    assert card("Ноотропил") is None, "без карты — None"
 
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

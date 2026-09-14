@@ -471,6 +471,76 @@ def test_log_weight_with_id_list_delete():
         conn.close()
 
 
+def test_pharma_dose_ladder_bounds():
+    """docs/adr/0002: рамки дозы держит код, не модель. 12.5->15 раньше 4
+    недель — ошибка; 12.5->10 (снижение) — ок; прыжок 10->15 через 12.5 —
+    ошибка; 12.5->20 с by_doctor=true — ок (рамки сняты)."""
+    from datetime import timedelta
+    from health_core import config
+
+    registry.set_caller("888")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM alerts WHERE user_id=888")
+        conn.execute("DELETE FROM med_log WHERE user_id=888")
+        conn.execute("DELETE FROM med_schedule WHERE user_id=888")
+        conn.execute("DELETE FROM users WHERE id=888")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(888,'888',175,'1985-01-01',"
+            "'male','UTC',90,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+
+        now = config.local_now()
+
+        # Стартовая доза — первое расписание, без истории приёма, рамки на неё не давят.
+        r = json.loads(main.dispatch("pharma", {
+            "action": "schedule", "substance": "Тирзепатид", "dose": 12.5,
+            "unit": "mg", "route": "injection",
+        }))
+        assert "ok" in r, f"первая доза не должна упираться в рамки: {r}"
+
+        # Приём этой дозы 5 дней назад — с этой даты отсчитывается минимальный срок ступени.
+        r = json.loads(main.dispatch("log_med", {
+            "drug": "Тирзепатид", "dose": "12.5", "route": "injection", "unit": "mg",
+            "at": (now - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S"),
+        }))
+        assert "error" not in r, f"log_med не должен падать: {r}"
+
+        # 12.5 -> 15 (соседняя ступень) раньше 4 недель на ступени — ошибка.
+        r = json.loads(main.dispatch("pharma", {
+            "action": "schedule", "substance": "Тирзепатид", "dose": 15,
+        }))
+        assert "error" in r, f"повышение раньше 4 недель должно быть ошибкой: {r}"
+
+        # 12.5 -> 10: снижение разрешено на любую ступень без ограничения по сроку.
+        r = json.loads(main.dispatch("pharma", {
+            "action": "schedule", "substance": "Тирзепатид", "dose": 10,
+        }))
+        assert "ok" in r, f"снижение дозы не должно блокироваться: {r}"
+
+        # 10 -> 15: прыжок через ступень 12.5 — ошибка, даже если бы срок уже прошёл.
+        r = json.loads(main.dispatch("pharma", {
+            "action": "schedule", "substance": "Тирзепатид", "dose": 15,
+        }))
+        assert "error" in r, f"прыжок через ступень должен быть ошибкой: {r}"
+
+        # 12.5 -> 20 с by_doctor=true: рамки сняты, 20 не ступень и выше максимума — всё равно ок.
+        r = json.loads(main.dispatch("pharma", {
+            "action": "schedule", "substance": "Тирзепатид", "dose": 20, "by_doctor": True,
+        }))
+        assert "ok" in r, f"by_doctor должен снимать рамки: {r}"
+
+    finally:
+        conn.execute("DELETE FROM alerts WHERE user_id=888")
+        conn.execute("DELETE FROM med_log WHERE user_id=888")
+        conn.execute("DELETE FROM med_schedule WHERE user_id=888")
+        conn.execute("DELETE FROM users WHERE id=888")
+        conn.commit()
+        conn.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

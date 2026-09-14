@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -151,6 +151,9 @@ CREATE TABLE IF NOT EXISTS med_schedule (
     stock_doses REAL,
     notes TEXT,
     updated_at TEXT,
+    -- v19: доза по назначению врача (docs/adr/0002) — снимает рамки лестницы
+    -- титрации из карты препарата (plugin/tools.py, action=schedule).
+    dose_by_doctor INTEGER,
     UNIQUE(user_id, substance)
 );
 
@@ -469,6 +472,14 @@ def _migrate_v17_to_v18(conn: sqlite3.Connection) -> None:
     _add_column(conn, "users", "meal_windows", "TEXT")
 
 
+def _migrate_v18_to_v19(conn: sqlite3.Connection) -> None:
+    """v18->v19: med_schedule.dose_by_doctor — «Доза по назначению врача»
+    (docs/adr/0002-рекомендация-дозы.md, CONTEXT.md). Без пометки план дозы
+    держится в рамках лестницы титрации карты препарата; с ней рамки code
+    не проверяет."""
+    _add_column(conn, "med_schedule", "dose_by_doctor", "INTEGER")
+
+
 def _migrate_v13_to_v14(conn: sqlite3.Connection) -> None:
     """v13->v14: добавляет notes и source в activity, делает file_hash необязательным (для ручных записей)."""
     _add_column(conn, "activity", "notes", "TEXT")
@@ -507,6 +518,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v16_to_v17(conn)
         if row["version"] < 18:
             _migrate_v17_to_v18(conn)
+        if row["version"] < 19:
+            _migrate_v18_to_v19(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 
