@@ -44,7 +44,7 @@ def scripted(*responses):
     """Подменяет сетевой шов llm._post очередью готовых ответов провайдера."""
     queue = list(responses)
 
-    async def _post(session, url, headers, payload):
+    async def _post(session, url, headers, payload, timeout_s=None):
         return 200, {"choices": [{"message": queue.pop(0)}]}
 
     return _post
@@ -59,7 +59,7 @@ os.environ["FAKE_KEY"] = "test"
 def test_tool_specs():
     specs = main.tool_specs()
     names = [s["function"]["name"] for s in specs]
-    assert len(names) == 34, f"33 инструмента плагина + knowledge, получено {len(names)}"
+    assert len(names) == 35, f"34 инструмента плагина + knowledge, получено {len(names)}"
     assert "knowledge" in names, "инструмент знаний не подключён"
     assert "log_food" in names and "get_status_bar" in names
     for s in specs:
@@ -581,6 +581,47 @@ def test_log_side_effect_add_list_delete():
         result_list2 = json.loads(main.dispatch("log_side_effect", {"action": "list", "limit": 10}))
         found2 = any(e["side_effect_id"] == side_effect_id for e in result_list2["entries"])
         assert not found2, f"side_effect_id {side_effect_id} всё ещё есть в list после удаления"
+    finally:
+        conn.close()
+
+
+def test_council_request_creates_running_and_answers_immediately():
+    """council action=request не ждёт саму работу консилиума (минуты): создаёт
+    running-запись и сразу отвечает, задача уходит в очередь фонового запуска
+    (bot/main.py._flush_pending_council забирает её оттуда)."""
+    registry.set_caller("777")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM users WHERE id=777")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(777,'777',180,'1980-01-01',"
+            "'male','UTC',75,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+
+        from bot import council
+        council._PENDING_RUNS.clear()
+
+        result = json.loads(main.dispatch("council", {"action": "request", "reason": "manual"}))
+        assert "ok" in result, f"нет 'ok' в ответе: {result}"
+        run_id = result["run_id"]
+
+        row = conn.execute("SELECT status, reason FROM council_runs WHERE id=?", (run_id,)).fetchone()
+        assert row is not None and row["status"] == "running" and row["reason"] == "manual", \
+            dict(row) if row else None
+
+        assert any(r[2] == run_id for r in council._PENDING_RUNS), \
+            "заявка не встала в очередь фонового запуска"
+        council._PENDING_RUNS.clear()
+
+        # повторный request раньше 6ч по той же причине — отказ, running не размножается
+        result2 = json.loads(main.dispatch("council", {"action": "request", "reason": "manual"}))
+        assert "error" in result2, f"повторный request должен быть отклонён: {result2}"
+
+        # action=status видит последний прогон
+        status = json.loads(main.dispatch("council", {"action": "status"}))
+        assert status["id"] == run_id and status["status"] == "running", status
     finally:
         conn.close()
 

@@ -1,5 +1,25 @@
 """JSON schemas for health plugin tools. Draft-07, descriptions in Russian."""
 
+council_schema = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["status", "request"],
+            "description": "status (умолчание) — последний результат/статус; "
+                           "request — созвать консилиум (нужен reason), ставит задачу в фон и сразу отвечает"
+        },
+        "reason": {
+            "type": "string",
+            "enum": ["manual", "dose"],
+            "description": "Для action=request: manual — по просьбе человека («разбери мои данные»), "
+                           "dose — перед любой рекомендацией дозы"
+        },
+        "user_id": {"type": "integer", "description": "ID пользователя"}
+    },
+    "required": ["action"]
+}
+
 log_food_schema = {
     "type": "object",
     "properties": {

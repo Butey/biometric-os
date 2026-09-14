@@ -23,6 +23,7 @@ DESCRIPTIONS = {
     "log_water": "Записать выпитую воду в мл. Также action=list для списка записей, action=delete для удаления по water_id (или clear_day=true для очистки всей воды за день).",
     "log_glucose": "Записать замер сахара крови (ммоль/л), опционально контекст (до/после еды). Также action=list для списка записей (limit опционален), action=delete для удаления по glucose_id или последнего замера (без glucose_id).",
     "log_side_effect": "Записать побочный эффект (тошнота, рвота, запор, диарея, изжога, слабость и т.п.) с тяжестью mild/moderate/severe. Без привязки к препарату — связь по времени приёма устанавливает модель. Также action=list (limit, since_days опциональны — например, за период с последнего изменения дозы), action=delete по side_effect_id или последней записи (без side_effect_id).",
+    "council": "Консилиум: честный разбор всех данных человека несколькими независимыми моделями в фоне (docs/adr/0003). action=request с reason=manual (по просьбе человека, «разбери мои данные») или reason=dose (перед любой рекомендацией дозы) — запускает разбор в фоне и сразу отвечает, итог придёт отдельным сообщением. action=status (умолчание) — последний результат/статус.",
     "log_labs": "Анализы крови текстом: add — записать показатели на дату сдачи (глюкоза, инсулин, HbA1c, креатинин, холестерин, ЛПВП, ЛПНП, триглицериды, АЛТ, АСТ); list — история; delete — по lab_id; derived — HOMA-IR, eGFR, non-HDL, eAG. Единицы: ммоль/л, мкЕд/мл, %, мкмоль/л, Ед/л.",
     "log_sleep": "Записать сон за ночь: длительность в минутах, время отбоя и подъёма, субъективная оценка 1-5. Также action=list для списка записей (limit опционален), action=delete для удаления по sleep_id или последней ночи (без sleep_id).",
     "equipment": "Инвентарь для тренировок: список, добавить, убрать. Спрашивай ПЕРЕД составлением тренировки — без записанного оборудования план не сохранится.",
@@ -254,7 +255,7 @@ if __name__ == "__main__":
         "get_day_summary", "get_trends", "get_status_bar",
         "query_metrics", "query_food", "pantry", "style", "explain_target", "get_progress",
         "get_evening_report", "register_user", "set_milestone", "admin_cmd", "help",
-        "get_weekly_summary",
+        "get_weekly_summary", "council",
     }
 
     registered = set(TOOLS)

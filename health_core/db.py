@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 22
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -393,6 +393,22 @@ CREATE TABLE IF NOT EXISTS side_effects (
     notes TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_side_effects_user_time ON side_effects(user_id, at);
+
+-- v22: консилиум (docs/adr/0003-консилиум.md, CONTEXT.md «Консилиум») — один
+-- прогон разбора данных несколькими независимыми моделями. complete=1 только
+-- если ответил весь состав аналитиков; result_text — готовый текст, который
+-- уходит человеку отдельным сообщением, когда прогон закончен.
+CREATE TABLE IF NOT EXISTS council_runs (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    reason TEXT NOT NULL CHECK(reason IN ('manual', 'dose', 'plateau')),
+    status TEXT NOT NULL CHECK(status IN ('running', 'done', 'failed')),
+    complete INTEGER,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    result_text TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_council_runs_user_time ON council_runs(user_id, started_at);
 """
 
 
@@ -516,6 +532,23 @@ def _migrate_v19_to_v20(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_side_effects_user_time ON side_effects(user_id, at)")
 
 
+def _migrate_v21_to_v22(conn: sqlite3.Connection) -> None:
+    """v21->v22: council_runs (docs/adr/0003-консилиум.md) — новая таблица,
+    CREATE TABLE IF NOT EXISTS в DDL уже создаёт её идемпотентно (тот же приём,
+    что в _migrate_v19_to_v20 выше). Отдельный шаг — чтобы номер версии не
+    перепрыгивал молча мимо неё на базах, где параллельная миграция до v21
+    (карты препаратов) ещё не применена: этот шаг от неё не зависит и
+    самодостаточен на любой базе с version < 22."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS council_runs ("
+        "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), "
+        "reason TEXT NOT NULL CHECK(reason IN ('manual','dose','plateau')), "
+        "status TEXT NOT NULL CHECK(status IN ('running','done','failed')), "
+        "complete INTEGER, started_at TEXT NOT NULL, finished_at TEXT, result_text TEXT)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_council_runs_user_time ON council_runs(user_id, started_at)")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
     row = conn.execute("SELECT version FROM schema_version").fetchone()
@@ -552,6 +585,10 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v18_to_v19(conn)
         if row["version"] < 20:
             _migrate_v19_to_v20(conn)
+        # v20->v21 — миграция карт препаратов/черновиков (параллельная задача,
+        # не в этом файле на момент правки); этот шаг её не предполагает.
+        if row["version"] < 22:
+            _migrate_v21_to_v22(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 

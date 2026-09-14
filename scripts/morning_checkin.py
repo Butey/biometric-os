@@ -5,6 +5,8 @@
     python scripts/morning_checkin.py --user 3   # только этот пользователь (для notify.py --all)
 """
 import argparse
+import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -16,8 +18,11 @@ from health_core.report import status_bar
 from health_core.guards import check_all
 from health_core.chrono import caffeine_cutoff
 from health_core.meds import stock_runs_out
-from health_core import sick
+from health_core import sick, council_data
 from health_core.config import local_now
+from bot import council as bot_council
+from admin.auth import load_env_file
+import notify  # рядом лежащий скрипт (scripts/), тот же способ доставки, что и у него
 
 
 def main() -> int:
@@ -63,6 +68,23 @@ def main() -> int:
                     f"🤒 Режим болезни до {until_dd_mm}: цель без дефицита, "
                     "напоминания о еде выключены."
                 )
+            # Плато 3+ недели (CONTEXT.md «Консилиум», docs/adr/0003) — созываем
+            # консилиум, если по этой причине он не собирался последние 21 день
+            # (council.reserve сам держит частоту и лок). Итог — ОТДЕЛЬНОЕ
+            # сообщение, тем же способом (notify.send), каким доставляется и
+            # обычный вывод этого скрипта.
+            if council_data.plateau_3w(conn, u["id"]):
+                try:
+                    result = asyncio.run(bot_council.run(conn, u["id"], "plateau"))
+                    tg_row = conn.execute(
+                        "SELECT telegram_user_id FROM users WHERE id=?", (u["id"],)
+                    ).fetchone()
+                    load_env_file()
+                    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+                    if tg_row and tg_row["telegram_user_id"] and token:
+                        notify.send(token, str(tg_row["telegram_user_id"]), result["text"])
+                except ValueError:
+                    pass  # уже собирался за последние 21 день или уже идёт — не спамим
             blocks.append("\n".join(block_lines))
         except Exception as e:
             blocks.append(f"user_id={u['id']}: чек-ин не удался: {e}")

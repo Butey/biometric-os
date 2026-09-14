@@ -308,3 +308,19 @@ bot:
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
       model: gemma-4-31b-it
+
+# Консилиум (docs/adr/0003-консилиум.md) — health_core/council_data.py,
+# bot/council.py. analysts/judge/judge_fallback ссылаются по model на
+# bot.providers выше — второго списка ключей/base_url не заводим.
+council:
+  # DeepSeek и Kimi из пула NVIDIA — общий бесплатный лимит (~40 запросов/мин),
+  # поэтому вызываются по очереди (bot/council.py), не параллельно.
+  analysts: [moonshotai/kimi-k3, deepseek-ai/deepseek-v4-flash-0731]
+  # первый Google-провайдер — Gemini не делит квоту с NVIDIA-пулом аналитиков
+  judge: gemini-3.8-flash
+  judge_fallback: moonshotai/kimi-k3
+  # Kimi с глубоким рассуждением часто не укладывается в обычные 25с чата —
+  # отдельный таймаут порядка минут (bot/llm.py::chat(timeout_s=...))
+  timeout_s: 300
+  retry_delay_s: 60
+  max_retries: 1

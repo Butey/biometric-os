@@ -116,11 +116,19 @@ def _ordered_keys(env_name: str, keys: list[str]) -> list[str]:
     return healthy + cooling
 
 
-async def _post(session: aiohttp.ClientSession, url: str, headers: dict, payload: dict) -> tuple[int, dict]:
+DEFAULT_TIMEOUT_S = 25.0  # чат: 25с хватает с запасом. Не меняется, если вызывающий
+# не передал timeout_s — так поведение обычного чата не трогается.
+
+
+async def _post(session: aiohttp.ClientSession, url: str, headers: dict, payload: dict,
+                 timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[int, dict]:
     # Вынесено отдельной функцией специально ради самотеста: подменяем её,
     # чтобы проверить фолбэк и цикл инструментов без похода в сеть.
-    # 25 секунд хватает с запасом, sock_connect=5 быстро отсекает мёртвый маршрут.
-    timeout = aiohttp.ClientTimeout(total=25, sock_connect=5)
+    # timeout_s параметром: обычный чат передаёт 25с (или bot.request_timeout_s
+    # из config.yaml), консилиум (bot/council.py) — свои council.timeout_s
+    # (минуты): Kimi с глубоким рассуждением часто не укладывается в 25с.
+    # sock_connect=5 всегда короткий — быстро отсекает мёртвый маршрут.
+    timeout = aiohttp.ClientTimeout(total=timeout_s, sock_connect=5)
     async with session.post(url, headers=headers, json=payload, timeout=timeout) as resp:
         try:
             body = await resp.json(content_type=None)
@@ -155,13 +163,16 @@ def _parse_retry_delay(body: Any, default: float = 60.0) -> float:
 
 
 async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict],
-                providers: list[Provider]) -> dict:
+                providers: list[Provider], timeout_s: float = DEFAULT_TIMEOUT_S) -> dict:
     """Идёт по providers по порядку, ротирует API-ключи для каждого провайдера,
     возвращает choices[0].message первого, кто ответил 200.
 
     Фолбэк на следующий ключ: 429 (Resource Exhausted / Rate Limit), 401/403 (Invalid Key).
     Фолбэк на следующего провайдера: когда все ключи текущего провайдера исчерпаны,
     сетевая ошибка/таймаут, 5xx или битый ответ.
+
+    timeout_s — таймаут одного HTTP-запроса (см. _post); по умолчанию как в
+    обычном чате, консилиум (bot/council.py) передаёт свой, в разы больше.
     """
     failures: list[str] = []
 
@@ -234,7 +245,7 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
             }
 
             try:
-                status, body = await _post(session, url, headers, payload)
+                status, body = await _post(session, url, headers, payload, timeout_s=timeout_s)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 msg = f"{provider['model']} (key {_mask_key(key)}): сетевая ошибка/таймаут — {exc!r}"
                 log.warning(msg)
@@ -322,7 +333,7 @@ async def _run_one(call: dict, dispatch: Callable[[str, dict], str]) -> str:
 
 async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict],
                     providers: list[Provider], dispatch: Callable[[str, dict], str],
-                    max_iters: int = 6) -> tuple[str, list[dict]]:
+                    max_iters: int = 6, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[str, list[dict]]:
     """Цикл: chat → если есть tool_calls, исполнить все и повторить, иначе вернуть текст.
 
     dispatch синхронный и блокирующий (хендлеры дёргают sqlite и т.п.), поэтому вызываем
@@ -334,7 +345,7 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
     last_text = ""
 
     for _ in range(max_iters):
-        message = await chat(session, messages, tools, providers)
+        message = await chat(session, messages, tools, providers, timeout_s=timeout_s)
         messages.append(message)
 
         tool_calls = message.get("tool_calls") or []
@@ -397,7 +408,7 @@ if __name__ == "__main__":
             # --- 1. успешный ответ без tool_calls с первого провайдера ---
             queue = [_resp(200, _msg(content="привет"))]
 
-            async def _post_ok(session, url, headers, payload):
+            async def _post_ok(session, url, headers, payload, timeout_s=None):
                 r = queue.pop(0)
                 return r["status"], r["body"]
 
@@ -411,7 +422,7 @@ if __name__ == "__main__":
             queue = [_resp(429, error={"error": "rate limited"}), _resp(200, _msg(content="ответ от второго"))]
             calls_seen = []
 
-            async def _post_fallback(session, url, headers, payload):
+            async def _post_fallback(session, url, headers, payload, timeout_s=None):
                 calls_seen.append(url)
                 r = queue.pop(0)
                 return r["status"], r["body"]
@@ -430,7 +441,7 @@ if __name__ == "__main__":
             ]
             auth_seen = []
 
-            async def _post_multi_keys(session, url, headers, payload):
+            async def _post_multi_keys(session, url, headers, payload, timeout_s=None):
                 auth_seen.append(headers.get("Authorization"))
                 if len(auth_seen) == 1:
                     return 429, {"error": {"message": "Resource exhausted", "details": [{"retryDelay": "10s"}]}}
@@ -446,7 +457,7 @@ if __name__ == "__main__":
             # --- 3. все провайдеры упали -> RuntimeError с перечислением ---
             queue = [_resp(500, error={"error": "server1 down"}), _resp(503, error={"error": "server2 down"})]
 
-            async def _post_all_fail(session, url, headers, payload):
+            async def _post_all_fail(session, url, headers, payload, timeout_s=None):
                 r = queue.pop(0)
                 return r["status"], r["body"]
 
@@ -503,7 +514,7 @@ if __name__ == "__main__":
             # --- 6. зацикливание на tool_calls обрывается по max_iters ---
             tc_loop = {"id": "call_x", "type": "function", "function": {"name": "noop", "arguments": "{}"}}
 
-            async def _post_infinite_tool_calls(session, url, headers, payload):
+            async def _post_infinite_tool_calls(session, url, headers, payload, timeout_s=None):
                 return 200, {"choices": [{"message": _msg(content=None, tool_calls=[tc_loop])}]}
 
             with patch(__name__ + "._post", _post_infinite_tool_calls):

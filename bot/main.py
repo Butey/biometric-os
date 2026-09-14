@@ -46,7 +46,7 @@ except ImportError:
     pass          # чистая сеть (обычный VPS) — работает и без него
 
 from admin.auth import load_env_file          # тот же .env, что у панели — второй читалки не заводим
-from bot import history, knowledge, llm, registry
+from bot import council, history, knowledge, llm, registry
 from health_core import config
 from health_core.config import load as load_config
 from health_core.db import connect, migrate
@@ -351,6 +351,35 @@ async def _flush_pending_notifications(bot: Bot) -> None:
             await bot.send_message(int(target), text)
         except Exception:
             log.exception("не удалось уведомить пользователя %s", target)
+
+
+async def _run_council_task(bot: Bot, telegram_uid: str, user_id: int, run_id: int, reason: str) -> None:
+    """Сама работа консилиума (минуты) — отдельной asyncio-задачей, не держит
+    ход разговора. Своё соединение с БД: то, что открыл тул-хендлер, уже
+    закрыто registry.release_connections к моменту, когда эта задача стартует."""
+    conn = connect()
+    try:
+        migrate(conn)
+        result = await council.execute(conn, user_id, run_id, reason)
+    except Exception:
+        log.exception("консилиум упал целиком, run_id=%s", run_id)
+        return
+    finally:
+        conn.close()
+    try:
+        await bot.send_message(int(telegram_uid), result["text"])
+    except Exception:
+        log.exception("не удалось отправить итог консилиума пользователю %s", telegram_uid)
+
+
+async def _flush_pending_council(bot: Bot) -> None:
+    """Заявки, которые council.reserve() уже зарезервировал синхронно (тул
+    в plugin/tools.py) — запускаем фоновой asyncio-задачей в цикле бота, а не
+    ждём здесь: ответ модели («консилиум запущен») уже ушёл или вот-вот уйдёт,
+    и обработку следующих сообщений это держать не должно."""
+    while council._PENDING_RUNS:
+        telegram_uid, user_id, run_id, reason = council._PENDING_RUNS.pop(0)
+        asyncio.create_task(_run_council_task(bot, telegram_uid, user_id, run_id, reason))
 
 
 def _require_admin(uid: str, cmd: str) -> str | None:
@@ -696,6 +725,7 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
         answer, full = await llm.run_loop(
             session, prefix, tool_specs(), bot_cfg["providers"],
             dispatch, max_iters=bot_cfg.get("max_tool_iters", 6),
+            timeout_s=bot_cfg.get("request_timeout_s", llm.DEFAULT_TIMEOUT_S),
         )
     except RuntimeError as e:
         log.error("все провайдеры недоступны: %s", e)
@@ -786,6 +816,7 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
         answer, full = await llm.run_loop(
             session, prefix, tool_specs(), bot_cfg["providers"],
             dispatch, max_iters=bot_cfg.get("max_tool_iters", 6),
+            timeout_s=bot_cfg.get("request_timeout_s", llm.DEFAULT_TIMEOUT_S),
         )
     except RuntimeError as e:
         log.error("все провайдеры недоступны: %s", e)
@@ -793,6 +824,10 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
         return
 
     await asyncio.to_thread(_close_turn, uid, full[len(prefix):])
+    # Инструмент council мог зарезервировать фоновый прогон (plugin/tools.py::
+    # handle_council) — запускаем его задачей цикла бота ПОСЛЕ ответа модели,
+    # не блокируя обработку следующих сообщений.
+    await _flush_pending_council(message.bot)
     await send_long(message, answer)
 
 
