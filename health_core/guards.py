@@ -335,6 +335,10 @@ def check_whr(conn: sqlite3.Connection, user_id: int):
 # ---------------------------------------------------------------- RATE_HIGH
 
 def check_rate_high(conn: sqlite3.Connection, user_id: int):
+    """Темп снижения веса — медианы по 3 первым и 3 последним взвешиваниям
+    окна, а не голые эндпоинты: один шумный день на весах не должен решать
+    сам по себе, сработал ли гардрейл. Покрытие меньше 10 дней между первым и
+    последним замером окна — темп неизвестен, гардрейл молчит."""
     cfg = _cfg()
     window_days = cfg["weight_rate_window_days"]
     min_points = cfg["weight_rate_min_points"]
@@ -345,20 +349,26 @@ def check_rate_high(conn: sqlite3.Connection, user_id: int):
     ).fetchall()
     if len(rows) < min_points:
         return None
-    first, last = rows[0], rows[-1]
-    weight_delta = last["weight_kg"] - first["weight_kg"]
+    days_covered = (_parse(rows[-1]["measured_at"]) - _parse(rows[0]["measured_at"])).days
+    if days_covered < 10:
+        return None  # темп неизвестен на коротком покрытии
+
+    k = min(3, len(rows))
+    first_med = statistics.median(r["weight_kg"] for r in rows[:k])
+    last_med = statistics.median(r["weight_kg"] for r in rows[-k:])
+    weight_delta = last_med - first_med
     if weight_delta >= 0:
         return None  # only fire on loss, not gain
-    days_elapsed = (_parse(last["measured_at"]) - _parse(first["measured_at"])).days
-    if days_elapsed == 0:
-        return None
-    pct_per_week = (abs(weight_delta) / first["weight_kg"]) * 100 * 7 / days_elapsed
-    threshold = cfg["weight_rate_pct_week_max"]
-    if pct_per_week > threshold:
+
+    kg_per_week = abs(weight_delta) * 7 / days_covered
+    pct_per_week = (abs(weight_delta) / first_med) * 100 * 7 / days_covered
+    threshold = min(cfg["weight_rate_kg_week_max"], first_med * cfg["weight_rate_pct_week_max"] / 100)
+    if kg_per_week > threshold:
         return _alert(
             "RATE_HIGH", "warning",
-            f"Потеря {pct_per_week:.2f}%/неделю выше порога {threshold:.2f}% (риск потери сухой массы).",
-            round(pct_per_week, 2), threshold,
+            f"Потеря {kg_per_week:.2f} кг/неделю ({pct_per_week:.2f}%/неделю) выше порога "
+            f"{threshold:.2f} кг/неделю — риск образования камней в желчном пузыре.",
+            round(kg_per_week, 2), round(threshold, 2),
         )
     return None
 
@@ -752,9 +762,11 @@ GUARD_DEFINITIONS = {
         "category": "Питание и калории",
         "default_severity": "critical",
         "description": "Проверяет, чтобы суточная цель калоража не опускалась ниже безопасного физиологического пола.",
-        "rationale": "Пол рассчитывается по модели Alpert: жировая ткань способна отдавать максимум ~31 ккал на кг жира в сутки. Дефицит глубже этой границы организм вынужден покрывать распадом белков внутренних органов и миокарда, резко угнетая выработку трийодтиронина (T3).",
+        "rationale": "Пол рассчитывается по модели Alpert: жировая ткань способна отдавать до fat_supply_kcal_per_kg ккал на кг жировой массы в сутки, но в дефицит разрешена лишь доля этого предела, убывающая по шкале процента жира (своей для пола) и растущая только при доказанной малой доле мышц в потере. Дефицит глубже этой границы организм вынужден покрывать распадом белков внутренних органов и миокарда, резко угнетая выработку трийодтиронина (T3).",
         "action": "Цель калорийности автоматически поднимается до уровня безопасного пола.",
-        "keys": ["fat_supply_kcal_per_kg", "fat_supply_safety"],
+        "keys": ["fat_supply_kcal_per_kg", "fat_share_lean", "fat_share_fat", "fat_share_fat_proven",
+                 "fat_share_bounds_m", "fat_share_bounds_f", "fat_mass_window_days",
+                 "lean_share_window_days", "lean_share_min_points", "lean_share_min_loss_kg"],
     },
     "UNDEREATING": {
         "code": "UNDEREATING",
@@ -771,10 +783,10 @@ GUARD_DEFINITIONS = {
         "name": "Превышение скорости снижения веса",
         "category": "Скорость снижения веса",
         "default_severity": "warning",
-        "description": "Контролирует темп потери массы тела более 1.0% в неделю за последние 14 дней.",
-        "rationale": "Клинические рекомендации ВОЗ: безопасный темп — до 0.5–1.0% веса в неделю. Более быстрый сброс многократно увеличивает риск холелитиаза (камней в желчном пузыре) и потери скелетных мышц.",
-        "action": "Поднять суточный калораж на 200–300 ккал для плавного, здорового снижения веса.",
-        "keys": ["weight_rate_pct_week_max", "weight_rate_window_days", "weight_rate_min_points"],
+        "description": "Контролирует темп потери массы тела выше min(weight_rate_kg_week_max кг, weight_rate_pct_week_max % веса) в неделю — по медианам первых и последних 3 взвешиваний в окне, при покрытии не короче 10 дней.",
+        "rationale": "Слишком быстрый сброс массы многократно увеличивает риск холелитиаза (камней в желчном пузыре).",
+        "action": "Сообщить человеку темп и обсудить, чем он вызван — гардрейл не предписывает конкретную правку калоража.",
+        "keys": ["weight_rate_pct_week_max", "weight_rate_kg_week_max", "weight_rate_window_days", "weight_rate_min_points"],
     },
     "PLATEAU": {
         "code": "PLATEAU",
@@ -928,8 +940,8 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
                 item["current_val"] = f"{val:.2f}" if isinstance(val, (int, float)) else str(val)
                 item["threshold_val"] = f"≤ {thr:.2f}" if isinstance(thr, (int, float)) else str(thr)
             elif code == "RATE_HIGH":
-                item["current_val"] = f"{val:.2f}% в неделю" if isinstance(val, (int, float)) else str(val)
-                item["threshold_val"] = f"≤ {thr:.2f}% в неделю" if isinstance(thr, (int, float)) else str(thr)
+                item["current_val"] = f"{val:.2f} кг/неделю" if isinstance(val, (int, float)) else str(val)
+                item["threshold_val"] = f"≤ {thr:.2f} кг/неделю" if isinstance(thr, (int, float)) else str(thr)
             elif code == "UNDEREATING":
                 item["current_val"] = f"Ниже {thr * 100:.0f}% цели {val} дн. подряд" if isinstance(thr, (int, float)) else f"{val} дн."
                 item["threshold_val"] = f"< {val} дн. подряд"
@@ -1004,8 +1016,7 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
             item["current_val"] = "Норма"
 
         elif code == "RATE_HIGH":
-            thresh = cfg["weight_rate_pct_week_max"]
-            item["threshold_val"] = f"≤ {thresh:.1f}% в нед"
+            item["threshold_val"] = f"≤ min({cfg['weight_rate_kg_week_max']:.1f} кг, {cfg['weight_rate_pct_week_max']:.1f}%) в нед"
             item["current_val"] = "Безопасный темп"
 
         elif code == "PLATEAU":
@@ -1277,39 +1288,66 @@ if __name__ == "__main__":
             whr_fired11 = [a for a in alerts11 if a["code"] == "WHR_HIGH"]
             assert not whr_fired11, f"WHR_HIGH должен молчать при отсутствии таза, получили {alerts11}"
 
-            # RATE_HIGH tests
-            u12 = make_user(112, height_cm=185, created_days_ago=30)
-            # Loss of 1.9 kg from 123.7 over 14 days -> 0.77 %/week, should not fire (< 1.0)
-            add_metric(u12, 13, 123.7, 78.0)
-            add_metric(u12, 10, 123.2, 78.0)
-            add_metric(u12, 5, 122.5, 78.0)
-            add_metric(u12, 0, 121.8, 78.0)
+            # RATE_HIGH tests (медианы 3 первых/последних, покрытие >= 10 дней)
+            u_rate_short = make_user(160, height_cm=185, created_days_ago=30)
+            # 4 кг за 5 дней -> темп огромный, но покрытие 5 дней < 10 -> темп неизвестен, молчит
+            add_metric(u_rate_short, 5, 125.0, 78.0)
+            add_metric(u_rate_short, 3, 123.5, 78.0)
+            add_metric(u_rate_short, 2, 122.7, 78.0)
+            add_metric(u_rate_short, 0, 121.0, 78.0)
             conn.commit()
-            alerts12 = check_all(conn, u12)
-            rate_fired12 = [a for a in alerts12 if a["code"] == "RATE_HIGH"]
-            assert not rate_fired12, f"RATE_HIGH не должен сработать при 0.77%/неделю, получили {alerts12}"
+            alerts_rate_short = check_all(conn, u_rate_short)
+            rate_fired_short = [a for a in alerts_rate_short if a["code"] == "RATE_HIGH"]
+            assert not rate_fired_short, f"RATE_HIGH должен молчать при покрытии < 10 дней, получили {alerts_rate_short}"
 
-            u13 = make_user(113, height_cm=185, created_days_ago=30)
-            # Loss of 5.0 kg from 123.7 over 13 days -> 2.13 %/week, should fire (> 1.0)
-            add_metric(u13, 13, 123.7, 78.0)
-            add_metric(u13, 10, 122.5, 78.0)
-            add_metric(u13, 7, 120.0, 78.0)
-            add_metric(u13, 0, 118.7, 78.0)
+            u_rate_outlier = make_user(161, height_cm=185, created_days_ago=30)
+            # Мягкий реальный темп (~1 кг/нед), но один шумный выброс в последней точке
+            # (116.0 вместо ~119) — median(последних 3) гасит его, наивная разница
+            # эндпоинтов дала бы 5 кг/13 дн = 2.7 кг/нед и ложно сработала бы
+            add_metric(u_rate_outlier, 13, 121.0, 78.0)
+            add_metric(u_rate_outlier, 10, 120.6, 78.0)
+            add_metric(u_rate_outlier, 8, 120.3, 78.0)
+            add_metric(u_rate_outlier, 5, 119.0, 78.0)
+            add_metric(u_rate_outlier, 2, 118.8, 78.0)
+            add_metric(u_rate_outlier, 0, 116.0, 78.0)
             conn.commit()
-            alerts13 = check_all(conn, u13)
-            rate_fired13 = [a for a in alerts13 if a["code"] == "RATE_HIGH"]
-            assert rate_fired13, f"RATE_HIGH должен сработать при >1%/неделю, получили {alerts13}"
+            alerts_rate_outlier = check_all(conn, u_rate_outlier)
+            rate_fired_outlier = [a for a in alerts_rate_outlier if a["code"] == "RATE_HIGH"]
+            assert not rate_fired_outlier, (
+                f"одиночный выброс в конце окна не должен срабатывать благодаря медианам, получили {alerts_rate_outlier}"
+            )
 
-            u14 = make_user(114, height_cm=185, created_days_ago=30)
-            # Weight GAIN of 5.0 kg -> should not fire (only loss)
-            add_metric(u14, 14, 118.7, 78.0)
-            add_metric(u14, 0, 123.7, 78.0)
+            u_rate_real = make_user(162, height_cm=185, created_days_ago=30)
+            # Реальный темп far above threshold: медиана первых 3 (127.0) к медиане
+            # последних 3 (119.5) за 13 дней -> ~4 кг/нед, > min(1.5 кг, 1.5%)
+            add_metric(u_rate_real, 13, 130.0, 78.0)
+            add_metric(u_rate_real, 10, 127.0, 78.0)
+            add_metric(u_rate_real, 8, 125.0, 78.0)
+            add_metric(u_rate_real, 5, 122.0, 78.0)
+            add_metric(u_rate_real, 2, 119.5, 78.0)
+            add_metric(u_rate_real, 0, 117.0, 78.0)
             conn.commit()
-            alerts14 = check_all(conn, u14)
-            rate_fired14 = [a for a in alerts14 if a["code"] == "RATE_HIGH"]
-            assert not rate_fired14, f"RATE_HIGH должен молчать на прибавке, получили {alerts14}"
+            alerts_rate_real = check_all(conn, u_rate_real)
+            rate_fired_real = [a for a in alerts_rate_real if a["code"] == "RATE_HIGH"]
+            assert rate_fired_real, f"RATE_HIGH должен сработать при реальном темпе >1.5%/нед, получили {alerts_rate_real}"
+            msg_rate_real = rate_fired_real[0]["message"]
+            assert "сухой массы" not in msg_rate_real and "мышц" not in msg_rate_real, (
+                f"RATE_HIGH больше не отвечает за сухую массу — сообщение не должно её упоминать: {msg_rate_real}"
+            )
 
-            print("OK: WHR_HIGH срабатывает, RATE_HIGH срабатывает на потерю выше порога, молчит на меньших потерях и приростах")
+            u_rate_gain = make_user(163, height_cm=185, created_days_ago=30)
+            # Прирост веса за 14 дней с достаточным покрытием -> молчит (только потеря)
+            add_metric(u_rate_gain, 14, 118.7, 78.0)
+            add_metric(u_rate_gain, 10, 120.0, 78.0)
+            add_metric(u_rate_gain, 5, 122.0, 78.0)
+            add_metric(u_rate_gain, 0, 123.7, 78.0)
+            conn.commit()
+            alerts_rate_gain = check_all(conn, u_rate_gain)
+            rate_fired_gain = [a for a in alerts_rate_gain if a["code"] == "RATE_HIGH"]
+            assert not rate_fired_gain, f"RATE_HIGH должен молчать на приросте, получили {alerts_rate_gain}"
+
+            print("OK: WHR_HIGH срабатывает; RATE_HIGH молчит на коротком покрытии и на одиночном "
+                  "выбросе, срабатывает на реальном темпе без упоминания сухой массы, молчит на приросте")
 
             # LIPID_GUARD: route='oral' срабатывает на низком жире, route='injection'
             # и route IS NULL (легаси-строка до миграции v3) молчат при тех же условиях.
