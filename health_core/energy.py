@@ -131,7 +131,7 @@ def lean_share(conn: sqlite3.Connection, user_id: int) -> float | None:
     if -d_weight < min_loss:
         return None  # потери меньше min_loss (в т.ч. набор) — доказательства нет
     d_lean = statistics.median(r["ffm_kg"] for r in last) - statistics.median(r["ffm_kg"] for r in first)
-    return abs(d_lean) / abs(d_weight)
+    return max(0.0, -d_lean) / -d_weight  # набор тощей массы на фоне потери — не потеря мышц
 
 
 def fat_share(conn: sqlite3.Connection, user_id: int, fat_pct: float) -> float:
@@ -236,20 +236,17 @@ def kcal_floor(conn: sqlite3.Connection, user_id: int, full_tdee: float) -> tupl
     """
     policy = load()["policy"]
     bmr = bmr_floor(conn, user_id)
-    fat_row = conn.execute(
-        "SELECT fat_pct FROM body_metrics WHERE user_id=? AND fat_pct IS NOT NULL "
-        "AND fat_pct > 0 ORDER BY measured_at DESC LIMIT 1",
-        (user_id,),
-    ).fetchone()
     fat_kg = fat_mass_kg(conn, user_id)
-    if fat_kg is None or fat_row is None:
+    weight = _smoothed_weight_kg(conn, user_id)
+    if fat_kg is None or not weight:
         return bmr, "bmr"
 
     per_kg = policy.get("fat_supply_kcal_per_kg")
     if not per_kg:
         return bmr, "bmr"        # модель выключена настройкой — прежнее поведение
 
-    share = fat_share(conn, user_id, fat_row["fat_pct"])
+    # процент жира из тех же сглаженных величин, что и жировая масса: шум одного замера не двигает долю
+    share = fat_share(conn, user_id, fat_kg / weight * 100)
     fat_supply_deficit = fat_kg * per_kg * share
     cap = _deficit_cap_kcal(conn, user_id)
     if cap is not None and cap < fat_supply_deficit:
@@ -803,6 +800,16 @@ if __name__ == "__main__":
         assert abs((tdee - floor2) - 1095.69) < 1, tdee - floor2
         print(f"OK: доказанная доля мышц {proven2:.3f}<0.15 -> доля {share2}, "
               f"дефицит {tdee - floor2:.0f} (ожидание ~1096)")
+
+        # 2b) тощая масса растёт на фоне потери веса — доля мышц в потере 0, а не |Δ|
+        _reset_metrics()
+        for days_ago, w, f in (
+            (27, 121.7, 78.2), (24, 121.0, 78.3), (21, 120.4, 78.4), (18, 119.9, 78.5),
+            (14, 119.5, 78.7), (10, 119.1, 78.9), (5, 118.9, 79.1), (0, 118.7, 79.2),
+        ):
+            _add_metric(days_ago, w, ffm_kg=f)
+        conn.commit()
+        assert lean_share(conn, uid) == 0.0, lean_share(conn, uid)
 
         # 3) худой 85 кг / 12% -> нижняя граница шкалы, доля = fat_share_lean (0.7)
         _reset_metrics()
