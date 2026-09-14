@@ -789,6 +789,15 @@ register_user_schema = {
                 "dinner": {"type": "object", "properties": {"start": {"type": "string"}, "end": {"type": "string"}}}
             },
             "description": "Личные окна приёмов пищи (HH:MM), переопределяют умолчание из config.yaml. Задавайте только по прямой просьбе человека («у меня завтрак с 6 до 9») — можно частично, один приём, остальные останутся умолчанием"
+        },
+        "hr_max_bpm": {
+            "type": "integer",
+            "description": "Личный максимальный пульс, уд/мин (100–230) — из нагрузочного теста или с часов, заменяет формулу по возрасту. Требует hr_max_source в этом же вызове"
+        },
+        "hr_max_source": {
+            "type": "string",
+            "enum": ["test", "watch"],
+            "description": "Источник hr_max_bpm: 'test' — нагрузочный тест, 'watch' — часы/пульсометр"
         }
     },
     "required": ["height_cm", "birth_date", "sex"]

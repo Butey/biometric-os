@@ -3956,6 +3956,12 @@ def handle_explain_target(params: dict) -> str:
         explanation["kcal_target"] = None
         explanation["computed_from"] = "not calculated"
 
+    # Честный вердикт срока (CONTEXT.md «Недостижимый срок») — computed_from
+    # несёт только тег "deadline_unreachable" (план ниже пола), не сам вердикт
+    # о недостижимости, который требует ещё и прогноза по факту.
+    from health_core.energy import deadline_verdict
+    explanation["deadline_verdict"] = deadline_verdict(conn, user_id, date_str)
+
     conn.close()
 
     return json.dumps(
@@ -4010,6 +4016,14 @@ def handle_get_progress(params: dict) -> str:
         ).fetchone()
         current = row["v"] if row else None
 
+    # deadline_verdict честен только про АКТИВНУЮ веху (ближайший срок среди
+    # недостигнутых, см. energy._active_milestone) — если спросили про другую,
+    # вердикт ей не принадлежит, отдавать чужой было бы враньём.
+    from health_core.energy import deadline_verdict
+    verdict = deadline_verdict(conn, user_id)
+    if verdict is not None and verdict["milestone"] != m["name"]:
+        verdict = None
+
     conn.close()
     return json.dumps(
         {
@@ -4020,6 +4034,7 @@ def handle_get_progress(params: dict) -> str:
             "remaining": round(current - m["threshold"], 2) if current is not None else None,
             "deadline": m["deadline"],
             "achieved_at": m["achieved_at"],
+            "deadline_verdict": verdict,
         },
         ensure_ascii=False,
     )
@@ -4174,6 +4189,31 @@ def handle_register_user(params: dict) -> str:
         json.dumps(meal_windows_param, ensure_ascii=False) if meal_windows_param is not None else None
     )
 
+    # Личный максимальный пульс (CONTEXT.md «Максимальный пульс»): из
+    # нагрузочного теста или с часов, заменяет формулу Tanaka в hr_zones целиком.
+    # Источник обязателен ИМЕННО в этом вызове — не подтягивается из старой
+    # записи, чтобы значение без источника никогда не легло в базу.
+    hr_max_bpm = params.get("hr_max_bpm")
+    hr_max_source = params.get("hr_max_source")
+    if hr_max_bpm is not None:
+        try:
+            hr_max_bpm = int(hr_max_bpm)
+        except (TypeError, ValueError):
+            conn.close()
+            return json.dumps({"error": f"hr_max_bpm должен быть целым числом, получено {hr_max_bpm!r}"},
+                              ensure_ascii=False)
+        if not (100 <= hr_max_bpm <= 230):
+            conn.close()
+            return json.dumps({"error": f"hr_max_bpm вне диапазона 100–230 уд/мин: {hr_max_bpm}"},
+                              ensure_ascii=False)
+        if hr_max_source not in ("test", "watch"):
+            conn.close()
+            return json.dumps({"error": "hr_max_source обязателен вместе с hr_max_bpm: 'test' или 'watch'"},
+                              ensure_ascii=False)
+    elif hr_max_source is not None and hr_max_source not in ("test", "watch"):
+        conn.close()
+        return json.dumps({"error": "hr_max_source: 'test' или 'watch'"}, ensure_ascii=False)
+
     # Профиль без роста, даты рождения и пола бесполезен: BMR по Mifflin считается
     # именно по ним, а без BMR нет ни пола цели, ни гардрейла BMR_FLOOR. Запись,
     # которая проходит и оставляет NULL, — это ложный успех: инструмент отвечает
@@ -4203,19 +4243,20 @@ def handle_register_user(params: dict) -> str:
         "UPDATE users SET height_cm=COALESCE(?,height_cm), birth_date=COALESCE(?,birth_date), "
         "sex=COALESCE(?,sex), timezone=COALESCE(?,timezone), "
         "base_weight_kg=COALESCE(?,base_weight_kg), base_weight_date=COALESCE(?,base_weight_date), "
-        "health_notes=COALESCE(?,health_notes), meal_windows=COALESCE(?,meal_windows) "
+        "health_notes=COALESCE(?,health_notes), meal_windows=COALESCE(?,meal_windows), "
+        "hr_max_bpm=COALESCE(?,hr_max_bpm), hr_max_source=COALESCE(?,hr_max_source) "
         "WHERE telegram_user_id=?",
         (height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes,
-         meal_windows_json, telegram_user_id),
+         meal_windows_json, hr_max_bpm, hr_max_source, telegram_user_id),
     )
     created = cur.rowcount == 0
 
     if created:
         cur = conn.execute(
-            "INSERT INTO users(telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes, meal_windows, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO users(telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes, meal_windows, hr_max_bpm, hr_max_source, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes,
-             meal_windows_json, _now_iso()),
+             meal_windows_json, hr_max_bpm, hr_max_source, _now_iso()),
         )
         err = _zero_write_error(cur, "register_user: INSERT had no effect")
         if err:
@@ -7105,6 +7146,52 @@ if __name__ == "__main__":
             assert _mw(conn, user_a_id)["breakfast"] == {"start": "06:00", "end": "09:00"}, \
                 "отклонённый запрос не должен менять сохранённые окна"
             print("OK: некорректные meal_windows отклоняются, сохранённые окна не трогаются")
+
+            # Личный максимальный пульс через register_user (CONTEXT.md
+            # «Максимальный пульс»): hr_max_bpm требует hr_max_source в том же вызове.
+            missing_source = json.loads(ctx.tools["register_user"]["handler"]({
+                "height_cm": 185, "birth_date": "1992-08-09", "sex": "m",
+                "hr_max_bpm": 185,
+            }))
+            assert "error" in missing_source, f"hr_max_bpm без источника должен отклоняться: {missing_source}"
+
+            out_of_range = json.loads(ctx.tools["register_user"]["handler"]({
+                "height_cm": 185, "birth_date": "1992-08-09", "sex": "m",
+                "hr_max_bpm": 300, "hr_max_source": "test",
+            }))
+            assert "error" in out_of_range, f"hr_max_bpm=300 должен отклоняться: {out_of_range}"
+
+            result_json = ctx.tools["register_user"]["handler"]({
+                "height_cm": 185, "birth_date": "1992-08-09", "sex": "m",
+                "hr_max_bpm": 185, "hr_max_source": "test",
+            })
+            result = json.loads(result_json)
+            assert "error" not in result, f"register_user с hr_max_bpm сломан: {result}"
+            a_hr = conn.execute(
+                "SELECT hr_max_bpm, hr_max_source FROM users WHERE id=?", (user_a_id,)
+            ).fetchone()
+            assert a_hr["hr_max_bpm"] == 185 and a_hr["hr_max_source"] == "test", dict(a_hr)
+            print("OK: hr_max_bpm=185/source=test сохраняется через register_user, без источника и вне 100-230 отклоняется")
+
+            # Зоны в log_workout и get_trends теперь считаются от личного максимума 185, не от формулы.
+            from health_core import hr_zones as _hz
+            z_personal = _hz.zones(conn, user_a_id, "2026-09-13")
+            assert z_personal["hr_max"] == 185 and z_personal["hr_max_source"] == "test", z_personal
+
+            workout_json = ctx.tools["log_workout"]["handler"]({
+                "action": "add", "sport": "бег-личный-максимум", "duration_min": 30,
+                "kcal": 300, "avg_hr": 130, "user_id": user_a_id,
+            })
+            workout_result = json.loads(workout_json)
+            assert workout_result["hr_zones"]["hr_max"] == 185, \
+                f"log_workout должен считать зоны от личного максимума 185, получили {workout_result.get('hr_zones')}"
+            assert workout_result["hr_zones"]["hr_max_source"] == "test", workout_result["hr_zones"]
+
+            trends_json = ctx.tools["get_trends"]["handler"]({"user_id": user_a_id})
+            trends_result = json.loads(trends_json)
+            assert trends_result["hr_zones"]["hr_max"] == 185, \
+                f"get_trends должен считать зоны от личного максимума 185, получили {trends_result.get('hr_zones')}"
+            print("OK: log_workout и get_trends считают пульсовые зоны от личного максимума 185 (source=test)")
 
         finally:
             tools_module._CALLER_FALLBACK.set(None)
