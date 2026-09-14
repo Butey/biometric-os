@@ -938,6 +938,104 @@ def handle_log_glucose(params: dict) -> str:
 
 
 @_handler_wrapper
+def handle_log_side_effect(params: dict) -> str:
+    """Журнал побочных эффектов (CONTEXT.md «Побочный эффект»): дата, симптом,
+    тяжесть. Без привязки к препарату — связь по времени приёма устанавливает
+    модель, не код. action=add|list|delete."""
+    conn = connect()
+    migrate(conn)
+    user_id = _get_user_id(params, conn)
+
+    action = (params.get("action") or "add").lower()
+
+    # ── Просмотр записей ──
+    if action == "list":
+        try:
+            limit = min(int(params.get("limit") or 20), 100)
+        except (TypeError, ValueError):
+            limit = 20
+        q = "SELECT id, symptom, severity, at, notes FROM side_effects WHERE user_id=?"
+        args: list = [user_id]
+        since_days = params.get("since_days")
+        if since_days is not None:
+            try:
+                since = (config.local_now() - timedelta(days=int(since_days))).strftime("%Y-%m-%d %H:%M:%S")
+                q += " AND at>=?"
+                args.append(since)
+            except (TypeError, ValueError):
+                pass
+        q += " ORDER BY at DESC LIMIT ?"
+        args.append(limit)
+        rows = conn.execute(q, args).fetchall()
+        entries = [
+            {"side_effect_id": r["id"], "symptom": r["symptom"], "severity": r["severity"],
+             "at": r["at"], "notes": r["notes"]}
+            for r in rows
+        ]
+        conn.close()
+        return json.dumps({"entries": entries, "count": len(entries)}, ensure_ascii=False)
+
+    # ── Удаление ошибочной записи ──
+    if action == "delete":
+        side_effect_id = params.get("side_effect_id")
+
+        if side_effect_id is None:
+            row = conn.execute(
+                "SELECT id, symptom, severity, at, notes FROM side_effects WHERE user_id=? "
+                "ORDER BY at DESC, id DESC LIMIT 1",
+                (user_id,)
+            ).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": "Записей побочных эффектов нет"}, ensure_ascii=False)
+            record_id = row["id"]
+        else:
+            try:
+                record_id = int(side_effect_id)
+            except (TypeError, ValueError):
+                conn.close()
+                return json.dumps({"error": "Нужен side_effect_id — номер записи"}, ensure_ascii=False)
+            row = conn.execute(
+                "SELECT symptom, severity, at, notes FROM side_effects WHERE id=? AND user_id=?",
+                (record_id, user_id)).fetchone()
+            if row is None:
+                conn.close()
+                return json.dumps({"error": f"Записи #{record_id} нет"}, ensure_ascii=False)
+
+        conn.execute("DELETE FROM side_effects WHERE id=? AND user_id=?", (record_id, user_id))
+        conn.commit()
+        conn.close()
+        return json.dumps({
+            "deleted": {"side_effect_id": record_id, "symptom": row["symptom"], "severity": row["severity"],
+                       "at": row["at"], "notes": row["notes"]},
+            "id": record_id,
+        }, ensure_ascii=False)
+
+    symptom = (params.get("symptom") or "").strip()
+    if not symptom:
+        conn.close()
+        return json.dumps({"error": "Нужен symptom — название симптома"}, ensure_ascii=False)
+    severity = params.get("severity")
+    if severity is not None and severity not in ("mild", "moderate", "severe"):
+        conn.close()
+        return json.dumps({"error": "severity должен быть mild, moderate или severe"}, ensure_ascii=False)
+    at = _norm_event_ts(params.get("at")) or _now_iso()
+
+    cur = conn.execute(
+        "INSERT INTO side_effects(user_id, at, symptom, severity, notes) VALUES (?, ?, ?, ?, ?)",
+        (user_id, at, symptom, severity, params.get("notes")),
+    )
+    side_effect_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    return json.dumps(
+        {"side_effect_id": side_effect_id, "symptom": symptom, "severity": severity, "at": at},
+        ensure_ascii=False,
+    )
+
+
+@_handler_wrapper
 def handle_log_labs(params: dict) -> str:
     """Log lab results with automatic validation and derived calculations."""
     conn = connect()
@@ -2958,7 +3056,7 @@ def _glp1_line(glp: dict) -> str:
     return " · ".join(parts) + f" — оценка по T½ {glp.get('half_life_days', 5)} дн"
 
 
-def _render_pharma(rows, last, glp_by_substance=None) -> str:
+def _render_pharma(rows, last, glp_by_substance=None, stock_warn=None) -> str:
     glp_by_substance = glp_by_substance or {}
     lines = ["💊 Фарма"]
     if not rows:
@@ -2977,6 +3075,9 @@ def _render_pharma(rows, last, glp_by_substance=None) -> str:
         if r["stock_doses"] is not None:
             warn = " ⚠ мало" if r["stock_doses"] <= 2 else ""
             lines.append(f"  Остаток: {r['stock_doses']:g} доз{warn}")
+            runs_out_at = (stock_warn or {}).get(r["substance"])
+            if runs_out_at:
+                lines.append(f"  Запаса хватит до {runs_out_at[8:10]}.{runs_out_at[5:7]}")
     if last is not None:
         # med_log.dose — TEXT (модель пишет '10' или '10mg'), не число: без :g.
         d = f"{last['dose']}{last['unit'] or ''}" if last["dose"] is not None else ""
@@ -3021,8 +3122,10 @@ def handle_pharma(params: dict) -> str:
                         glp_by_substance[_canon_med(r["substance"])] = p
         except Exception:
             glp_by_substance = {}
+        from health_core.meds import stock_runs_out
+        stock_warn = {w["substance"]: w["runs_out_at"] for w in stock_runs_out(conn, user_id)}
         conn.close()
-        return json.dumps({"pharma": _render_pharma(rows, last, glp_by_substance)}, ensure_ascii=False)
+        return json.dumps({"pharma": _render_pharma(rows, last, glp_by_substance, stock_warn=stock_warn)}, ensure_ascii=False)
 
     substance = _canon_med(params.get("substance"))
     if not substance:
@@ -4678,6 +4781,7 @@ _WIPE_TABLES = (
     "food_log", "water_log", "glucose_log", "body_metrics", "anthropometry",
     "activity", "med_log", "alerts", "daily_targets", "import_log",
     "llm_calls", "refeed_days", "sick_days", "lab_results", "plan_log",
+    "side_effects",
 )
 _WIPE_CONFIRM = "УДАЛИТЬ"
 
@@ -4775,6 +4879,7 @@ def register(ctx):
         ("log_food", handle_log_food, schemas.log_food_schema),
         ("log_water", handle_log_water, schemas.log_water_schema),
         ("log_glucose", handle_log_glucose, schemas.log_glucose_schema),
+        ("log_side_effect", handle_log_side_effect, schemas.log_side_effect_schema),
         ("log_labs", handle_log_labs, schemas.log_labs_schema),
         ("log_sleep", handle_log_sleep, schemas.log_sleep_schema),
         ("log_weight", handle_log_weight, schemas.log_weight_schema),
@@ -4897,7 +5002,7 @@ if __name__ == "__main__":
         register(ctx)
 
         expected_tools = {
-            "log_food", "log_water", "log_glucose", "log_labs", "log_sleep", "log_weight",
+            "log_food", "log_water", "log_glucose", "log_side_effect", "log_labs", "log_sleep", "log_weight",
             "equipment", "plan_day", "log_workout", "refeed", "sick", "forecast",
             "log_anthropometry", "log_med", "pharma", "plans", "import_scale_export",
             "get_day_summary", "get_trends", "get_status_bar",
@@ -6167,6 +6272,7 @@ if __name__ == "__main__":
             "forecast": {"intake_kcal": 1500},
             "log_water": {"ml": 250},
             "log_glucose": {"mmol_l": 5.5},
+            "log_side_effect": {"symptom": "тошнота"},
             "log_labs": {"markers": {"glucose": 5.0, "insulin": 10}},
             "log_sleep": {"duration_min": 480},
             "log_weight": {"weight_kg": 80.0},

@@ -15,6 +15,7 @@ from health_core.db import connect, migrate
 from health_core.report import status_bar
 from health_core.guards import check_all
 from health_core.chrono import caffeine_cutoff
+from health_core.meds import stock_runs_out
 from health_core import sick
 from health_core.config import local_now
 
@@ -49,6 +50,10 @@ def main() -> int:
             for alert in alerts:
                 if alert.get("code") == "BINGE_RISK":
                     block_lines.append(f"⚠ {alert['message']}")
+            # Запас препарата (CONTEXT.md «Запас препарата»)
+            for w in stock_runs_out(conn, u["id"]):
+                ra = w["runs_out_at"]
+                block_lines.append(f"💊 {w['substance']}: запаса хватит до {ra[8:10]}.{ra[5:7]} — пополни")
             today = local_now().date().isoformat()
             st = sick.status(conn, u["id"], today)
             if st["sick"]:

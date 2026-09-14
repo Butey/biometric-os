@@ -262,6 +262,51 @@ log_glucose_schema = {
     "required": []
 }
 
+log_side_effect_schema = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["add", "delete", "list"],
+            "description": "add (умолчание) — записать побочный эффект; delete — удалить ошибочную запись или последнюю (без side_effect_id); list — список записей"
+        },
+        "side_effect_id": {
+            "type": "integer",
+            "description": "Для action=delete: номер записи побочного эффекта"
+        },
+        "symptom": {
+            "type": "string",
+            "description": "Симптом (тошнота, рвота, запор, диарея, изжога, слабость и т.п.)"
+        },
+        "severity": {
+            "type": "string",
+            "enum": ["mild", "moderate", "severe"],
+            "description": "Тяжесть: mild — лёгкая, moderate — средняя, severe — тяжёлая"
+        },
+        "notes": {
+            "type": "string",
+            "description": "Заметка"
+        },
+        "at": {
+            "type": "string",
+            "description": "ISO timestamp, по умолчанию сейчас"
+        },
+        "since_days": {
+            "type": "integer",
+            "description": "Для action=list: только записи не старше стольких дней (без параметра — просто последние limit записей)"
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Для action=list: сколько последних записей вернуть (по умолчанию 20)"
+        },
+        "user_id": {
+            "type": "integer",
+            "description": "ID пользователя"
+        }
+    },
+    "required": []
+}
+
 log_weight_schema = {
     "type": "object",
     "properties": {

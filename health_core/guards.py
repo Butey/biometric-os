@@ -373,6 +373,55 @@ def check_rate_high(conn: sqlite3.Connection, user_id: int):
     return None
 
 
+# ---------------------------------------------------------------- WEIGHT_REGAIN
+
+def check_weight_regain(conn: sqlite3.Connection, user_id: int):
+    """Возврат веса (CONTEXT.md «Возврат веса»): рост сглаженного веса за
+    regain_window_days дней, независимо от причины — перерыв в терапии,
+    снижение дозы, срыв. Причину ищет модель, а не гард (docs/adr/
+    0002-рекомендация-дозы.md). Взвешивания в дни рефида и болезни исключаются
+    из выборки ДО подсчёта медиан — там рост веса плановый (гликоген/вода,
+    задержка после болезни), не сигнал возврата.
+
+    Медианы по 3 первым и 3 последним ОСТАВШИМСЯ взвешиваниям гасят шум одной
+    точки — тот же приём, что в check_rate_high."""
+    from health_core import sick
+    from health_core.energy import _is_refeed
+
+    cfg = _cfg()
+    window_days = cfg["regain_window_days"]
+    min_points = cfg["regain_min_points"]
+    since = (_now() - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    rows = conn.execute(
+        "SELECT measured_at, weight_kg FROM body_metrics WHERE user_id=? AND measured_at>=? ORDER BY measured_at",
+        (user_id, since),
+    ).fetchall()
+    rows = [
+        r for r in rows
+        if not sick.is_sick(conn, user_id, r["measured_at"][:10])
+        and not _is_refeed(conn, user_id, r["measured_at"][:10])
+    ]
+    if len(rows) < min_points:
+        return None
+
+    k = 3
+    first_med = statistics.median(r["weight_kg"] for r in rows[:k])
+    last_med = statistics.median(r["weight_kg"] for r in rows[-k:])
+    kg_delta = last_med - first_med
+    if kg_delta <= 0:
+        return None  # only fire on gain
+    pct_delta = kg_delta / first_med * 100
+    threshold = cfg["regain_pct"]
+    if pct_delta > threshold:
+        days_covered = (_parse(rows[-1]["measured_at"]) - _parse(rows[0]["measured_at"])).days
+        return _alert(
+            "WEIGHT_REGAIN", "warning",
+            f"Вес вырос на {kg_delta:.1f} кг ({pct_delta:.1f}%) за {days_covered} дн.",
+            round(pct_delta, 2), threshold,
+        )
+    return None
+
+
 # ---------------------------------------------------------------- STALE_CALIB
 
 def check_stale_calib(conn: sqlite3.Connection, user_id: int):
@@ -670,6 +719,7 @@ _CHECKS = (
     check_glucose_volatility,
     check_measure_soon,
     check_binge_risk,
+    check_weight_regain,
 )
 
 # Режим болезни (health_core/sick.py) глушит поведенческие гардрейлы: во время
@@ -787,6 +837,16 @@ GUARD_DEFINITIONS = {
         "rationale": "Слишком быстрый сброс массы многократно увеличивает риск холелитиаза (камней в желчном пузыре).",
         "action": "Сообщить человеку темп и обсудить, чем он вызван — гардрейл не предписывает конкретную правку калоража.",
         "keys": ["weight_rate_pct_week_max", "weight_rate_kg_week_max", "weight_rate_window_days", "weight_rate_min_points"],
+    },
+    "WEIGHT_REGAIN": {
+        "code": "WEIGHT_REGAIN",
+        "name": "Возврат веса (28 дней)",
+        "category": "Скорость снижения веса",
+        "default_severity": "warning",
+        "description": "Рост сглаженного веса за regain_window_days дней выше regain_pct% от медианы начала окна — по медианам первых и последних 3 взвешиваний из оставшихся после исключения дней рефида и болезни.",
+        "rationale": "Возврат веса случается по разным причинам — перерыв в терапии, снижение дозы, срыв — и гард сообщает только факт роста, а не причину: причину ищет модель по остальным данным (побочные эффекты, приём препарата).",
+        "action": "Сообщить человеку факт (кг/% за сколько дней), без причин и советов — их называет модель по контексту.",
+        "keys": ["regain_window_days", "regain_min_points", "regain_pct"],
     },
     "PLATEAU": {
         "code": "PLATEAU",
@@ -942,6 +1002,9 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
             elif code == "RATE_HIGH":
                 item["current_val"] = f"{val:.2f} кг/неделю" if isinstance(val, (int, float)) else str(val)
                 item["threshold_val"] = f"≤ {thr:.2f} кг/неделю" if isinstance(thr, (int, float)) else str(thr)
+            elif code == "WEIGHT_REGAIN":
+                item["current_val"] = f"+{val:.1f}%" if isinstance(val, (int, float)) else str(val)
+                item["threshold_val"] = f"≤ {thr}%" if isinstance(thr, (int, float)) else str(thr)
             elif code == "UNDEREATING":
                 item["current_val"] = f"Ниже {thr * 100:.0f}% цели {val} дн. подряд" if isinstance(thr, (int, float)) else f"{val} дн."
                 item["threshold_val"] = f"< {val} дн. подряд"
@@ -1018,6 +1081,10 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
         elif code == "RATE_HIGH":
             item["threshold_val"] = f"≤ min({cfg['weight_rate_kg_week_max']:.1f} кг, {cfg['weight_rate_pct_week_max']:.1f}%) в нед"
             item["current_val"] = "Безопасный темп"
+
+        elif code == "WEIGHT_REGAIN":
+            item["threshold_val"] = f"≤ {cfg['regain_pct']}% за {cfg['regain_window_days']} дн"
+            item["current_val"] = "Без возврата"
 
         elif code == "PLATEAU":
             item["threshold_val"] = f"> {cfg['plateau_range_kg']} кг за {cfg['plateau_window_days']} дн"
@@ -1751,5 +1818,69 @@ if __name__ == "__main__":
                 f"GLUCOSE_VOLATILITY обязан звучать даже в день болезни, получили {alerts_glucose_sick}"
             )
             print("OK: режим болезни НЕ глушит GLUCOSE_VOLATILITY (безопасность)")
+
+            # ---------------------------------------------------------------- WEIGHT_REGAIN
+            # Порог по умолчанию: regain_pct=3.0%, regain_window_days=28, regain_min_points=6.
+
+            u_regain_fires = make_user(170, height_cm=185, created_days_ago=30)
+            add_metric(u_regain_fires, 27, 99.5, None)
+            add_metric(u_regain_fires, 25, 100.0, None)
+            add_metric(u_regain_fires, 23, 100.5, None)   # первая медиана = 100.0
+            add_metric(u_regain_fires, 4, 103.0, None)
+            add_metric(u_regain_fires, 2, 103.5, None)
+            add_metric(u_regain_fires, 0, 104.0, None)    # последняя медиана = 103.5 -> +3.5%
+            conn.commit()
+            alerts_regain_fires = check_all(conn, u_regain_fires)
+            regain_fired = [a for a in alerts_regain_fires if a["code"] == "WEIGHT_REGAIN"]
+            assert regain_fired, f"WEIGHT_REGAIN должен сработать при росте 3.5% за 28 дней, получили {alerts_regain_fires}"
+
+            u_regain_quiet = make_user(171, height_cm=185, created_days_ago=30)
+            add_metric(u_regain_quiet, 27, 99.5, None)
+            add_metric(u_regain_quiet, 25, 100.0, None)
+            add_metric(u_regain_quiet, 23, 100.5, None)   # первая медиана = 100.0
+            add_metric(u_regain_quiet, 4, 102.0, None)
+            add_metric(u_regain_quiet, 2, 102.5, None)
+            add_metric(u_regain_quiet, 0, 103.0, None)    # последняя медиана = 102.5 -> +2.5%
+            conn.commit()
+            alerts_regain_quiet = check_all(conn, u_regain_quiet)
+            assert not any(a["code"] == "WEIGHT_REGAIN" for a in alerts_regain_quiet), (
+                f"WEIGHT_REGAIN должен молчать при росте 2.5% (< порога 3.0%), получили {alerts_regain_quiet}"
+            )
+
+            # Скачок только в дни рефида: без исключения дал бы явный возврат, но эти
+            # две точки — рефид, и после исключения остаются ровно 6 плоских точек.
+            u_regain_refeed = make_user(172, height_cm=185, created_days_ago=30)
+            add_metric(u_regain_refeed, 27, 100.0, None)
+            add_metric(u_regain_refeed, 24, 100.2, None)
+            add_metric(u_regain_refeed, 21, 100.0, None)
+            add_metric(u_regain_refeed, 18, 105.0, None)  # рефид — исключается
+            add_metric(u_regain_refeed, 15, 105.0, None)  # рефид — исключается
+            add_metric(u_regain_refeed, 6, 100.3, None)
+            add_metric(u_regain_refeed, 3, 100.1, None)
+            add_metric(u_regain_refeed, 0, 100.4, None)
+            for d in (18, 15):
+                conn.execute(
+                    "INSERT INTO refeed_days(user_id, date) VALUES (?, ?)",
+                    (u_regain_refeed, (_now().date() - timedelta(days=d)).isoformat()),
+                )
+            conn.commit()
+            alerts_regain_refeed = check_all(conn, u_regain_refeed)
+            assert not any(a["code"] == "WEIGHT_REGAIN" for a in alerts_regain_refeed), (
+                f"WEIGHT_REGAIN должен молчать, если скачок пришёлся только на дни рефида, "
+                f"получили {alerts_regain_refeed}"
+            )
+
+            u_regain_thin = make_user(173, height_cm=185, created_days_ago=30)
+            add_metric(u_regain_thin, 20, 100.0, None)
+            add_metric(u_regain_thin, 10, 105.0, None)
+            add_metric(u_regain_thin, 0, 110.0, None)     # огромный рост, но только 3 точки < min_points=6
+            conn.commit()
+            alerts_regain_thin = check_all(conn, u_regain_thin)
+            assert not any(a["code"] == "WEIGHT_REGAIN" for a in alerts_regain_thin), (
+                f"WEIGHT_REGAIN должен молчать при < regain_min_points точек, получили {alerts_regain_thin}"
+            )
+
+            print("OK: WEIGHT_REGAIN — 3.5% срабатывает, 2.5% молчит, скачок только в дни рефида "
+                  "молчит, мало точек молчит")
         finally:
             conn.close()

@@ -111,6 +111,17 @@ guards:
   weight_rate_pct_week_max: 1.5
   weight_rate_window_days: 14
   weight_rate_min_points: 4
+  # WEIGHT_REGAIN (CONTEXT.md «Возврат веса») — рост сглаженного веса за окно
+  # выше regain_pct% от медианы начала окна, независимо от причины (перерыв в
+  # терапии, снижение дозы, срыв — причину ищет модель, не гард). Взвешивания
+  # в дни рефида и болезни исключаются из окна до подсчёта медиан.
+  regain_window_days: 28
+  regain_min_points: 6
+  regain_pct: 3.0
+  # Запас препарата (CONTEXT.md «Запас препарата») — health_core/meds.py::
+  # stock_runs_out. Предупреждение, если даты «запаса хватит до» осталось
+  # не больше stock_warn_days: morning_checkin и pharma status.
+  stock_warn_days: 14
   # отношение талия/таз, абдоминальное ожирение
   whr_male_max: 0.9
   whr_female_max: 0.85

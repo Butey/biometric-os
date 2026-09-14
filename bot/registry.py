@@ -22,6 +22,7 @@ DESCRIPTIONS = {
     "log_food": "Записать приём пищи: одно или несколько блюд с ккал и БЖУ. meal_slot — только если человек прямо назвал приём (завтрак/обед/ужин/перекус); иначе не передавай — код определит приём по окнам. Также action=delete для удаления по food_log_id.",
     "log_water": "Записать выпитую воду в мл. Также action=list для списка записей, action=delete для удаления по water_id (или clear_day=true для очистки всей воды за день).",
     "log_glucose": "Записать замер сахара крови (ммоль/л), опционально контекст (до/после еды). Также action=list для списка записей (limit опционален), action=delete для удаления по glucose_id или последнего замера (без glucose_id).",
+    "log_side_effect": "Записать побочный эффект (тошнота, рвота, запор, диарея, изжога, слабость и т.п.) с тяжестью mild/moderate/severe. Без привязки к препарату — связь по времени приёма устанавливает модель. Также action=list (limit, since_days опциональны — например, за период с последнего изменения дозы), action=delete по side_effect_id или последней записи (без side_effect_id).",
     "log_labs": "Анализы крови текстом: add — записать показатели на дату сдачи (глюкоза, инсулин, HbA1c, креатинин, холестерин, ЛПВП, ЛПНП, триглицериды, АЛТ, АСТ); list — история; delete — по lab_id; derived — HOMA-IR, eGFR, non-HDL, eAG. Единицы: ммоль/л, мкЕд/мл, %, мкмоль/л, Ед/л.",
     "log_sleep": "Записать сон за ночь: длительность в минутах, время отбоя и подъёма, субъективная оценка 1-5. Также action=list для списка записей (limit опционален), action=delete для удаления по sleep_id или последней ночи (без sleep_id).",
     "equipment": "Инвентарь для тренировок: список, добавить, убрать. Спрашивай ПЕРЕД составлением тренировки — без записанного оборудования план не сохранится.",
@@ -247,7 +248,7 @@ if __name__ == "__main__":
     conn.commit()
 
     expected_tools = {
-        "log_food", "log_water", "log_glucose", "log_labs", "log_sleep", "log_weight",
+        "log_food", "log_water", "log_glucose", "log_side_effect", "log_labs", "log_sleep", "log_weight",
         "equipment", "plan_day", "log_workout", "refeed", "sick", "forecast",
         "log_anthropometry", "log_med", "pharma", "plans", "import_scale_export",
         "get_day_summary", "get_trends", "get_status_bar",
