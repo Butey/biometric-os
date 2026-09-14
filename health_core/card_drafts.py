@@ -10,6 +10,7 @@
 save_draft/approve/reject — чистая работа с БД и Knowledge/drug_cards.md.
 """
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -161,6 +162,39 @@ _CARD_FIELD_LINES = (
 )
 
 
+_LADDER_RE = re.compile(r"\d+(?:\.\d+)?(?:\s*,\s*\d+(?:\.\d+)?)*(?:\s*(?:мг|mg))?", re.I)
+_NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)(?:\s*[a-zа-яё.]+)?", re.I)
+
+
+def _one_line(value) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _checked_fields(substance: str, synonyms: str, fields: dict) -> tuple[str, str, dict]:
+    """Граница доверия: поля пишет модель и правит админ в веб-форме, а файл карт
+    читает парсер построчно. Перевод строки в любом поле мог бы дописать чужой
+    заголовок карты или второе поле, поэтому всё сводится в одну строку и
+    проверяется по строгим шаблонам до записи."""
+    substance, synonyms = _one_line(substance), _one_line(synonyms)
+    clean = {key: _one_line(fields.get(key)) for key, _ in _CARD_FIELD_LINES}
+    problems = []
+    if not substance or substance.startswith("#"):
+        problems.append("название препарата пустое или начинается с #")
+    if clean["status"] and clean["status"] != "зарегистрирован" and not clean["status"].startswith("не зарегистрирован"):
+        problems.append("статус — «зарегистрирован» или «не зарегистрирован (…)»")
+    if clean["ladder"]:
+        steps = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", clean["ladder"])]
+        if not _LADDER_RE.fullmatch(clean["ladder"]) or any(s <= 0 for s in steps) or steps != sorted(set(steps)):
+            problems.append("лестница — положительные дозы через запятую по возрастанию, например «2.5, 5, 7.5 мг»")
+    for key, integer in (("min_weeks", True), ("interval_days", True), ("half_life_days", False), ("tmax_h", False)):
+        m = _NUMBER_RE.fullmatch(clean[key]) if clean[key] else None
+        if clean[key] and (m is None or float(m.group(1)) <= 0 or (integer and "." in m.group(1))):
+            problems.append(f"{key} — {'целое ' if integer else ''}положительное число")
+    if problems:
+        raise ValueError("Черновик не прошёл проверку: " + "; ".join(problems))
+    return substance, synonyms, clean
+
+
 def _card_block(card_number: int, substance: str, synonyms: str, fields: dict) -> str:
     header = f"{substance} / {synonyms}".strip(" /") if synonyms else substance
     lines = [f"## 📇 Карта {card_number}: {header}"]
@@ -195,6 +229,7 @@ def approve(conn, draft_id: int, fields: dict) -> dict:
         if sources:
             fields["source"] = "; ".join(sources)
     synonyms = fields.pop("synonyms", "") or ""
+    substance, synonyms, fields = _checked_fields(substance, synonyms, fields)
 
     path = _meds.DRUG_CARDS
     text = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -353,6 +388,26 @@ if __name__ == "__main__":
         except ValueError:
             pass
         print("OK: approve — повторное одобрение того же черновика отклонено")
+
+        # ---- approve: граница доверия — перевод строки и мусор не пишутся в файл карт ----
+        bad = cd.save_draft(conn, uid, "Кагрилинтид", {}, [])
+        before = tmp_cards.read_text(encoding="utf-8")
+        for bad_fields in (
+            {"ladder": "0.25,\n## 📇 Карта 9: Подделка\n- **Лестница:** 99"},
+            {"ladder": "5, 2.5 мг"},
+            {"status": "одобрен"},
+            {"min_weeks": "2.5"},
+            {"half_life_days": "долго"},
+        ):
+            try:
+                cd.approve(conn, bad, bad_fields)
+                raise AssertionError(f"approve пропустил некорректные поля: {bad_fields}")
+            except ValueError:
+                pass
+        assert tmp_cards.read_text(encoding="utf-8") == before, "отклонённый approve не должен трогать файл карт"
+        assert cd.get_draft(conn, bad)["status"] == "pending"
+        cd.reject(conn, bad)
+        print("OK: approve — внедрение строк и некорректные поля отклоняются до записи")
     finally:
         meds_mod.DRUG_CARDS = _orig_drug_cards
         meds_mod.aliases.cache_clear()
