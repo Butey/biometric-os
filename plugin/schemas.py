@@ -43,15 +43,32 @@ log_food_schema = {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Название блюда"},
-                    "grams": {"type": "number", "description": "Вес в граммах, если известен"},
-                    "kcal": {"type": "number", "description": "Калорийность, ккал. Обязательно: без неё запись отклоняется. Незнакомое блюдо — дайте оценку"},
-                    "protein_g": {"type": "number", "description": "Белки, г. Обязательно"},
-                    "fat_g": {"type": "number", "description": "Жиры, г. Обязательно, влияет на LIPID_GUARD"},
-                    "carbs_g": {"type": "number", "description": "Углеводы, г. Обязательно"},
-                    "fiber_g": {"type": "number", "description": "Клетчатка, г. Не входит в carbs_g и почти не даёт калорий — считается отдельно. Не знаешь — не передавай"},
+                    "grams": {"type": "number", "description": "Вес в граммах. Обязателен, если передан per_100g — код умножает состав на граммы сам"},
+                    "kcal": {"type": "number", "description": "Калорийность, ккал. Обязательно, если не передан per_100g. Незнакомое блюдо — дайте оценку"},
+                    "protein_g": {"type": "number", "description": "Белки, г. Обязательно, если не передан per_100g"},
+                    "fat_g": {"type": "number", "description": "Жиры, г. Обязательно (если не передан per_100g), влияет на LIPID_GUARD"},
+                    "carbs_g": {"type": "number", "description": "Углеводы, г. Обязательно, если не передан per_100g"},
+                    "fiber_g": {"type": "number", "description": "Клетчатка, г. Не входит в carbs_g и почти не даёт калорий — считается отдельно. Не знаешь и не передан per_100g.fiber_g — не передавай"},
+                    "per_100g": {
+                        "type": "object",
+                        "properties": {
+                            "kcal": {"type": "number"},
+                            "protein_g": {"type": "number"},
+                            "fat_g": {"type": "number"},
+                            "carbs_g": {"type": "number"},
+                            "fiber_g": {"type": "number"}
+                        },
+                        "required": ["kcal", "protein_g", "fat_g", "carbs_g"],
+                        "description": "Состав на 100 г (из food_lookup: match — свой продукт, search — Open Food Facts; или с этикетки). Передан вместе с grams — код сам считает kcal/protein_g/fat_g/carbs_g позиции, свои значения этих полей не нужны"
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["off", "my_product", "label", "estimate"],
+                        "description": "Откуда состав: off — Open Food Facts (после food_lookup search+remember), my_product — свой сохранённый продукт (food_lookup match), label — с этикетки от человека (после food_lookup remember), estimate — оценка модели без базы"
+                    },
                     "plate_category": {"type": "string", "description": "Категория тарелки"}
                 },
-                "required": ["name", "kcal", "protein_g", "fat_g", "carbs_g"]
+                "required": ["name"]
             },
             "description": "Массив блюд, один item — один приём пищи. Не агрегируйте день целиком: у позиции есть потолок ккал, разбивайте на отдельные блюда"
         },
@@ -70,6 +87,31 @@ log_food_schema = {
         }
     },
     "required": ["items"]
+}
+
+food_lookup_schema = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["match", "search", "remember", "list", "forget"],
+            "description": "match (умолчание) — найти СВОЙ сохранённый продукт по названию, в любой формулировке; search — до 5 кандидатов из Open Food Facts по названию; remember — сохранить/обновить свой продукт под этим названием; list — список своих продуктов; forget — убрать сохранённый продукт по названию"
+        },
+        "name": {"type": "string", "description": "Название продукта. Нужно для match/search/remember/forget"},
+        "off_code": {"type": "string", "description": "Для remember: код продукта Open Food Facts из результата search (candidate.off_code). Без явных чисел код сам подтянет состав по этому коду"},
+        "kcal_100g": {"type": "number", "description": "Для remember: калории на 100 г — либо это, либо off_code"},
+        "protein_100g": {"type": "number", "description": "Для remember: белки на 100 г"},
+        "fat_100g": {"type": "number", "description": "Для remember: жиры на 100 г"},
+        "carbs_100g": {"type": "number", "description": "Для remember: углеводы на 100 г"},
+        "fiber_100g": {"type": "number", "description": "Для remember: клетчатка на 100 г"},
+        "source": {
+            "type": "string",
+            "enum": ["off", "label", "estimate"],
+            "description": "Для remember: откуда цифры — off (Open Food Facts), label (с этикетки от человека) или estimate (оценка модели)"
+        },
+        "user_id": {"type": "integer", "description": "ID пользователя"}
+    },
+    "required": ["action"]
 }
 
 log_water_schema = {

@@ -59,7 +59,7 @@ os.environ["FAKE_KEY"] = "test"
 def test_tool_specs():
     specs = main.tool_specs()
     names = [s["function"]["name"] for s in specs]
-    assert len(names) == 36, f"35 инструментов плагина + knowledge, получено {len(names)}"
+    assert len(names) == 37, f"36 инструментов плагина + knowledge, получено {len(names)}"
     assert "knowledge" in names, "инструмент знаний не подключён"
     assert "log_food" in names and "get_status_bar" in names
     for s in specs:
@@ -454,6 +454,66 @@ def test_log_food_without_eaten_at_uses_user_timezone():
         conn.execute("DELETE FROM alerts WHERE user_id=780")
         conn.execute("DELETE FROM food_log WHERE user_id=780")
         conn.execute("DELETE FROM users WHERE id=780")
+        conn.commit()
+        conn.close()
+
+
+def test_food_lookup_remember_match_and_log_food_per_100g():
+    """CONTEXT.md «Состав продукта»/«Мой продукт»: food_lookup remember сохраняет
+    продукт -> match по ДРУГОЙ формулировке находит его -> log_food с per_100g
+    и grams считает kcal/БЖУ кодом (не моделью) и пишет source=my_product в
+    food_items."""
+    registry.set_caller("881")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM alerts WHERE user_id=881")
+        conn.execute("DELETE FROM food_log WHERE user_id=881")
+        conn.execute("DELETE FROM my_products WHERE user_id=881")
+        conn.execute("DELETE FROM users WHERE id=881")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(881,'881',170,'1990-01-01',"
+            "'f','UTC',65,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+
+        remembered = json.loads(main.dispatch("food_lookup", {
+            "action": "remember", "name": "бородинский", "source": "off", "off_code": "111",
+            "kcal_100g": 208, "protein_100g": 6.8, "fat_100g": 1.3, "carbs_100g": 40.7,
+        }))
+        assert remembered.get("ok") is True and remembered.get("product_id"), remembered
+
+        found = json.loads(main.dispatch("food_lookup", {
+            "action": "match", "name": "Бородинские тосты сухие",
+        }))
+        assert found.get("found") is True, f"match по другой формулировке должен найти: {found}"
+        assert found["kcal_100g"] == 208 and found["source"] == "off", found
+
+        result = json.loads(main.dispatch("log_food", {
+            "items": [{
+                "name": "Бородинские тосты сухие", "grams": 80,
+                "per_100g": {"kcal": found["kcal_100g"], "protein_g": found["protein_100g"],
+                             "fat_g": found["fat_100g"], "carbs_g": found["carbs_100g"]},
+                "source": "my_product",
+            }],
+        }))
+        assert "error" not in result, result
+        item = result["items"][0]
+        assert item["source"] == "my_product", item
+        assert abs(item["kcal"] - 208 * 0.8) < 1e-6, item
+
+        row = conn.execute(
+            "SELECT kcal, protein_g, source FROM food_items fi JOIN food_log fl ON fl.id=fi.food_log_id "
+            "WHERE fl.user_id=881 ORDER BY fi.id DESC LIMIT 1"
+        ).fetchone()
+        assert abs(row["kcal"] - 166.4) < 1e-6, dict(row)
+        assert abs(row["protein_g"] - 6.8 * 0.8) < 1e-6, dict(row)
+        assert row["source"] == "my_product", dict(row)
+    finally:
+        conn.execute("DELETE FROM alerts WHERE user_id=881")
+        conn.execute("DELETE FROM food_log WHERE user_id=881")
+        conn.execute("DELETE FROM my_products WHERE user_id=881")
+        conn.execute("DELETE FROM users WHERE id=881")
         conn.commit()
         conn.close()
 
