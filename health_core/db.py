@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 20
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -375,6 +375,21 @@ CREATE TABLE IF NOT EXISTS lab_results (
     UNIQUE(user_id, taken_on, marker)
 );
 CREATE INDEX IF NOT EXISTS idx_lab_results_user_date ON lab_results(user_id, taken_on);
+
+-- v20: журнал побочных эффектов (CONTEXT.md «Побочный эффект»). Без привязки
+-- к препарату — связь симптома с приёмом по времени устанавливает модель, не
+-- схема. Тяжесть ограничена CHECK: рекомендация дозы (docs/adr/0002) читает
+-- историю за период с последнего изменения дозы, и вольный текст тяжести
+-- туда не годится.
+CREATE TABLE IF NOT EXISTS side_effects (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    at TEXT NOT NULL,
+    symptom TEXT NOT NULL,
+    severity TEXT CHECK(severity IN ('mild','moderate','severe')),
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_side_effects_user_time ON side_effects(user_id, at);
 """
 
 
@@ -475,6 +490,21 @@ def _migrate_v13_to_v14(conn: sqlite3.Connection) -> None:
     _add_column(conn, "activity", "source", "TEXT")
 
 
+def _migrate_v19_to_v20(conn: sqlite3.Connection) -> None:
+    """v19->v20: side_effects — новая таблица, CREATE TABLE IF NOT EXISTS в DDL
+    уже создаёт её идемпотентно (см. _migrate_v9_to_v10/v16_to_v17 — тот же
+    путь для новых таблиц/колонок выше по файлу). Отдельный шаг нужен только
+    затем, чтобы номер версии не перепрыгивал молча мимо side_effects на базах,
+    где параллельная миграция до v19 ещё не применена."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS side_effects ("
+        "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), "
+        "at TEXT NOT NULL, symptom TEXT NOT NULL, "
+        "severity TEXT CHECK(severity IN ('mild','moderate','severe')), notes TEXT)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_side_effects_user_time ON side_effects(user_id, at)")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
     row = conn.execute("SELECT version FROM schema_version").fetchone()
@@ -507,6 +537,9 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v16_to_v17(conn)
         if row["version"] < 18:
             _migrate_v17_to_v18(conn)
+        # v18->v19 — миграция другого агента (параллельная ветка), сюда не входит.
+        if row["version"] < 20:
+            _migrate_v19_to_v20(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 

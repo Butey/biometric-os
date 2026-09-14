@@ -106,6 +106,45 @@ def merge_duplicate_schedules(conn) -> list[tuple[str, str]]:
     return renamed
 
 
+def stock_runs_out(conn, user_id: int) -> list[dict]:
+    """Запас препарата (CONTEXT.md «Запас препарата»): для каждой строки
+    med_schedule с известными every_days/next_at/stock_doses — дата, до
+    которой хватит текущего остатка при неизменном интервале приёма.
+
+    Последняя покрытая остатком доза = next_at + (stock_doses-1)*every_days;
+    stock_doses=0 значит покрытия нет вовсе — запас уже кончился на next_at.
+    Дата «хватит до» = последняя покрытая доза + один интервал (первая доза
+    без препарата) = next_at + stock_doses*every_days — обе записи формулы
+    совпадают, вторая короче.
+
+    Возвращает только строки, где до даты «хватит до» осталось не больше
+    guards.stock_warn_days (config.yaml) — вызывающему (morning_checkin,
+    pharma status) не нужно повторять порог."""
+    from datetime import datetime, timedelta
+
+    from health_core.config import load, local_now
+
+    warn_days = load()["guards"]["stock_warn_days"]
+    now = local_now()
+    rows = conn.execute(
+        "SELECT substance, every_days, next_at, stock_doses FROM med_schedule "
+        "WHERE user_id=? AND every_days IS NOT NULL AND next_at IS NOT NULL AND stock_doses IS NOT NULL",
+        (user_id,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        next_at = datetime.strptime(r["next_at"][:19], "%Y-%m-%d %H:%M:%S")
+        runs_out = next_at + timedelta(days=r["every_days"] * max(r["stock_doses"], 0))
+        days_left = (runs_out.date() - now.date()).days
+        if days_left <= warn_days:
+            out.append({
+                "substance": r["substance"],
+                "runs_out_at": runs_out.strftime("%Y-%m-%d %H:%M:%S"),
+                "days_left": days_left,
+            })
+    return out
+
+
 if __name__ == "__main__":
     import sqlite3
     import sys
@@ -142,5 +181,35 @@ if __name__ == "__main__":
                    (1, "Тирзепатид", "2026-08-23 22:00:00", 5.0),
                    (2, "Тирзепатид", "2026-09-01 22:00:00", 8.0)], got
     assert conn.execute("SELECT substance FROM med_log").fetchone()["substance"] == "Тирзетта",         "историю приёмов не переписываем — гарды читают route, а не имя"
-    print("meds: ok", len(a), "алиасов")
+
+    # stock_runs_out: пример из задания — stock_doses=1, every_days=7,
+    # next_at=2026-09-20 22:00 -> хватит до 2026-09-27; при today=2026-09-14
+    # до даты 13 дней -> предупреждение (порог guards.stock_warn_days=14).
+    # stock_doses=0 -> покрытия нет, предупреждение сразу; stock_doses=5 ->
+    # запаса на 35 дней, предупреждения быть не должно.
+    import health_core.config as _cfg_mod
+    from datetime import datetime as _dt
+
+    _orig_local_now = _cfg_mod.local_now
+    _cfg_mod.local_now = lambda: _dt(2026, 9, 14, 8, 0, 0)
+    try:
+        conn.execute("ALTER TABLE med_schedule ADD COLUMN every_days INTEGER")
+        conn.execute("DELETE FROM med_schedule")
+        conn.executemany(
+            "INSERT INTO med_schedule(user_id, substance, every_days, next_at, stock_doses) VALUES (?,?,?,?,?)",
+            [(3, "Тирзепатид", 7, "2026-09-20 22:00:00", 1.0),
+             (3, "Андрокомплекс", 7, "2026-09-20 22:00:00", 0.0),
+             (3, "Тесторил", 7, "2026-09-20 22:00:00", 5.0)],
+        )
+        warns = {w["substance"]: w for w in stock_runs_out(conn, 3)}
+        assert warns["Тирзепатид"]["runs_out_at"][:10] == "2026-09-27", warns["Тирзепатид"]
+        assert warns["Тирзепатид"]["days_left"] == 13, warns["Тирзепатид"]
+        assert "Андрокомплекс" in warns, "stock_doses=0 — покрытия нет, предупреждение сразу"
+        assert "Тесторил" not in warns, (
+            f"stock_doses=5 — запас на 35 дней, предупреждения быть не должно: {warns.get('Тесторил')}"
+        )
+    finally:
+        _cfg_mod.local_now = _orig_local_now
+
+    print("meds: ok", len(a), "алиасов;", "stock_runs_out: пример/0/5 доз проверены")
     sys.exit(0)

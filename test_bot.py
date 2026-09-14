@@ -59,7 +59,7 @@ os.environ["FAKE_KEY"] = "test"
 def test_tool_specs():
     specs = main.tool_specs()
     names = [s["function"]["name"] for s in specs]
-    assert len(names) == 33, f"32 инструмента плагина + knowledge, получено {len(names)}"
+    assert len(names) == 34, f"33 инструмента плагина + knowledge, получено {len(names)}"
     assert "knowledge" in names, "инструмент знаний не подключён"
     assert "log_food" in names and "get_status_bar" in names
     for s in specs:
@@ -467,6 +467,45 @@ def test_log_weight_with_id_list_delete():
         found2 = any(e["weight_id"] == weight_id for e in result_list2["entries"])
         assert not found2, f"weight_id {weight_id} всё ещё есть в list после удаления"
 
+    finally:
+        conn.close()
+
+
+def test_log_side_effect_add_list_delete():
+    """Запись побочного эффекта → id в ответе → list содержит этот id → delete без id удаляет."""
+    registry.set_caller("998")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM users WHERE id=998")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(998,'998',180,'1980-01-01',"
+            "'male','UTC',75,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+
+        result_add = json.loads(main.dispatch("log_side_effect", {
+            "symptom": "тошнота",
+            "severity": "mild",
+            "at": "2026-01-01 12:00:00",
+        }))
+        assert "side_effect_id" in result_add, f"нет side_effect_id в ответе: {result_add}"
+        side_effect_id = result_add["side_effect_id"]
+        assert side_effect_id > 0, f"side_effect_id должен быть положительным, получено {side_effect_id}"
+
+        result_list = json.loads(main.dispatch("log_side_effect", {"action": "list", "limit": 10}))
+        assert "entries" in result_list, f"нет entries в list: {result_list}"
+        found = any(e["side_effect_id"] == side_effect_id for e in result_list["entries"])
+        assert found, f"side_effect_id {side_effect_id} не найден в list: {result_list}"
+
+        result_del = json.loads(main.dispatch("log_side_effect", {"action": "delete"}))
+        assert "deleted" in result_del, f"нет deleted в ответе: {result_del}"
+        assert result_del["deleted"]["side_effect_id"] == side_effect_id, \
+            f"удалилась не та запись: {result_del['deleted']['side_effect_id']} != {side_effect_id}"
+
+        result_list2 = json.loads(main.dispatch("log_side_effect", {"action": "list", "limit": 10}))
+        found2 = any(e["side_effect_id"] == side_effect_id for e in result_list2["entries"])
+        assert not found2, f"side_effect_id {side_effect_id} всё ещё есть в list после удаления"
     finally:
         conn.close()
 

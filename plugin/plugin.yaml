@@ -19,6 +19,7 @@ provides_tools:
   - log_food
   - log_water
   - log_glucose
+  - log_side_effect
   - log_labs
   - log_weight
   - log_anthropometry
