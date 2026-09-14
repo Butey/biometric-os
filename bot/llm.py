@@ -91,14 +91,19 @@ def get_provider_keys(provider: Provider) -> list[str]:
     return keys
 
 
-def _get_key_state(key: str) -> KeyState:
-    state = _KEY_STATES.get(key)
+def _key_id(key: str, model: str = "") -> str:
+    return f"{model}:{key}" if model else key
+
+
+def _get_key_state(key: str, model: str = "") -> KeyState:
+    k = _key_id(key, model)
+    state = _KEY_STATES.get(k)
     if state is None:
-        state = _KEY_STATES[key] = KeyState()
+        state = _KEY_STATES[k] = KeyState()
     return state
 
 
-def _ordered_keys(env_name: str, keys: list[str]) -> list[str]:
+def _ordered_keys(env_name: str, keys: list[str], model: str = "") -> list[str]:
     """Сортирует ключи для запроса: сначала здоровые (не на кулдауне) с round-robin сдвигом,
     затем те, у кого кулдаун истекает раньше."""
     if not keys:
@@ -109,9 +114,9 @@ def _ordered_keys(env_name: str, keys: list[str]) -> list[str]:
     _ROTATION_INDEX[env_name] = (idx + 1) % len(keys)
     rotated = keys[idx:] + keys[:idx]
 
-    healthy = [k for k in rotated if _get_key_state(k).cooldown_until <= now]
-    cooling = [k for k in rotated if _get_key_state(k).cooldown_until > now]
-    cooling.sort(key=lambda k: _get_key_state(k).cooldown_until)
+    healthy = [k for k in rotated if _get_key_state(k, model).cooldown_until <= now]
+    cooling = [k for k in rotated if _get_key_state(k, model).cooldown_until > now]
+    cooling.sort(key=lambda k: _get_key_state(k, model).cooldown_until)
 
     return healthy + cooling
 
@@ -186,7 +191,16 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
             failures.append(msg)
             continue
 
-        ordered_keys = _ordered_keys(env_name, all_keys)
+        # Кулдаун ключа живёт в пределах квоты: у Google она на модель, у NVIDIA
+        # общий пул на все модели — такие провайдеры помечены quota_group в config.yaml.
+        scope = provider.get("quota_group") or provider.get("model", "")
+        ordered_keys = _ordered_keys(env_name, all_keys, model=scope)
+        now_ts = time.time()
+        healthy_keys = [k for k in ordered_keys if _get_key_state(k, model=scope).cooldown_until <= now_ts]
+        prov_timeout = float(provider.get("timeout_s", timeout_s))
+        if "nvidia" in provider.get("base_url", "").lower() and "timeout_s" not in provider:
+            prov_timeout = min(prov_timeout, 20.0)
+
         url = f"{provider['base_url'].rstrip('/')}/chat/completions"
         clean_messages = []
         for m in messages:
@@ -233,10 +247,10 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
             payload.pop("tool_choice", None)
 
         for key in ordered_keys:
-            state = _get_key_state(key)
+            state = _get_key_state(key, model=scope)
             now = time.time()
-            if state.cooldown_until > now and len(ordered_keys) > 1:
-                # Если есть другие ключи, ключ на кулдауне пропускаем
+            if state.cooldown_until > now and healthy_keys:
+                # Если есть здоровые ключи, ключ на кулдауне пропускаем
                 continue
 
             headers = {
@@ -245,7 +259,7 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
             }
 
             try:
-                status, body = await _post(session, url, headers, payload, timeout_s=timeout_s)
+                status, body = await _post(session, url, headers, payload, timeout_s=prov_timeout)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 msg = f"{provider['model']} (key {_mask_key(key)}): сетевая ошибка/таймаут — {exc!r}"
                 log.warning(msg)
@@ -276,6 +290,13 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                 log.warning("%s (key %s): HTTP 404 модель не найдена, переход к следующему провайдеру — %s",
                             provider["model"], _mask_key(key), _short(body, 180))
                 failures.append(f"{provider['model']}[{_mask_key(key)}]: HTTP 404 NotFound")
+                break
+
+            if status == 413:
+                # Превышен лимит размера запроса/токенов провайдера (например, Groq TPM/ITPM)
+                log.warning("%s (key %s): HTTP 413 превышен лимит размера/токенов, переход к следующему провайдеру — %s",
+                            provider["model"], _mask_key(key), _short(body, 180))
+                failures.append(f"{provider['model']}[{_mask_key(key)}]: HTTP 413 PayloadTooLarge")
                 break
 
             if status == 429:

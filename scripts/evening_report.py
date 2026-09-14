@@ -11,12 +11,12 @@
 """
 import argparse
 import sys
-from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")  # VPS-локаль не гарантирована, тут кириллица
 
+from health_core.config import user_today
 from health_core.db import connect, migrate
 from health_core.report import evening_report
 
@@ -38,10 +38,10 @@ def main() -> int:
         conn.close()
         return 1
 
-    today = date.today().isoformat()
     blocks = []
     for u in users:
         try:
+            today = user_today(conn, u["id"])
             blocks.append(evening_report(conn, u["id"], today))
         except Exception as e:
             # Отчёт одного человека не должен отменять отчёт остальных.

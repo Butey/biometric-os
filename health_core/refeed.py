@@ -47,7 +47,9 @@ def schedule(conn: sqlite3.Connection, user_id: int, start, horizon_weeks: int =
 
 def clear(conn: sqlite3.Connection, user_id: int, frm=None) -> int:
     """Снять будущие перерывы. Прошлые не трогаем — это история, а не план."""
-    frm = (frm or _date.today()).isoformat() if not isinstance(frm, str) else frm
+    from health_core.config import user_today
+    frm = frm or user_today(conn, user_id)
+    frm = frm if isinstance(frm, str) else frm.isoformat()
     cur = conn.execute("DELETE FROM refeed_days WHERE user_id=? AND date >= ?", (user_id, frm))
     conn.commit()
     return cur.rowcount

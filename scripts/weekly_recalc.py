@@ -10,13 +10,12 @@
 """
 import argparse
 import sys
-from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")
 
-from health_core.config import load
+from health_core.config import load, user_today
 from health_core.db import connect, migrate
 from health_core.energy import daily_target
 
@@ -38,13 +37,13 @@ def main() -> int:
         conn.close()
         return 1
 
-    today = date.today().isoformat()
     cfg = load()
     min_morning = cfg.get("policy", {}).get("weekly_recalc_min_morning_measures", 3)
     # При --user получатель и так один человек, префикс user_id=N: ему не нужен.
     prefix_tpl = "" if args.user is not None else "user_id={id}: "
     lines = []
     for u in users:
+        today = user_today(conn, u["id"])
         n = conn.execute(
             "SELECT COUNT(*) c FROM body_metrics WHERE user_id=? "
             "AND time(measured_at) BETWEEN '06:00:00' AND '11:00:00'",

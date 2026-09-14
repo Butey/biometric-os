@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import textwrap
 from datetime import datetime, date, timedelta
@@ -159,20 +160,30 @@ def _get_user_id(params: dict, conn=None) -> int:
     if caller_id and conn:
         # Try to resolve Telegram ID to database user_id
         row = conn.execute(
-            "SELECT id FROM users WHERE telegram_user_id=?",
+            "SELECT id, timezone FROM users WHERE telegram_user_id=?",
             (caller_id,),
         ).fetchone()
         if row:
+            if row["timezone"] and not config._TZ.get():
+                config.set_tz(row["timezone"])
             return row["id"]
         else:
             raise ValueError(f"Telegram user {caller_id} not found in database")
     # Fall back when no caller id (CLI, cron, self-check) or no connection
-    return params.get("user_id", 1)
+    uid = params.get("user_id", 1)
+    if conn and not config._TZ.get():
+        row = conn.execute("SELECT timezone FROM users WHERE id=?", (uid,)).fetchone()
+        if row and row["timezone"]:
+            config.set_tz(row["timezone"])
+    return uid
 
 
-def _now_iso() -> str:
+def _now_iso(conn: sqlite3.Connection | None = None, user_id: int | None = None) -> str:
     """Время в каноническом формате схемы: YYYY-MM-DD HH:MM:SS, через пробел.
-    Не ISO с 'T' — guards и report парсят по пробелу, а база хранит так же."""
+    Не ISO с 'T' — guards и report парсят по пробелу, а база хранит так же.
+    Если переданы conn и user_id — гарантированно вычисляет время в поясе пользователя."""
+    if conn is not None and user_id is not None:
+        return config.user_now(conn, user_id).strftime("%Y-%m-%d %H:%M:%S")
     return config.local_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -198,7 +209,7 @@ _EVENT_TS_PAST_DAYS = 400
 _EVENT_TS_FUTURE_DAYS = 2
 
 
-def _norm_event_ts(value: str | None) -> str | None:
+def _norm_event_ts(value: str | None, conn: sqlite3.Connection | None = None, user_id: int | None = None) -> str | None:
     """Метка события, которое уже произошло: еда, вода, глюкоза, замер, приём.
 
     Формат приводит _norm_ts, здесь проверяется правдоподобность. Модель
@@ -215,7 +226,10 @@ def _norm_event_ts(value: str | None) -> str | None:
     ts = _norm_ts(value)
     if ts is None:
         return None
-    now = config.local_now().replace(tzinfo=None)
+    if conn is not None and user_id is not None:
+        now = config.user_now(conn, user_id).replace(tzinfo=None)
+    else:
+        now = config.local_now().replace(tzinfo=None)
     delta_days = (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S") - now).days
     if delta_days > _EVENT_TS_FUTURE_DAYS:
         raise ValueError(f"Метка времени {ts} в будущем — событие ещё не произошло. "
@@ -226,8 +240,10 @@ def _norm_event_ts(value: str | None) -> str | None:
     return ts
 
 
-def _today_iso() -> str:
-    """Today as ISO date string."""
+def _today_iso(conn: sqlite3.Connection | None = None, user_id: int | None = None) -> str:
+    """Today as ISO date string in user's timezone."""
+    if conn is not None and user_id is not None:
+        return config.user_today(conn, user_id)
     return config.local_now().date().isoformat()
 
 
@@ -394,7 +410,7 @@ def _delete_food(conn, user_id: int, params: dict) -> str:
         conn.execute("DELETE FROM food_log WHERE id=? AND user_id=?", (log_id, user_id))
     conn.commit()
 
-    date_str = (row["eaten_at"] or "")[:10] or _today_iso()
+    date_str = (row["eaten_at"] or "")[:10] or _today_iso(conn, user_id)
     summary = day_summary(conn, user_id, date_str)
     conn.close()
     return json.dumps({
@@ -422,10 +438,10 @@ def handle_log_food(params: dict) -> str:
 
     raw_eaten = params.get("eaten_at")
     if raw_eaten:
-        cur_year = str(config.local_now().year)
+        cur_year = str(config.user_now(conn, user_id).year)
         if raw_eaten.startswith(("2024-", "2025-")):
             raw_eaten = cur_year + raw_eaten[4:]
-    eaten_at = _norm_event_ts(raw_eaten) or _now_iso()
+    eaten_at = _norm_event_ts(raw_eaten, conn, user_id) or _now_iso(conn, user_id)
 
     # Приём без позиций бессмысленен: калории и КБЖУ живут в food_items, и пустой
     # food_log даёт "0 ккал" в сводке при бодром "записано" в ответе. Это ровно тот
@@ -625,7 +641,7 @@ def handle_log_water(params: dict) -> str:
 
         conn.execute("DELETE FROM water_log WHERE id=? AND user_id=?", (record_id, user_id))
         conn.commit()
-        d = day_summary(conn, user_id, (row["at"] or "")[:10] or _today_iso())
+        d = day_summary(conn, user_id, (row["at"] or "")[:10] or _today_iso(conn, user_id))
         conn.close()
         return json.dumps({
             "deleted": {"water_id": record_id, "volume_ml": row["volume_ml"], "at": row["at"]},
@@ -635,7 +651,7 @@ def handle_log_water(params: dict) -> str:
         }, ensure_ascii=False)
 
     ml = params.get("ml")
-    at = _norm_event_ts(params.get("at")) or _now_iso()
+    at = _norm_event_ts(params.get("at"), conn, user_id) or _now_iso(conn, user_id)
 
     # Ноль и отрицательные миллилитры — не запись, а мусор в логе: они портят
     # суточную сумму и выглядят как выполненное действие. В базе уже лежала
@@ -886,7 +902,7 @@ def handle_log_glucose(params: dict) -> str:
 
     mmol_l = params.get("mmol_l")
     context = params.get("context")
-    at = _norm_event_ts(params.get("at")) or _now_iso()
+    at = _norm_event_ts(params.get("at"), conn, user_id) or _now_iso(conn, user_id)
     confirmed = params.get("confirmed", False)
 
     # mmol_l required в схеме — подсказка, не гарантия: без гейта здесь NULL-запись
@@ -1019,7 +1035,7 @@ def handle_log_side_effect(params: dict) -> str:
     if severity is not None and severity not in ("mild", "moderate", "severe"):
         conn.close()
         return json.dumps({"error": "severity должен быть mild, moderate или severe"}, ensure_ascii=False)
-    at = _norm_event_ts(params.get("at")) or _now_iso()
+    at = _norm_event_ts(params.get("at"), conn, user_id) or _now_iso(conn, user_id)
 
     cur = conn.execute(
         "INSERT INTO side_effects(user_id, at, symptom, severity, notes) VALUES (?, ?, ?, ?, ?)",
@@ -1235,7 +1251,7 @@ def handle_log_weight(params: dict) -> str:
         }, ensure_ascii=False)
 
     weight_kg = params.get("weight_kg")
-    measured_at = _norm_event_ts(params.get("measured_at")) or _now_iso()
+    measured_at = _norm_event_ts(params.get("measured_at"), conn, user_id) or _now_iso(conn, user_id)
 
     # weight_kg REAL NOT NULL в body_metrics отказывает на None, но не на мусорную
     # строку — SQLite хранит TEXT в REAL-колонке как есть, и она тихо всплывает
@@ -1380,7 +1396,7 @@ def handle_log_anthropometry(params: dict) -> str:
 
     site = params.get("site")
     value_cm = params.get("value_cm")
-    measured_on = params.get("measured_on", _today_iso())
+    measured_on = params.get("measured_on") or _today_iso(conn, user_id)
 
     # site — реальный гейт, не только enum в схеме: report.whr()/trends() ищут
     # ЛИТЕРАЛЬНО site='талия'/'таз' (health_core/ingest/anthro.SITES). Английское
@@ -1518,7 +1534,7 @@ def handle_log_med(params: dict) -> str:
     unit = params.get("unit")
     site = params.get("site")
     notes = params.get("notes")
-    at = _norm_event_ts(params.get("at")) or _now_iso()
+    at = _norm_event_ts(params.get("at"), conn, user_id) or _now_iso(conn, user_id)
 
     # Normalize timestamp
     if "T" in at and at.count(":") == 1:
@@ -1673,7 +1689,7 @@ def handle_log_workout(params: dict) -> str:
         except (TypeError, ValueError):
             avg_hr = None
 
-    started_at = _norm_event_ts(params.get("started_at")) or _now_iso()
+    started_at = _norm_event_ts(params.get("started_at"), conn, user_id) or _now_iso(conn, user_id)
     notes = (params.get("notes") or "").strip() or None
     source = params.get("source") or "manual"
 
@@ -1902,7 +1918,7 @@ def _render_console(conn, user_id: int, date_str: str) -> str:
     day_summary/meals_of_day/guards/bmr_floor и последней строки body_metrics.
     Пустые секции (нет фармы, нет плана) показываются честно, не выдумываются."""
     rule = "━" * _CONSOLE_W
-    now = config.local_now()
+    now = config.user_now(conn, user_id)
     m = conn.execute(
         "SELECT weight_kg, fat_pct, bmi, muscle_mass_kg, ffm_kg, visceral_fat, water_pct, metabolic_age "
         "FROM body_metrics WHERE user_id=? ORDER BY measured_at DESC LIMIT 1",
@@ -2167,7 +2183,7 @@ def handle_get_day_summary(params: dict) -> str:
     migrate(conn)
     user_id = _get_user_id(params, conn)
     raw_date = params.get("date")
-    cur_today = _today_iso()
+    cur_today = _today_iso(conn, user_id)
     if not raw_date:
         date_str = cur_today
     elif raw_date.startswith(("2024-", "2025-")) and raw_date[5:10] == cur_today[5:10]:
