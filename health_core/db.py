@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -104,7 +104,8 @@ CREATE TABLE IF NOT EXISTS food_items (
     fat_g REAL,
     carbs_g REAL,
     fiber_g REAL,
-    plate_category TEXT
+    plate_category TEXT,
+    source TEXT  -- off|my_product|label|estimate, CONTEXT.md «Состав продукта»; NULL для старых записей
 );
 
 CREATE TABLE IF NOT EXISTS water_log (
@@ -427,6 +428,27 @@ CREATE TABLE IF NOT EXISTS council_runs (
     result_text TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_council_runs_user_time ON council_runs(user_id, started_at);
+
+-- v23: личный справочник «Мои продукты» (CONTEXT.md «Мой продукт», health_core/
+-- foods.py). name_key — нормализованная основа названия (foods.name_key), по
+-- ней распознаётся тот же продукт в другой формулировке; UNIQUE(user_id,
+-- name_key) — повторный remember того же продукта обновляет строку, а не
+-- плодит дубликат.
+CREATE TABLE IF NOT EXISTS my_products (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    name_key TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    off_code TEXT,
+    kcal_100g REAL,
+    protein_100g REAL,
+    fat_100g REAL,
+    carbs_100g REAL,
+    fiber_100g REAL,
+    source TEXT CHECK(source IN ('off','label','estimate')),
+    created_at TEXT NOT NULL,
+    UNIQUE(user_id, name_key)
+);
 """
 
 
@@ -582,6 +604,15 @@ def _migrate_v21_to_v22(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_council_runs_user_time ON council_runs(user_id, started_at)")
 
 
+def _migrate_v22_to_v23(conn: sqlite3.Connection) -> None:
+    """v22->v23: состав продукта (CONTEXT.md «Состав продукта», «Мой продукт»,
+    health_core/foods.py) — my_products новой таблицей уже создаёт CREATE TABLE
+    IF NOT EXISTS в DDL выше (тот же приём, что в _migrate_v21_to_v22 для
+    council_runs); food_items.source — ALTER, так как таблица уже существует с
+    данными (тот же приём, что в _migrate_v10_to_v11 для fiber_g)."""
+    _add_column(conn, "food_items", "source", "TEXT")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
     row = conn.execute("SELECT version FROM schema_version").fetchone()
@@ -622,6 +653,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v20_to_v21(conn)
         if row["version"] < 22:
             _migrate_v21_to_v22(conn)
+        if row["version"] < 23:
+            _migrate_v22_to_v23(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 

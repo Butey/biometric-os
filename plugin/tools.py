@@ -440,6 +440,41 @@ def handle_log_food(params: dict) -> str:
     for i in items:
         nm = str(i.get("name") or "").strip()
         i["name"] = nm if nm else "Блюдо"
+
+    # per_100g + grams (CONTEXT.md «Состав продукта»): код, а не модель, считает
+    # kcal/protein_g/fat_g/carbs_g позиции из состава на 100 г (food_lookup
+    # match/search/remember) и граммовки. Заполняем эти поля здесь, ДО проверки
+    # обязательных КБЖУ ниже — старый формат (модель сама прислала числа) через
+    # этот блок просто не проходит (per_100g отсутствует) и работает как раньше.
+    _ITEM_SOURCES = ("off", "my_product", "label", "estimate")
+    for i in items:
+        per100 = i.get("per_100g")
+        src = i.get("source")
+        if src is not None and src not in _ITEM_SOURCES:
+            conn.close()
+            return json.dumps(
+                {"error": f"{i['name']}: source должен быть одним из {_ITEM_SOURCES}, получено {src!r}"},
+                ensure_ascii=False)
+        if per100 is None:
+            continue
+        if not isinstance(per100, dict):
+            conn.close()
+            return json.dumps({"error": f"{i['name']}: per_100g должен быть объектом"}, ensure_ascii=False)
+        if i.get("grams") is None:
+            conn.close()
+            return json.dumps({"error": f"{i['name']}: per_100g требует grams"}, ensure_ascii=False)
+        try:
+            factor = _as_float("grams", i["grams"]) / 100.0
+            i["kcal"] = _as_float("per_100g.kcal", per100.get("kcal")) * factor
+            i["protein_g"] = _as_float("per_100g.protein_g", per100.get("protein_g")) * factor
+            i["fat_g"] = _as_float("per_100g.fat_g", per100.get("fat_g")) * factor
+            i["carbs_g"] = _as_float("per_100g.carbs_g", per100.get("carbs_g")) * factor
+            if per100.get("fiber_g") is not None and i.get("fiber_g") is None:
+                i["fiber_g"] = _as_float("per_100g.fiber_g", per100["fiber_g"]) * factor
+        except ValueError as e:
+            conn.close()
+            return json.dumps({"error": f"{i['name']}: {e}"}, ensure_ascii=False)
+
     # meal_slot необязателен (CONTEXT.md «Приём пищи»): передан — используется
     # как есть, после проверки enum (прямое слово человека побеждает всегда).
     # Не передан — код сам определяет приём по окнам (health_core.chrono.
@@ -507,7 +542,7 @@ def handle_log_food(params: dict) -> str:
     for item in items:
         icur = conn.execute(
             "INSERT INTO food_items(food_log_id, name, grams, kcal, protein_g, fat_g, carbs_g, "
-            "fiber_g, plate_category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "fiber_g, plate_category, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 food_log_id,
                 item.get("name"),
@@ -520,6 +555,9 @@ def handle_log_food(params: dict) -> str:
                 # а отказ записать приём из-за неизвестной клетчатки хуже пробела.
                 item.get("fiber_g"),
                 item.get("plate_category"),
+                # off|my_product|label|estimate (CONTEXT.md «Состав продукта»); NULL —
+                # старый формат, модель прислала числа сама, без food_lookup.
+                item.get("source"),
             ),
         )
         _written += icur.rowcount
@@ -543,9 +581,107 @@ def handle_log_food(params: dict) -> str:
     conn.close()
 
     return json.dumps(
-        {"status_bar": bar, "alerts": alerts, "meal_slot": meal_slot},
+        {"status_bar": bar, "alerts": alerts, "meal_slot": meal_slot,
+         # source по каждой позиции — видно, откуда взят состав (CONTEXT.md
+         # «Состав продукта»): off/my_product/label — из базы, estimate/NULL — оценка.
+         "items": [{"name": i["name"], "kcal": i.get("kcal"), "source": i.get("source")} for i in items]},
         ensure_ascii=False,
     )
+
+
+def _product_row(r) -> dict:
+    return {
+        "product_id": r["id"], "name": r["display_name"], "off_code": r["off_code"],
+        "kcal_100g": r["kcal_100g"], "protein_100g": r["protein_100g"], "fat_100g": r["fat_100g"],
+        "carbs_100g": r["carbs_100g"], "fiber_100g": r["fiber_100g"], "source": r["source"],
+    }
+
+
+@_handler_wrapper
+def handle_food_lookup(params: dict) -> str:
+    """Состав продукта (CONTEXT.md «Состав продукта», «Мой продукт»,
+    health_core/foods.py): match — найти СВОЙ сохранённый продукт по названию,
+    в любой формулировке; search — до 5 кандидатов из Open Food Facts;
+    remember — сохранить/обновить свой продукт (off_code — код сам подтянет
+    состав, либо отдай числа на 100 г напрямую, например с этикетки); list —
+    свои продукты; forget — убрать сохранённый продукт."""
+    from health_core import foods
+
+    conn = connect()
+    migrate(conn)
+    user_id = _get_user_id(params, conn)
+    action = (params.get("action") or "match").lower()
+
+    if action in ("match", "forget"):
+        name = (params.get("name") or "").strip()
+        if not name:
+            conn.close()
+            return json.dumps({"error": "Нужно name"}, ensure_ascii=False)
+        if action == "forget":
+            ok = foods.forget(conn, user_id, name)
+            conn.close()
+            return json.dumps({"ok": ok}, ensure_ascii=False)
+        row = foods.find_mine(conn, user_id, name)
+        conn.close()
+        if row is None:
+            return json.dumps({"found": False}, ensure_ascii=False)
+        return json.dumps({"found": True, **_product_row(row)}, ensure_ascii=False)
+
+    if action == "search":
+        name = (params.get("name") or "").strip()
+        conn.close()
+        if not name:
+            return json.dumps({"error": "Нужно name"}, ensure_ascii=False)
+        return json.dumps(foods.search(name), ensure_ascii=False)
+
+    if action == "list":
+        rows = foods.list_mine(conn, user_id)
+        conn.close()
+        return json.dumps({"products": [_product_row(r) for r in rows]}, ensure_ascii=False)
+
+    if action == "remember":
+        name = (params.get("name") or "").strip()
+        source = params.get("source")
+        if not name:
+            conn.close()
+            return json.dumps({"error": "Нужно name"}, ensure_ascii=False)
+        if source not in ("off", "label", "estimate"):
+            conn.close()
+            return json.dumps({"error": "source должен быть off, label или estimate"}, ensure_ascii=False)
+
+        off_code = params.get("off_code")
+        nums = {k: params.get(f"{k}_100g") for k in ("kcal", "protein", "fat", "carbs", "fiber")}
+        # Числа не даны, но есть код OFF — код сам подтягивает состав по коду
+        # (та же единая точка сети, что у search()), а не заставляет модель
+        # переспрашивать то, что уже показал предыдущий search().
+        if nums["kcal"] is None and off_code:
+            fetched = foods.fetch_by_code(off_code)
+            if fetched.get("error"):
+                conn.close()
+                return json.dumps(fetched, ensure_ascii=False)
+            for k in nums:
+                if nums[k] is None:
+                    nums[k] = fetched.get(f"{k}_100g")
+
+        try:
+            product_id = foods.remember(
+                conn, user_id, name, source=source, off_code=off_code,
+                kcal_100g=_as_float("kcal_100g", nums["kcal"]) if nums["kcal"] is not None else None,
+                protein_100g=_as_float("protein_100g", nums["protein"]) if nums["protein"] is not None else None,
+                fat_100g=_as_float("fat_100g", nums["fat"]) if nums["fat"] is not None else None,
+                carbs_100g=_as_float("carbs_100g", nums["carbs"]) if nums["carbs"] is not None else None,
+                fiber_100g=_as_float("fiber_100g", nums["fiber"]) if nums["fiber"] is not None else None,
+            )
+        except ValueError as e:
+            conn.close()
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+        conn.close()
+        return json.dumps({"ok": True, "product_id": product_id}, ensure_ascii=False)
+
+    conn.close()
+    return json.dumps(
+        {"error": f"Неизвестное действие: {action}. Допустимо: match, search, remember, list, forget"},
+        ensure_ascii=False)
 
 
 @_handler_wrapper
@@ -4890,7 +5026,7 @@ _WIPE_TABLES = (
     "food_log", "water_log", "glucose_log", "body_metrics", "anthropometry",
     "activity", "med_log", "alerts", "daily_targets", "import_log",
     "llm_calls", "refeed_days", "sick_days", "lab_results", "plan_log",
-    "side_effects",
+    "side_effects", "my_products",
 )
 _WIPE_CONFIRM = "УДАЛИТЬ"
 
@@ -4986,6 +5122,7 @@ def register(ctx):
 
     tools = [
         ("log_food", handle_log_food, schemas.log_food_schema),
+        ("food_lookup", handle_food_lookup, schemas.food_lookup_schema),
         ("log_water", handle_log_water, schemas.log_water_schema),
         ("log_glucose", handle_log_glucose, schemas.log_glucose_schema),
         ("log_side_effect", handle_log_side_effect, schemas.log_side_effect_schema),
@@ -5113,7 +5250,7 @@ if __name__ == "__main__":
         register(ctx)
 
         expected_tools = {
-            "log_food", "log_water", "log_glucose", "log_side_effect", "log_labs", "log_sleep", "log_weight",
+            "log_food", "food_lookup", "log_water", "log_glucose", "log_side_effect", "log_labs", "log_sleep", "log_weight",
             "equipment", "plan_day", "log_workout", "refeed", "sick", "forecast",
             "log_anthropometry", "log_med", "pharma", "drug_card_draft", "plans", "import_scale_export",
             "get_day_summary", "get_trends", "get_status_bar",
@@ -6377,6 +6514,13 @@ if __name__ == "__main__":
         # а то, чего строгий дамми в принципе не может syntheзировать.
         _GEN_EXTRAS = {
             "import_scale_export": {"file_path": str(csv_path)},
+            # kcal/protein_g/fat_g/carbs_g обязательны только если НЕТ per_100g —
+            # это ветвление кода, которое дамми по одному "required": ["name"] не
+            # выразит (та же причина, что у log_water ниже: ml не required схемой,
+            # но нужен для реального add).
+            "food_lookup": {"name": "Тестовый продукт для контракта"},
+            "log_food": {"items": [{"name": "Тест", "kcal": 300, "protein_g": 10,
+                                     "fat_g": 10, "carbs_g": 30}]},
             "get_progress": {"milestone_name": "goal_weight"},
             # Прогнозу нужен средний приход за 14 дней; фикстура столько еды не
             # логирует, а отказ "мало данных" — не нарушение контракта полей.
