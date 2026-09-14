@@ -2880,6 +2880,12 @@ def _check_dose_bounds(conn, user_id: int, substance: str, dose_f: float, card_d
         "SELECT at, dose FROM med_log WHERE user_id=? AND substance=? ORDER BY at DESC LIMIT 1",
         (user_id, substance),
     ).fetchone()
+    if last_log is None and idx_new != 0 and conn.execute(
+        "SELECT 1 FROM med_schedule WHERE user_id=? AND substance=?", (user_id, substance)
+    ).fetchone() is None:
+        # без расписания и истории приёма — это начало терапии, а не повышение, но старт с максимума опасен
+        return (f"Начало терапии — со стартовой ступени {ladder[0]:g}. Если доза {dose_f:g} уже назначена "
+                f"врачом или уже принимается — укажи by_doctor. {note}"), False
     if last_log is not None and (now - _dt(last_log["at"])).days > 14:
         last_dose = _dose_num(last_log["dose"])
         if last_dose is not None and dose_f > last_dose + 1e-6:
@@ -6282,7 +6288,7 @@ if __name__ == "__main__":
         # которого принятая доза не двигала next_at и расписание вечно висело
         # просроченным. См. health_core/meds.py.
         assert "Расписаний нет" in _rx(action="status")["pharma"]
-        assert "ok" in _rx(action="schedule", substance="Tirzepatide", dose=10, unit="mg", route="injection",
+        assert "ok" in _rx(action="schedule", substance="Tirzepatide", dose=10, unit="mg", route="injection", by_doctor=True,
                            every_days=7, next_at="2026-08-24 22:00:00", stock_doses=4)
         st = _rx(action="status")["pharma"]
         assert "Тирзепатид" in st and "10mg" in st and "4 доз" in st, st

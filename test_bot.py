@@ -494,12 +494,17 @@ def test_pharma_dose_ladder_bounds():
 
         now = config.local_now()
 
-        # Стартовая доза — первое расписание, без истории приёма, рамки на неё не давят.
+        # Начало терапии без расписания и истории: выше стартовой ступени — только by_doctor.
         r = json.loads(main.dispatch("pharma", {
             "action": "schedule", "substance": "Тирзепатид", "dose": 12.5,
             "unit": "mg", "route": "injection",
         }))
-        assert "ok" in r, f"первая доза не должна упираться в рамки: {r}"
+        assert "error" in r, f"старт терапии с 12.5 без by_doctor должен быть ошибкой: {r}"
+        r = json.loads(main.dispatch("pharma", {
+            "action": "schedule", "substance": "Тирзепатид", "dose": 12.5,
+            "unit": "mg", "route": "injection", "by_doctor": True,
+        }))
+        assert "ok" in r, f"уже назначенная врачом доза должна приниматься с by_doctor: {r}"
 
         # Приём этой дозы 5 дней назад — с этой даты отсчитывается минимальный срок ступени.
         r = json.loads(main.dispatch("log_med", {
