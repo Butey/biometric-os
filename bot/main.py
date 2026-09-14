@@ -25,7 +25,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat,
+                           CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message)
 from aiogram.utils.chat_action import ChatActionSender
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -61,8 +62,27 @@ BUILTIN_COMMANDS = {
     "new": "Забыть контекст разговора",
     "help": "Что я умею",
     "status": "Статус-бар: вес, калории, гарды",
-    "model": "Смена активной модели (админ)",
 }
+
+# Видны в меню только в чатах администраторов (BotCommandScopeChat); у остальных
+# их нет — вызов всё равно отбивается проверкой прав в run_command.
+ADMIN_COMMANDS = {
+    "model": "Смена активной модели",
+    "access": "Заявки и допущенные пользователи",
+    "approve": "Одобрить доступ: /approve <tg_id>",
+    "deny": "Отклонить заявку: /deny <tg_id>",
+    "revoke": "Отозвать доступ: /revoke <tg_id>",
+}
+_ADMIN_ONLY_SLASH = {"users", "mode"}
+
+
+def menu_commands(admin: bool) -> list[BotCommand]:
+    """Меню Telegram: встроенные команды + слэш-команды плагина (+ админские)."""
+    items = dict(BUILTIN_COMMANDS)
+    items.update({n: d for n, _h, d in registry.SLASH_COMMANDS if admin or n not in _ADMIN_ONLY_SLASH})
+    if admin:
+        items.update(ADMIN_COMMANDS)
+    return [BotCommand(command=c, description=d[:256]) for c, d in items.items()]
 
 _soul_cache: tuple[float, str] | None = None
 
@@ -961,13 +981,18 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
         # рвётся урывками: этот вызов молча съедал старт целиком, бот не доходил
         # ни до строки лога, ни до поллинга, и снаружи выглядел мёртвым при живом
         # процессе. Не вышло — работаем без меню, слэш-команды всё равно живы.
+        # all_private_chats перекрывает default в личке: там годами висело меню
+        # Hermes без /model, поэтому пишем обе области, а админам — своё меню.
+        async def _set_menus():
+            user_menu = menu_commands(admin=False)
+            await bot.set_my_commands(user_menu)
+            await bot.set_my_commands(user_menu, scope=BotCommandScopeAllPrivateChats())
+            for admin_id in admin_user_ids():
+                await bot.set_my_commands(menu_commands(admin=True),
+                                          scope=BotCommandScopeChat(chat_id=int(admin_id)))
+
         try:
-            await asyncio.wait_for(
-                bot.set_my_commands([
-                    BotCommand(command=c, description=d) for c, d in BUILTIN_COMMANDS.items()
-                ]),
-                timeout=10,
-            )
+            await asyncio.wait_for(_set_menus(), timeout=20)
         except Exception as e:
             log.warning("меню команд не зарегистрировано (%s) — не мешает работе", type(e).__name__)
         await dp.start_polling(bot)

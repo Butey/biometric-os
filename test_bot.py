@@ -206,6 +206,16 @@ def test_access_approval_flow():
     assert main._check_access("900001", None) == "denied"
 
 
+def test_telegram_menu():
+    user = {c.command for c in main.menu_commands(admin=False)}
+    admin = {c.command for c in main.menu_commands(admin=True)}
+    handled = set(main.BUILTIN_COMMANDS) | set(main.ADMIN_COMMANDS) | {n for n, _h, _d in registry.SLASH_COMMANDS}
+    assert handled == admin, f"команды без пункта меню у админа: {handled - admin}"
+    assert {"model", "approve", "deny", "revoke", "access", "users", "mode"} <= admin
+    assert not {"model", "approve", "deny", "revoke", "access", "users", "mode"} & user, "админские команды в меню пользователя"
+    assert {"new", "help", "status", "week", "wipe"} <= user
+
+
 def test_personal_knowledge_isolated():
     kdir = Path(_TMP) / "Knowledge"
     (kdir / "personal" / "900002").mkdir(parents=True)
