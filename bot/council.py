@@ -91,6 +91,14 @@ def reserve(conn: sqlite3.Connection, user_id: int, reason: str) -> int:
     решает, что с этим делать."""
     if reason not in ("manual", "dose", "plateau"):
         raise ValueError(f"неизвестная причина консилиума: {reason!r}")
+    # running старше часа — прогон, оборванный перезапуском бота: иначе он навсегда занял бы лок
+    stale_before = (local_now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "UPDATE council_runs SET status='failed', complete=0, finished_at=?, "
+        "result_text='Консилиум прерван (перезапуск или сбой).' "
+        "WHERE user_id=? AND status='running' AND started_at<?",
+        (_now_iso(), user_id, stale_before),
+    )
     if conn.execute(
         "SELECT 1 FROM council_runs WHERE user_id=? AND status='running'", (user_id,)
     ).fetchone():

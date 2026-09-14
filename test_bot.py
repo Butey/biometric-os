@@ -679,6 +679,15 @@ def test_council_request_creates_running_and_answers_immediately():
         # action=status видит последний прогон
         status = json.loads(main.dispatch("council", {"action": "status"}))
         assert status["id"] == run_id and status["status"] == "running", status
+
+        # running, оборванный перезапуском (старше часа), не держит лок вечно
+        conn.execute("UPDATE council_runs SET started_at='2026-01-01 00:00:00' WHERE id=?", (run_id,))
+        conn.commit()
+        result3 = json.loads(main.dispatch("council", {"action": "request", "reason": "dose"}))
+        assert "ok" in result3, f"зависший running должен сниматься: {result3}"
+        old = conn.execute("SELECT status FROM council_runs WHERE id=?", (run_id,)).fetchone()
+        assert old["status"] == "failed", dict(old)
+        council._PENDING_RUNS.clear()
     finally:
         conn.close()
 

@@ -363,6 +363,10 @@ async def _run_council_task(bot: Bot, telegram_uid: str, user_id: int, run_id: i
         result = await council.execute(conn, user_id, run_id, reason)
     except Exception:
         log.exception("консилиум упал целиком, run_id=%s", run_id)
+        try:
+            council._finish(conn, run_id, "failed", 0, "Консилиум не состоялся: внутренняя ошибка.")
+        except Exception:
+            log.exception("не удалось пометить run_id=%s как failed", run_id)
         return
     finally:
         conn.close()
@@ -372,6 +376,9 @@ async def _run_council_task(bot: Bot, telegram_uid: str, user_id: int, run_id: i
         log.exception("не удалось отправить итог консилиума пользователю %s", telegram_uid)
 
 
+_COUNCIL_TASKS: set = set()
+
+
 async def _flush_pending_council(bot: Bot) -> None:
     """Заявки, которые council.reserve() уже зарезервировал синхронно (тул
     в plugin/tools.py) — запускаем фоновой asyncio-задачей в цикле бота, а не
@@ -379,7 +386,9 @@ async def _flush_pending_council(bot: Bot) -> None:
     и обработку следующих сообщений это держать не должно."""
     while council._PENDING_RUNS:
         telegram_uid, user_id, run_id, reason = council._PENDING_RUNS.pop(0)
-        asyncio.create_task(_run_council_task(bot, telegram_uid, user_id, run_id, reason))
+        task = asyncio.create_task(_run_council_task(bot, telegram_uid, user_id, run_id, reason))
+        _COUNCIL_TASKS.add(task)  # без сильной ссылки цикл может собрать задачу посреди работы
+        task.add_done_callback(_COUNCIL_TASKS.discard)
 
 
 def _require_admin(uid: str, cmd: str) -> str | None:
