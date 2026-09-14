@@ -666,9 +666,9 @@ def handle_log_water(params: dict) -> str:
     alerts = check_all(conn, user_id)
     record(conn, user_id, alerts)
 
-    # Get day summary for water info
-    today = _today_iso()
-    d = day_summary(conn, user_id, today)
+    # Get day summary for water info — за дату записи (at), не за сегодня
+    record_date = at[:10] if at else _today_iso()
+    d = day_summary(conn, user_id, record_date)
     water_ml = d.get("water_ml", 0)
     water_target_ml = d.get("water_target_ml", 0)
 
@@ -3777,6 +3777,13 @@ def handle_pantry(params: dict) -> str:
         return float(params["qty"])
 
     if action == "add":
+        # Валидация category, если передана
+        category = params.get("category")
+        if category is not None and category not in _PANTRY_CATEGORY_ORDER:
+            conn.close()
+            return json.dumps({
+                "error": f"Неизвестная категория '{category}'. Допустимые: {', '.join(_PANTRY_CATEGORY_ORDER)}"
+            }, ensure_ascii=False)
         try:
             qty = _qty_or_none()
         except (TypeError, ValueError):

@@ -16,10 +16,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")
 
+from health_core.config import load
 from health_core.db import connect, migrate
 from health_core.energy import daily_target
-
-_MIN_MORNING_MEASURES = 3
 
 
 def main() -> int:
@@ -40,6 +39,8 @@ def main() -> int:
         return 1
 
     today = date.today().isoformat()
+    cfg = load()
+    min_morning = cfg.get("policy", {}).get("weekly_recalc_min_morning_measures", 3)
     # При --user получатель и так один человек, префикс user_id=N: ему не нужен.
     prefix_tpl = "" if args.user is not None else "user_id={id}: "
     lines = []
@@ -49,7 +50,7 @@ def main() -> int:
             "AND time(measured_at) BETWEEN '06:00:00' AND '11:00:00'",
             (u["id"],),
         ).fetchone()["c"]
-        if n < _MIN_MORNING_MEASURES:
+        if n < min_morning:
             continue
         prefix = prefix_tpl.format(id=u["id"])
         try:

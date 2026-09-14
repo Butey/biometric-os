@@ -926,7 +926,7 @@ GUARD_DEFINITIONS = {
         "description": "Прошло от 5 до 7 дней с момента предыдущего контрольного замера.",
         "rationale": "Превентивное мягкое напоминание для поддержания ритмичного еженедельного графика мониторинга.",
         "action": "Запланировать замер на ближайшее утро.",
-        "keys": ["measure_soon_after_days"],
+        "keys": ["measure_soon_after_days", "no_measure_days"],
     },
     "BINGE_RISK": {
         "code": "BINGE_RISK",

@@ -387,7 +387,7 @@ log_anthropometry_schema = {
         "site": {
             "type": "string",
             "enum": ["талия", "грудь", "таз", "бедро", "шея", "бицепс"],
-            "description": "Место измерения. Талия/таз обязательны для расчёта Т/Б"
+            "description": "Место измерения; обязательно для action=add. Талия/таз обязательны для расчёта Т/Б"
         },
         "value_cm": {
             "type": "number",
@@ -423,16 +423,16 @@ log_med_schema = {
         },
         "drug": {
             "type": "string",
-            "description": "Название препарата"
+            "description": "Название препарата; обязательно для action=add"
         },
         "dose": {
             "type": "string",
-            "description": "Дозировка"
+            "description": "Дозировка; обязательно для action=add"
         },
         "route": {
             "type": "string",
             "enum": ["injection", "oral", "topical"],
-            "description": "Путь введения: инъекция, перорально или топически"
+            "description": "Путь введения: инъекция, перорально или топически; обязательно для action=add"
         },
         "unit": {
             "type": "string",
@@ -505,7 +505,7 @@ pharma_schema = {
             "enum": ["status", "schedule", "restock", "remove"],
             "description": "status — расписание, следующая доза и остаток («фарма»/«когда колоть»). schedule — задать/обновить препарат, дозу (её рекомендуешь ты), каденцию, следующую дозу, остаток. restock — пополнить остаток доз. remove — убрать препарат из расписания."
         },
-        "substance": {"type": "string", "description": "Название препарата (для schedule/restock/remove)"},
+        "substance": {"type": "string", "description": "Название препарата; обязательно для schedule/restock/remove"},
         "dose": {
             "type": "number",
             "description": "Разовая доза (число). Рекомендуешь ты, но schedule держит рамки лестницы титрации из карты препарата: доза — её ступень, не выше максимума, повышение только на соседнюю ступень не раньше минимального срока на ступени, а после перерыва в терапии (>14 дней без приёма) — не выше прежней дозы. Выход за рамки — только с by_doctor=true. Без карты/лестницы у препарата — без проверок."
@@ -561,7 +561,7 @@ pantry_schema = {
         "name": {"type": "string", "description": "Название продукта (для add/remove)"},
         "qty": {"type": "number", "description": "Количество или вес. Для remove без qty — списать позицию целиком."},
         "unit": {"type": "string", "description": "Единица: г, шт, мл и т.п."},
-        "category": {"type": "string", "description": "Категория: Белковые, Овощи/Фрукты, Сложные углеводы, Молочка/Сыры, Прочее."},
+        "category": {"type": "string", "enum": ["Белковые", "Молочка/Сыры", "Овощи/Фрукты", "Сложные углеводы", "Прочее"], "description": "Категория: Белковые, Молочка/Сыры, Овощи/Фрукты, Сложные углеводы, Прочее"},
         "user_id": {"type": "integer", "description": "ID пользователя"}
     },
     "required": ["action"]
