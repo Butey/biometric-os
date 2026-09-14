@@ -8,7 +8,6 @@ register(), подсунув ему ctx-шим с register_tool/register_hook/re
 """
 import json
 import threading
-from functools import lru_cache
 
 from health_core import config
 from plugin import tools as _tools
@@ -177,21 +176,26 @@ def set_caller(telegram_id: str) -> None:
     config.set_tz(_tz_of(str(telegram_id)))
 
 
-@lru_cache(maxsize=64)
 def _tz_of(telegram_id: str) -> str | None:
-    """Пояс из профиля. Кэшируем: запрос на каждое сообщение ради строки,
-    которая меняется раз в жизни, — лишний поход в базу. Переезд в другой пояс
-    подхватится после перезапуска бота, это приемлемо."""
+    """Пояс из профиля, без кэша: новый человек заполняет пояс при регистрации,
+    и закэшированный None держал бы его на времени сервера до перезапуска.
+
+    Профиля ещё нет или пояс не указан — общий дефолт из config.yaml
+    (schedule.default_timezone), тот же, что использует диспетчер напоминаний.
+    Совсем без дефолта в конфиге — на время сервера."""
     conn = _real_connect()
     try:
         row = conn.execute(
             "SELECT timezone FROM users WHERE telegram_user_id=?", (telegram_id,)
         ).fetchone()
-        return row["timezone"] if row else None
+        tz = row["timezone"] if row else None
     except Exception:
-        return None            # профиля ещё нет — работаем по времени сервера
+        tz = None               # профиля ещё нет — ниже отдадим дефолт из конфига
     finally:
         conn.close()
+    if tz:
+        return tz
+    return (config.load().get("schedule") or {}).get("default_timezone")
 
 
 def quick_macro(text: str) -> str | None:

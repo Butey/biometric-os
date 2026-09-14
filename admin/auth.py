@@ -207,6 +207,11 @@ class SessionStore:
                 "expires": time.time() + self.timeout_sec,
                 "csrf": secrets.token_urlsafe(32),
                 "authed": authed,
+                # Remembers which persona (users.id) this admin picked via the
+                # nav selector (admin/server.py::_resolve_user_id), so plain
+                # links keep working without a `?user=` on every request.
+                # None until a selection is made or a fallback is resolved.
+                "selected_user_id": None,
             }
         return token
 

@@ -684,6 +684,10 @@ register_user_schema = {
         "base_weight_date": {
             "type": "string",
             "description": "Дата базового веса YYYY-MM-DD"
+        },
+        "health_notes": {
+            "type": "string",
+            "description": "Личные ограничения по здоровью: травмы, противопоказания, диагнозы — только со слов самого человека"
         }
     },
     "required": ["height_cm", "birth_date", "sex"]

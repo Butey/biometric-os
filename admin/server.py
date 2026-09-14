@@ -56,6 +56,7 @@ PERSONA_TABLES = (
     "water_log", "glucose_log", "activity", "med_schedule", "pantry",
     "daily_targets", "alerts", "med_log", "llm_calls", "import_log",
     "refeed_days", "meal_plan", "workout_plan", "persona_styles", "plan_log",
+    "sick_days", "lab_results", "dispatch_log",
 )
 
 
@@ -90,6 +91,10 @@ def _delete_persona(conn, target_user_id: int) -> list[tuple[str, int]]:
         if exists is not None:
             cur.execute("DELETE FROM user_mode WHERE telegram_user_id=?", (str(trow[0]),))
             counts.append(("user_mode", cur.rowcount))
+        # Допуск тоже по telegram id: удалённая персона, написав снова, должна
+        # пройти одобрение заново, а не молча вернуться с прежним approved.
+        cur.execute("DELETE FROM access_list WHERE telegram_user_id=?", (str(trow[0]),))
+        counts.append(("access_list", cur.rowcount))
 
     cur.execute("DELETE FROM users WHERE id=?", (target_user_id,))
     counts.append(("users", cur.rowcount))
@@ -99,6 +104,62 @@ def _delete_persona(conn, target_user_id: int) -> list[tuple[str, int]]:
 def _get_user_id(conn) -> int | None:
     row = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
     return row["id"] if row else None
+
+
+def _user_exists(conn, user_id: int) -> bool:
+    return conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is not None
+
+
+def _resolve_user_id(conn, sess: dict, path: str) -> int | None:
+    """Selected persona for this request. Priority: ?user=<id> query param (when
+    it names a real row — remembered on the session for next time), else the id
+    already remembered on the admin's session (when it still exists), else the
+    first user in the DB (also remembered, so the fallback is sticky too).
+
+    This is the ONLY place that should decide "which user" outside of pages that
+    intentionally list every persona (personas_page, the nav selector itself) —
+    every handler gets user_id from _require_auth()'s return value, never by
+    re-querying `users` directly."""
+    query = urllib.parse.urlparse(path).query
+    raw = urllib.parse.parse_qs(query).get("user", [None])[0]
+    if raw is not None:
+        try:
+            requested = int(raw)
+        except ValueError:
+            requested = None
+        if requested is not None and _user_exists(conn, requested):
+            sess["selected_user_id"] = requested
+            return requested
+
+    remembered = sess.get("selected_user_id")
+    if remembered is not None and _user_exists(conn, remembered):
+        return remembered
+
+    fallback = _get_user_id(conn)
+    sess["selected_user_id"] = fallback
+    return fallback
+
+
+def _list_users_for_selector(conn) -> list[dict]:
+    """All personas for the nav <select>: id, telegram_user_id, and username
+    from access_list when that table exists. access_list is created by the v17
+    migration that db_migrate() already ran by the time this is called, but we
+    tolerate its absence anyway (defensive — another agent owns that schema)."""
+    rows = conn.execute("SELECT id, telegram_user_id FROM users ORDER BY id").fetchall()
+    has_access_list = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='access_list'"
+    ).fetchone() is not None
+    out = []
+    for r in rows:
+        username = None
+        if has_access_list:
+            urow = conn.execute(
+                "SELECT username FROM access_list WHERE telegram_user_id=?",
+                (str(r["telegram_user_id"]),),
+            ).fetchone()
+            username = urow["username"] if urow else None
+        out.append({"id": r["id"], "telegram_user_id": r["telegram_user_id"], "username": username})
+    return out
 
 
 def _run_action(conn, user_id: int, action: str) -> str:
@@ -454,14 +515,35 @@ class Handler(BaseHTTPRequestHandler):
         return content_type, self.rfile.read(length)
 
     def _require_auth(self):
-        """Returns (conn, user_id, token, session) or sends a redirect and returns None."""
+        """Returns (conn, user_id, token, session) or sends a redirect and returns None.
+
+        user_id comes from _resolve_user_id: ?user=<id> when present and valid,
+        else the session's remembered pick, else the first user — see there.
+        Also stashes the persona list + selection on the handler instance for
+        self._layout() to render the nav selector, without every call site
+        needing to thread that through."""
         token, sess = self._session()
         if sess is None or not sess.get("authed"):
             self._redirect("/login")
             return None
         conn = connect()
         db_migrate(conn)
-        return conn, _get_user_id(conn), token, sess
+        user_id = _resolve_user_id(conn, sess, self.path)
+        self._nav_user_id = user_id
+        self._nav_users = _list_users_for_selector(conn)
+        return conn, user_id, token, sess
+
+    def _layout(self, title: str, body: str, csrf_token: str, active: str | None = None) -> str:
+        """Thin wrapper over pages.layout() that adds the nav's user selector,
+        using the persona list _require_auth() stashed on this request. Use this
+        instead of calling pages.layout() directly in any handler reached via
+        _require_auth (i.e. everywhere except /login)."""
+        return pages.layout(
+            title, body, csrf_token, active=active,
+            users=getattr(self, "_nav_users", None),
+            selected_user_id=getattr(self, "_nav_user_id", None),
+            current_path=self.path,
+        )
 
     def log_message(self, fmt, *args):  # keep default stderr logging (systemd journal captures it)
         super().log_message(fmt, *args)
@@ -585,7 +667,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if user_id is None:
                 body = pages.no_user_page()
-                return self._html(200, pages.layout("Дашборд", body, sess["csrf"], active="dashboard"))
+                return self._html(200, self._layout("Дашборд", body, sess["csrf"], active="dashboard"))
             today = user_today(conn, user_id)
             alerts = check_all(conn, user_id)
             tr = trends(conn, user_id, 90)
@@ -619,7 +701,7 @@ class Handler(BaseHTTPRequestHandler):
             guards_status = get_guards_status(conn, user_id)
             body = pages.dashboard_page(alerts, tr, latest, target, history, day, meals,
                                         base_weight, day_delta, sess["csrf"], guards_status=guards_status)
-            self._html(200, pages.layout("Дашборд", body, sess["csrf"], active="dashboard"))
+            self._html(200, self._layout("Дашборд", body, sess["csrf"], active="dashboard"))
         finally:
             conn.close()
 
@@ -640,9 +722,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if user_id is None:
                 body = pages.no_user_page()
-                return self._html(200, pages.layout("Гардрейлы", body, sess["csrf"], active="guards"))
+                return self._html(200, self._layout("Гардрейлы", body, sess["csrf"], active="guards"))
             body = self._guards_body(conn, user_id, sess)
-            self._html(200, pages.layout("Гардрейлы", body, sess["csrf"], active="guards"))
+            self._html(200, self._layout("Гардрейлы", body, sess["csrf"], active="guards"))
         finally:
             conn.close()
 
@@ -686,7 +768,7 @@ class Handler(BaseHTTPRequestHandler):
                 error_msg = message
                 message = None
             body = self._guards_body(conn, user_id, sess, message=message, error=error_msg)
-            self._html(200, pages.layout("Гардрейлы", body, sess["csrf"], active="guards"))
+            self._html(200, self._layout("Гардрейлы", body, sess["csrf"], active="guards"))
         finally:
             conn.close()
 
@@ -706,7 +788,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             rows = self._milestone_rows(conn, user_id) if user_id is not None else []
             body = pages.milestones_page(rows, _VALID_MILESTONE_METRICS, sess["csrf"])
-            self._html(200, pages.layout("Вехи", body, sess["csrf"], active="milestones"))
+            self._html(200, self._layout("Вехи", body, sess["csrf"], active="milestones"))
         finally:
             conn.close()
 
@@ -760,7 +842,7 @@ class Handler(BaseHTTPRequestHandler):
             if error:
                 rows = self._milestone_rows(conn, user_id)
                 body = pages.milestones_page(rows, _VALID_MILESTONE_METRICS, sess["csrf"], error=error)
-                return self._html(200, pages.layout("Вехи", body, sess["csrf"], active="milestones"))
+                return self._html(200, self._layout("Вехи", body, sess["csrf"], active="milestones"))
             self._redirect("/milestones")
         finally:
             conn.close()
@@ -780,7 +862,7 @@ class Handler(BaseHTTPRequestHandler):
         conn, user_id, token, sess = ctx
         conn.close()  # not needed for this page; config.yaml lives outside sqlite
         body = self._thresholds_body(sess)
-        self._html(200, pages.layout("Пороги", body, sess["csrf"], active="thresholds"))
+        self._html(200, self._layout("Пороги", body, sess["csrf"], active="thresholds"))
 
     def _post_thresholds(self):
         ctx = self._require_auth()
@@ -816,7 +898,7 @@ class Handler(BaseHTTPRequestHandler):
         if had_error:
             message = "Ошибка. " + message
         body = self._thresholds_body(sess, message=message)
-        self._html(200, pages.layout("Пороги", body, sess["csrf"], active="thresholds"))
+        self._html(200, self._layout("Пороги", body, sess["csrf"], active="thresholds"))
 
     # ---------------------------------------------------------------- keys & models
 
@@ -832,7 +914,7 @@ class Handler(BaseHTTPRequestHandler):
             providers, keys_dict, providers_yaml, sess["csrf"],
             message=message, error=error, test_results=test_results,
         )
-        return pages.layout("Ключи и Модели", body, sess["csrf"], active="keys")
+        return self._layout("Ключи и Модели", body, sess["csrf"], active="keys")
 
     def _get_keys(self):
         ctx = self._require_auth()
@@ -980,7 +1062,7 @@ class Handler(BaseHTTPRequestHandler):
                     (user_id, (page - 1) * 50),
                 ).fetchall()
             body = pages.alerts_page(rows, page, total, sess["csrf"])
-            self._html(200, pages.layout("Алерты", body, sess["csrf"], active="alerts"))
+            self._html(200, self._layout("Алерты", body, sess["csrf"], active="alerts"))
         finally:
             conn.close()
 
@@ -1050,7 +1132,7 @@ class Handler(BaseHTTPRequestHandler):
 
             body = pages.plans_page(today_plans, all_dates, selected_date, selected_plan,
                                    weekly_template, sess["csrf"])
-            self._html(200, pages.layout("Планы", body, sess["csrf"], active="plans"))
+            self._html(200, self._layout("Планы", body, sess["csrf"], active="plans"))
         finally:
             conn.close()
 
@@ -1223,7 +1305,7 @@ class Handler(BaseHTTPRequestHandler):
                 sports_efficiency = eff.get("sports", {})
 
             body = pages.workouts_page(rows, stats, sports_efficiency, sess["csrf"], error, message)
-            self._html(200, pages.layout("Тренировки", body, sess["csrf"], active="workouts"))
+            self._html(200, self._layout("Тренировки", body, sess["csrf"], active="workouts"))
         finally:
             conn.close()
 
@@ -1347,7 +1429,7 @@ class Handler(BaseHTTPRequestHandler):
 
             body = pages.forecast_page(result, actual, horizon, intake,
                                        reach_result, target, sess["csrf"])
-            self._html(200, pages.layout("Прогноз", body, sess["csrf"], active="forecast"))
+            self._html(200, self._layout("Прогноз", body, sess["csrf"], active="forecast"))
         finally:
             conn.close()
 
@@ -1384,7 +1466,7 @@ class Handler(BaseHTTPRequestHandler):
         conn, _user_id, _token, sess = ctx
         try:
             body = pages.personas_page(self._persona_rows(conn), sess["csrf"])
-            self._html(200, pages.layout("Персоны", body, sess["csrf"], active="personas"))
+            self._html(200, self._layout("Персоны", body, sess["csrf"], active="personas"))
         finally:
             conn.close()
 
@@ -1418,7 +1500,7 @@ class Handler(BaseHTTPRequestHandler):
                     error=(f"Подтверждение не совпало: введите ровно {row['telegram_user_id']}. "
                            f"Ничего не удалено."),
                 )
-                return self._html(400, pages.layout("Персоны", body, sess["csrf"], active="personas"))
+                return self._html(400, self._layout("Персоны", body, sess["csrf"], active="personas"))
 
             try:
                 summary = _delete_persona(conn, target_id)
@@ -1431,13 +1513,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._persona_rows(conn), sess["csrf"],
                     error="Удаление не выполнено, изменения откачены. Подробности в логах сервера.",
                 )
-                return self._html(500, pages.layout("Персоны", body, sess["csrf"], active="personas"))
+                return self._html(500, self._layout("Персоны", body, sess["csrf"], active="personas"))
 
             body = pages.personas_page(
                 self._persona_rows(conn), sess["csrf"],
                 summary=[(t, n) for t, n in summary if n],
             )
-            self._html(200, pages.layout("Персоны", body, sess["csrf"], active="personas"))
+            self._html(200, self._layout("Персоны", body, sess["csrf"], active="personas"))
         finally:
             conn.close()
 
@@ -1448,7 +1530,7 @@ class Handler(BaseHTTPRequestHandler):
         conn, user_id, token, sess = ctx
         conn.close()
         body = pages.actions_page(sess["csrf"])
-        self._html(200, pages.layout("Действия", body, sess["csrf"], active="actions"))
+        self._html(200, self._layout("Действия", body, sess["csrf"], active="actions"))
 
     def _post_actions(self):
         ctx = self._require_auth()
@@ -1463,7 +1545,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error_page(400, "Нет пользователя в базе.")
             result = _run_action(conn, user_id, form.get("action", ""))
             body = pages.actions_page(sess["csrf"], result=result)
-            self._html(200, pages.layout("Действия", body, sess["csrf"], active="actions"))
+            self._html(200, self._layout("Действия", body, sess["csrf"], active="actions"))
         finally:
             conn.close()
 
@@ -1476,7 +1558,7 @@ class Handler(BaseHTTPRequestHandler):
             read = self._read_multipart()
             if read is None:
                 body = pages.actions_page(sess["csrf"], result="Запрос повреждён или файл превышает потолок размера.")
-                return self._html(400, pages.layout("Действия", body, sess["csrf"], active="actions"))
+                return self._html(400, self._layout("Действия", body, sess["csrf"], active="actions"))
             content_type, raw_body = read
             fields = upload.parse_multipart(content_type, raw_body)
 
@@ -1486,18 +1568,18 @@ class Handler(BaseHTTPRequestHandler):
 
             if user_id is None:
                 body = pages.actions_page(sess["csrf"], result="Нет пользователя в базе.")
-                return self._html(400, pages.layout("Действия", body, sess["csrf"], active="actions"))
+                return self._html(400, self._layout("Действия", body, sess["csrf"], active="actions"))
 
             file_field = fields.get("file")
             if not isinstance(file_field, tuple) or not file_field[0]:
                 body = pages.actions_page(sess["csrf"], result="Файл не выбран.")
-                return self._html(400, pages.layout("Действия", body, sess["csrf"], active="actions"))
+                return self._html(400, self._layout("Действия", body, sess["csrf"], active="actions"))
             filename, data = file_field
 
             ok, message = _import_scale_upload(conn, user_id, filename, data)
             status = 200 if ok else 400
             body = pages.actions_page(sess["csrf"], result=message)
-            self._html(status, pages.layout("Действия", body, sess["csrf"], active="actions"))
+            self._html(status, self._layout("Действия", body, sess["csrf"], active="actions"))
         finally:
             conn.close()
 
@@ -1527,7 +1609,7 @@ class Handler(BaseHTTPRequestHandler):
         conn, _user_id, _token, sess = ctx
         conn.close()  # не нужен для этой страницы — Knowledge/ живёт на диске, не в sqlite
         body = pages.knowledge_page(self._knowledge_rows(), sess["csrf"])
-        self._html(200, pages.layout("Знания", body, sess["csrf"], active="knowledge"))
+        self._html(200, self._layout("Знания", body, sess["csrf"], active="knowledge"))
 
     def _post_knowledge_upload(self):
         ctx = self._require_auth()
@@ -1542,7 +1624,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._knowledge_rows(), sess["csrf"],
                 error="Запрос повреждён или файл превышает потолок размера.",
             )
-            return self._html(400, pages.layout("Знания", body, sess["csrf"], active="knowledge"))
+            return self._html(400, self._layout("Знания", body, sess["csrf"], active="knowledge"))
         content_type, raw_body = read
         fields = upload.parse_multipart(content_type, raw_body)
 
@@ -1553,7 +1635,7 @@ class Handler(BaseHTTPRequestHandler):
         file_field = fields.get("file")
         if not isinstance(file_field, tuple) or not file_field[0]:
             body = pages.knowledge_page(self._knowledge_rows(), sess["csrf"], error="Файл не выбран.")
-            return self._html(400, pages.layout("Знания", body, sess["csrf"], active="knowledge"))
+            return self._html(400, self._layout("Знания", body, sess["csrf"], active="knowledge"))
         filename, data = file_field
         overwrite = fields.get("overwrite") == "on"
 
@@ -1563,7 +1645,7 @@ class Handler(BaseHTTPRequestHandler):
             self._knowledge_rows(), sess["csrf"],
             error=None if ok else message, message=message if ok else None,
         )
-        self._html(status, pages.layout("Знания", body, sess["csrf"], active="knowledge"))
+        self._html(status, self._layout("Знания", body, sess["csrf"], active="knowledge"))
 
     def _post_knowledge_delete(self):
         ctx = self._require_auth()
@@ -1582,7 +1664,7 @@ class Handler(BaseHTTPRequestHandler):
         target = upload.safe_knowledge_path(KNOWLEDGE_DIR, form.get("name", ""))
         if target is None or not target.is_file():
             body = pages.knowledge_page(self._knowledge_rows(), sess["csrf"], error="Файл не найден.")
-            return self._html(404, pages.layout("Знания", body, sess["csrf"], active="knowledge"))
+            return self._html(404, self._layout("Знания", body, sess["csrf"], active="knowledge"))
 
         target.unlink()
         self._redirect("/knowledge")

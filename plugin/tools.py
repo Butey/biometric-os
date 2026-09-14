@@ -3546,6 +3546,8 @@ _HELP_ADMIN = """🛠 **Админ**
 
 `admin_cmd`: mode · status · guards · targets · set <ключ> <значение> · milestone add/del · milestones · recalc [дата] · export · backup · alerts [N]
 
+Доступ (в телеграме): /approve <tg_id> · /deny <tg_id> · /revoke <tg_id> · /access — заявки и допущенные
+
 Вход — «mode admin» (только allowlist), выход — «mode user»."""
 
 
@@ -3598,6 +3600,7 @@ def handle_register_user(params: dict) -> str:
     timezone = params.get("timezone")
     base_weight_kg = params.get("base_weight_kg")
     base_weight_date = params.get("base_weight_date")
+    health_notes = params.get("health_notes")
 
     # Профиль без роста, даты рождения и пола бесполезен: BMR по Mifflin считается
     # именно по ним, а без BMR нет ни пола цели, ни гардрейла BMR_FLOOR. Запись,
@@ -3627,17 +3630,18 @@ def handle_register_user(params: dict) -> str:
     cur = conn.execute(
         "UPDATE users SET height_cm=COALESCE(?,height_cm), birth_date=COALESCE(?,birth_date), "
         "sex=COALESCE(?,sex), timezone=COALESCE(?,timezone), "
-        "base_weight_kg=COALESCE(?,base_weight_kg), base_weight_date=COALESCE(?,base_weight_date) "
+        "base_weight_kg=COALESCE(?,base_weight_kg), base_weight_date=COALESCE(?,base_weight_date), "
+        "health_notes=COALESCE(?,health_notes) "
         "WHERE telegram_user_id=?",
-        (height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, telegram_user_id),
+        (height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes, telegram_user_id),
     )
     created = cur.rowcount == 0
 
     if created:
         cur = conn.execute(
-            "INSERT INTO users(telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, _now_iso()),
+            "INSERT INTO users(telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, base_weight_date, health_notes, _now_iso()),
         )
         err = _zero_write_error(cur, "register_user: INSERT had no effect")
         if err:
@@ -4051,18 +4055,24 @@ def _admin_set(key: str, value: str) -> str:
 
 def _admin_milestone_add(name: str, metric: str, threshold: str, deadline: str = None) -> str:
     """Add or update milestone using existing set_milestone."""
+    conn = None
     try:
         threshold_val = float(threshold)
+        conn = connect()
+        user_id = _get_user_id({}, conn=conn)
         params = {
-            "user_id": 1,  # Admin-level command, use dummy user
+            "user_id": user_id,
             "name": name,
             "metric": metric,
             "threshold": threshold_val,
         }
         if deadline:
             params["deadline"] = deadline
+        conn.close()
         return handle_set_milestone(params)
     except Exception as e:
+        if conn:
+            conn.close()
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
@@ -4071,7 +4081,8 @@ def _admin_milestone_del(name: str) -> str:
     conn = None
     try:
         conn = connect()
-        conn.execute("DELETE FROM milestones WHERE name=?", (name,))
+        user_id = _get_user_id({}, conn=conn)
+        conn.execute("DELETE FROM milestones WHERE user_id=? AND name=?", (user_id, name))
         conn.commit()
         count = conn.total_changes
 
@@ -4090,8 +4101,10 @@ def _admin_milestones() -> str:
     conn = None
     try:
         conn = connect()
+        user_id = _get_user_id({}, conn=conn)
         rows = conn.execute(
-            "SELECT name, metric, threshold, deadline, achieved_at FROM milestones ORDER BY name"
+            "SELECT name, metric, threshold, deadline, achieved_at FROM milestones WHERE user_id=? ORDER BY name",
+            (user_id,)
         ).fetchall()
 
         if not rows:
@@ -4123,14 +4136,10 @@ def _admin_recalc(recalc_date: str = None) -> str:
         conn = connect()
         date_str = recalc_date or _today_iso()
 
-        # Find a user (just take the first one for admin-level command)
-        user = conn.execute("SELECT id FROM users LIMIT 1").fetchone()
-        if not user:
-            return json.dumps({"text": "No users in database"}, ensure_ascii=False)
-
-        uid = user["id"]
+        # Resolve caller's user id
+        user_id = _get_user_id({}, conn=conn)
         # Recalculate calls the energy module which updates daily_targets
-        result = daily_target(conn, uid, date_str)
+        result = daily_target(conn, user_id, date_str)
         conn.commit()
 
         return json.dumps({"text": f"Recalculated targets for {date_str}: {result}"}, ensure_ascii=False)
@@ -4143,12 +4152,22 @@ def _admin_recalc(recalc_date: str = None) -> str:
 
 def _admin_export() -> str:
     """Run export_all."""
+    conn = None
     try:
+        import os
         from health_core.export import export_all
-        result = export_all()
+        from health_core.db import DB_PATH
+
+        conn = connect()
+        user_id = _get_user_id({}, conn=conn)
+        out_dir = os.environ.get("HEALTH_EXPORT_DIR", str(DB_PATH.parent / "export"))
+        result = export_all(conn, user_id, out_dir)
         return json.dumps({"text": f"Export complete: {result}"}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+    finally:
+        if conn:
+            conn.close()
 
 
 def _admin_backup() -> str:
@@ -4166,9 +4185,10 @@ def _admin_alerts(n: int = 10) -> str:
     conn = None
     try:
         conn = connect()
+        user_id = _get_user_id({}, conn=conn)
         rows = conn.execute(
-            "SELECT created_at, alert_type, message FROM alerts ORDER BY created_at DESC LIMIT ?",
-            (n,)
+            "SELECT created_at, rule, message FROM alerts WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+            (user_id, n)
         ).fetchall()
 
         if not rows:
@@ -4176,7 +4196,7 @@ def _admin_alerts(n: int = 10) -> str:
 
         text = f"Last {min(n, len(rows))} alerts:\n"
         for r in rows:
-            text += f"  {r['created_at']} {r['alert_type']}: {r['message']}\n"
+            text += f"  {r['created_at']} {r['rule']}: {r['message']}\n"
 
         return json.dumps({"text": text}, ensure_ascii=False)
     except Exception as e:
@@ -4302,7 +4322,7 @@ def cmd_users(raw_args: str) -> str:
 _WIPE_TABLES = (
     "food_log", "water_log", "glucose_log", "body_metrics", "anthropometry",
     "activity", "med_log", "alerts", "daily_targets", "import_log",
-    "llm_calls", "refeed_days",
+    "llm_calls", "refeed_days", "sick_days", "lab_results", "plan_log",
 )
 _WIPE_CONFIRM = "УДАЛИТЬ"
 
@@ -6386,6 +6406,89 @@ if __name__ == "__main__":
         assert "hr_zones" in result, f"log_workout with avg_hr should return hr_zones dict, got {result}"
         hr_zone_value = result.get("hr_zone")
         print(f"OK: log_workout returns hr_zone={hr_zone_value}, hr_zones={result.get('hr_zones')}")
+
+        print("="*60)
+        print("TEST 35: Multi-user isolation — milestone/register_user/health_notes")
+        print("="*60)
+
+        # Create two users
+        conn.execute(
+            "INSERT INTO users(telegram_user_id, height_cm, birth_date, sex, created_at) "
+            "VALUES (2, 170, '1990-01-01', 'f', '2026-08-20 00:00:00')"
+        )
+        user_a_id = uid  # user with telegram_user_id=1
+        user_b_row = conn.execute(
+            "SELECT id FROM users WHERE telegram_user_id=2"
+        ).fetchone()
+        user_b_id = user_b_row["id"]
+        conn.commit()
+
+        # Test milestone isolation via direct handle_set_milestone (not admin_cmd)
+        import plugin.tools as tools_module
+        tools_module._CALLER_FALLBACK.set("1")  # Set caller to user A
+        try:
+            # Add milestone directly via handle_set_milestone for user A
+            result_json = ctx.tools["set_milestone"]["handler"]({
+                "user_id": user_a_id,
+                "name": "vega",
+                "metric": "weight_kg",
+                "threshold": 75
+            })
+            result = json.loads(result_json)
+            assert "id" in result, f"set_milestone should return milestone object with id, got {result}"
+
+            # Verify A's milestone is in DB
+            a_milestones = conn.execute(
+                "SELECT name FROM milestones WHERE user_id=?",
+                (user_a_id,)
+            ).fetchall()
+            assert any(m["name"] == "vega" for m in a_milestones), "Milestone should be created for user A"
+
+            # Verify B has no milestone
+            b_milestones = conn.execute(
+                "SELECT name FROM milestones WHERE user_id=?",
+                (user_b_id,)
+            ).fetchall()
+            assert not any(m["name"] == "vega" for m in b_milestones), "User B should not have A's milestone"
+
+            print("OK: Milestones isolated per user")
+
+            # Test health_notes via register_user
+            tools_module._CALLER_FALLBACK.set("1")  # User A
+            result_json = ctx.tools["register_user"]["handler"]({
+                "height_cm": 185,
+                "birth_date": "1992-08-09",
+                "sex": "m",
+                "health_notes": "Восстановление после травмы колена"
+            })
+            result = json.loads(result_json)
+            assert result.get("user_id") == user_a_id, f"Should be registered as user A, got {result}"
+
+            # Verify health_notes persists
+            a_notes = conn.execute(
+                "SELECT health_notes FROM users WHERE id=?",
+                (user_a_id,)
+            ).fetchone()["health_notes"]
+            assert a_notes == "Восстановление после травмы колена", f"health_notes should persist, got {a_notes}"
+
+            # Re-register without health_notes — should preserve old value (COALESCE)
+            result_json = ctx.tools["register_user"]["handler"]({
+                "height_cm": 185,
+                "birth_date": "1992-08-09",
+                "sex": "m"
+            })
+            result = json.loads(result_json)
+            a_notes_after = conn.execute(
+                "SELECT health_notes FROM users WHERE id=?",
+                (user_a_id,)
+            ).fetchone()["health_notes"]
+            assert a_notes_after == "Восстановление после травмы колена", \
+                f"COALESCE should preserve health_notes when not provided, got {a_notes_after}"
+
+            print("OK: health_notes stored and preserved with COALESCE")
+
+        finally:
+            tools_module._CALLER_FALLBACK.set(None)
 
         print("="*60)
         print("ALL TESTS PASSED")

@@ -22,15 +22,27 @@ def _is_admin() -> bool:
     return _tools._get_mode(_tools._caller_telegram_id() or "") == "admin"
 
 
+def _personal_dir() -> Path | None:
+    """Knowledge/personal/<telegram id>/ — личные документы звонящего (его
+    протокол, вехи, заметки). Видны только ему; общий индекс их не содержит."""
+    tg = _tools._caller_telegram_id()
+    return KNOWLEDGE_DIR / "personal" / tg if tg and str(tg).isdigit() else None
+
+
+def _dirs() -> list[Path]:
+    personal = _personal_dir()
+    return [d for d in (personal, KNOWLEDGE_DIR) if d is not None and d.is_dir()]
+
+
 def _topics() -> list[Path]:
-    """Файлы Knowledge/*.md и *.txt, по одному на тему (.md приоритетнее при
-    совпадении имени), отсортированы по имени темы для стабильного вывода."""
-    if not KNOWLEDGE_DIR.is_dir():
-        return []
+    """Файлы Knowledge/*.md и *.txt плюс личные файлы звонящего, по одному на
+    тему (личный файл и .md приоритетнее при совпадении имени), отсортированы по
+    имени темы для стабильного вывода."""
     by_stem: dict[str, Path] = {}
-    for ext in _EXTS:
-        for p in KNOWLEDGE_DIR.glob(f"*{ext}"):
-            by_stem.setdefault(p.stem, p)
+    for d in _dirs():
+        for ext in _EXTS:
+            for p in d.glob(f"*{ext}"):
+                by_stem.setdefault(p.stem, p)
     admin = _is_admin()
     return [p for stem, p in sorted(by_stem.items()) if admin or stem != _ADMIN_ONLY]
 
@@ -94,15 +106,14 @@ def _resolve(topic: str) -> Path | None:
     """Путь собирается от KNOWLEDGE_DIR + расширение; topic приходит от модели —
     граница доверия, поэтому итог обязан лежать ВНУТРИ каталога (resolve +
     сравнение), иначе "../../.env" утечёт файлом."""
-    base = KNOWLEDGE_DIR.resolve()
-    for ext in _EXTS:
-        candidate = (KNOWLEDGE_DIR / f"{topic}{ext}").resolve()
-        try:
-            candidate.relative_to(base)
-        except ValueError:
-            continue
-        if candidate.is_file():
-            return candidate
+    # Файл обязан лежать ПРЯМО в своём каталоге, а не где-то внутри: иначе
+    # topic "personal/<чужой id>/protocol" прочитал бы чужие личные документы.
+    for d in _dirs():
+        base = d.resolve()
+        for ext in _EXTS:
+            candidate = (d / f"{topic}{ext}").resolve()
+            if candidate.parent == base and candidate.is_file():
+                return candidate
     return None
 
 

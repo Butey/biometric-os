@@ -75,7 +75,7 @@ def test_system_prompt_has_knowledge_index():
 
 
 def test_dispatch_routes_knowledge():
-    out = main.dispatch("knowledge", {"topic": "protocol_v1"})
+    out = main.dispatch("knowledge", {"topic": "клетчатка"})
     assert isinstance(out, str) and out.strip(), "knowledge вернул пустоту"
     assert "log_food" not in out[:50]
 
@@ -183,6 +183,48 @@ def test_allowlist():
     os.environ["TELEGRAM_ALLOWED_USERS"] = ""
     assert main.allowed_users() == set(), "пустая переменная обязана закрывать доступ всем"
     os.environ["TELEGRAM_ALLOWED_USERS"] = "111,222"
+
+
+def test_access_approval_flow():
+    admin = next(iter(main.admin_user_ids()))
+    assert main._check_access("900001", None) == "new_pending"
+    assert main._check_access("900001", None) == "pending", "повторное сообщение не должно заново слать заявку"
+    assert "только администраторам" in main._cmd_approve("900001", "900001"), "не-админ одобрил сам себя"
+    main._PENDING_USER_NOTIFICATIONS.clear()
+    main._cmd_approve(admin, "900001")
+    assert main._check_access("900001", None) == "approved"
+    assert main._PENDING_USER_NOTIFICATIONS[0][0] == "900001", "одобренному не ушло уведомление"
+    main._PENDING_USER_NOTIFICATIONS.clear()
+    conn = connect()
+    try:
+        assert conn.execute("SELECT 1 FROM users WHERE telegram_user_id='900001'").fetchone(), \
+            "одобрение не создало строку users — первый вызов инструмента упадёт"
+    finally:
+        conn.close()
+    assert "Нельзя" in main._cmd_revoke(admin, admin), "админ отозвал сам себя"
+    main._cmd_revoke(admin, "900001")
+    assert main._check_access("900001", None) == "denied"
+
+
+def test_personal_knowledge_isolated():
+    kdir = Path(_TMP) / "Knowledge"
+    (kdir / "personal" / "900002").mkdir(parents=True)
+    (kdir / "общее.md").write_text("общий текст для всех", encoding="utf-8")
+    (kdir / "personal" / "900002" / "мой_протокол.md").write_text("личный протокол", encoding="utf-8")
+    old = knowledge.KNOWLEDGE_DIR
+    knowledge.KNOWLEDGE_DIR = kdir
+    try:
+        registry.set_caller("900002")
+        assert "мой_протокол" in knowledge.index() and "общее" in knowledge.index()
+        assert knowledge.read("мой_протокол") == "личный протокол"
+        registry.set_caller("900003")
+        assert "мой_протокол" not in knowledge.index(), "чужой личный документ в индексе"
+        assert "не найдена" in knowledge.read("мой_протокол")
+        assert "не найдена" in knowledge.read("personal/900002/мой_протокол"), "обход пути к чужим документам"
+        assert "не найдена" in knowledge.read("../Knowledge/personal/900002/мой_протокол")
+    finally:
+        knowledge.KNOWLEDGE_DIR = old
+        registry.set_caller("111")
 
 
 def test_slash_commands_run_without_model():
@@ -309,7 +351,6 @@ def test_caller_sets_timezone():
 
     config.set_tz(None)
     server = config.local_now()
-    registry._tz_of.cache_clear()
     registry.set_caller("778")
     tokyo = config.local_now()
     assert abs((tokyo - server).total_seconds()) > 3000, (

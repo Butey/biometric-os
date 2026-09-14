@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS users (
     timezone TEXT,
     base_weight_kg REAL,
     base_weight_date TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    health_notes TEXT
 );
 
 CREATE TABLE IF NOT EXISTS user_targets (
@@ -351,6 +352,17 @@ CREATE TABLE IF NOT EXISTS dispatch_log (
     UNIQUE(user_id, slot_key)
 );
 
+-- v17: допуск к боту. Один администратор (config.yaml admin.telegram_admin_ids)
+-- одобряет людей командой; незнакомый telegram id пишет — появляется pending.
+-- Строка users создаётся при одобрении, не раньше: до одобрения человека нет.
+CREATE TABLE IF NOT EXISTS access_list (
+    telegram_user_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'denied')),
+    username TEXT,
+    requested_at TEXT,
+    decided_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS lab_results (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id),
@@ -442,6 +454,13 @@ def _migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
     merge_duplicate_schedules(conn)
 
 
+def _migrate_v16_to_v17(conn: sqlite3.Connection) -> None:
+    """v16->v17: users.health_notes — личные ограничения по здоровью (травмы,
+    противопоказания) для промпта именно этого человека. Раньше жили в общем
+    системном промпте с пометкой user_id=1 и применялись ко всем."""
+    _add_column(conn, "users", "health_notes", "TEXT")
+
+
 def _migrate_v13_to_v14(conn: sqlite3.Connection) -> None:
     """v13->v14: добавляет notes и source в activity, делает file_hash необязательным (для ручных записей)."""
     _add_column(conn, "activity", "notes", "TEXT")
@@ -475,6 +494,9 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v13_to_v14(conn)
         # v14->v15 — только новые таблицы lab_results и sick_days, отдельного шага не нужно.
         # v15->v16 — только новая таблица dispatch_log.
+        # v16->v17 — новая таблица access_list (DDL выше) и колонка users.health_notes.
+        if row["version"] < 17:
+            _migrate_v16_to_v17(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 

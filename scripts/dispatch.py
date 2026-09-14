@@ -80,9 +80,13 @@ def main() -> int:
     conn = connect()
     migrate(conn)
     conn.execute("DELETE FROM dispatch_log WHERE sent_at < datetime('now', '-30 day')")
+    # Отозванным (access_list.status='denied') не пишем: строка users после
+    # /revoke остаётся — данные человека не удаляются, а напоминания должны.
     users = conn.execute(
-        "SELECT id, telegram_user_id, timezone FROM users "
-        "WHERE telegram_user_id IS NOT NULL AND telegram_user_id != ''"
+        "SELECT id, telegram_user_id, timezone FROM users u "
+        "WHERE telegram_user_id IS NOT NULL AND telegram_user_id != '' "
+        "AND NOT EXISTS (SELECT 1 FROM access_list a "
+        "WHERE a.telegram_user_id = CAST(u.telegram_user_id AS TEXT) AND a.status != 'approved')"
     ).fetchall()
 
     had_error = False

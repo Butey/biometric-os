@@ -106,10 +106,68 @@ def dispatch(name: str, args: dict) -> str:
 
 
 def allowed_users() -> set[str]:
-    """Пусто = не пускаем никого. Fail closed: пустая переменная означает
-    незаконченную настройку, а не «открыто всем»."""
+    """TELEGRAM_ALLOWED_USERS — разовый бутстрап со старой (однопользовательской)
+    схемы, не источник правды. На старте _bootstrap_env_allowlist заводит этим id
+    approved-строку в access_list, и дальше доступ живёт там; переменную можно
+    не заполнять вовсе."""
     raw = os.environ.get("TELEGRAM_ALLOWED_USERS", "")
     return {p.strip() for p in raw.replace(";", ",").split(",") if p.strip()}
+
+
+def _now_iso() -> str:
+    return config.local_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _bootstrap_env_allowlist(conn) -> None:
+    """Разовая миграция: каждому id из TELEGRAM_ALLOWED_USERS заводим approved-
+    строку в access_list, если её ещё нет — так существующие до этой правки
+    пользователи не теряют доступ. Идемпотентно: повторный запуск ничего не
+    портит, строка заводится только при её полном отсутствии."""
+    now = _now_iso()
+    for uid in allowed_users():
+        row = conn.execute(
+            "SELECT 1 FROM access_list WHERE telegram_user_id=?", (uid,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO access_list(telegram_user_id, status, requested_at, decided_at) "
+                "VALUES (?, 'approved', ?, ?)",
+                (uid, now, now),
+            )
+    conn.commit()
+
+
+def _display_name(from_user) -> str:
+    if from_user and from_user.username:
+        return f"@{from_user.username}"
+    if from_user and from_user.full_name:
+        return from_user.full_name
+    return str(from_user.id) if from_user else "?"
+
+
+def _check_access(uid: str, from_user) -> str:
+    """Синхронный, для asyncio.to_thread. Возвращает статус ('approved',
+    'pending', 'denied') или 'new_pending', когда строки ещё не было и мы её
+    только что завели этим сообщением — отдельное значение нужно, чтобы
+    вызывающий код отправил заявку администратору и ответ человеку РОВНО
+    один раз, а не при каждом следующем сообщении того же pending-человека."""
+    conn = connect()
+    try:
+        migrate(conn)
+        row = conn.execute(
+            "SELECT status FROM access_list WHERE telegram_user_id=?", (uid,)
+        ).fetchone()
+        if row is not None:
+            return row["status"]
+        conn.execute(
+            "INSERT INTO access_list(telegram_user_id, status, username, requested_at) "
+            "VALUES (?, 'pending', ?, ?)",
+            (uid, _display_name(from_user), _now_iso()),
+        )
+        conn.commit()
+        return "new_pending"
+    finally:
+        conn.close()
 
 
 def _chunks(text: str, limit: int) -> list[str]:
@@ -246,6 +304,158 @@ def switch_model_cmd(args: str) -> str:
     )
 
 
+async def _notify_admins_of_request(bot: Bot, uid: str, from_user) -> None:
+    text = (
+        f"🆕 Заявка на доступ: tg {uid} {_display_name(from_user)}. "
+        f"Одобрить: /approve {uid} · Отклонить: /deny {uid}"
+    )
+    for admin_id in admin_user_ids():
+        try:
+            await bot.send_message(int(admin_id), text)
+        except Exception:
+            log.exception("не удалось уведомить администратора %s о заявке %s", admin_id, uid)
+
+
+# run_command исполняется в потоке (asyncio.to_thread) и не видит объект Bot,
+# а /approve обязан не только ответить админу, но и написать одобренному
+# человеку. Вместо протаскивания Bot через сигнатуру run_command (её же зовут
+# тесты напрямую, синхронно) — очередь уведомлений, которую _handle_turn
+# опустошает сразу после run_command, там, где Bot уже под рукой.
+_PENDING_USER_NOTIFICATIONS: list[tuple[str, str]] = []
+
+
+async def _flush_pending_notifications(bot: Bot) -> None:
+    while _PENDING_USER_NOTIFICATIONS:
+        target, text = _PENDING_USER_NOTIFICATIONS.pop(0)
+        try:
+            await bot.send_message(int(target), text)
+        except Exception:
+            log.exception("не удалось уведомить пользователя %s", target)
+
+
+def _require_admin(uid: str, cmd: str) -> str | None:
+    if uid not in admin_user_ids():
+        return f"⚠ Команда /{cmd} доступна только администраторам."
+    return None
+
+
+def _parse_tg_id(args: str, cmd: str) -> tuple[str | None, str | None]:
+    tg_id = args.strip()
+    if not tg_id.isdigit():
+        return None, f"Использование: /{cmd} <tg_id>"
+    return tg_id, None
+
+
+def _access_upsert_status(conn, tg_id: str, status: str) -> None:
+    now = _now_iso()
+    cur = conn.execute(
+        "UPDATE access_list SET status=?, decided_at=? WHERE telegram_user_id=?",
+        (status, now, tg_id),
+    )
+    if cur.rowcount == 0:
+        conn.execute(
+            "INSERT INTO access_list(telegram_user_id, status, requested_at, decided_at) "
+            "VALUES (?, ?, ?, ?)",
+            (tg_id, status, now, now),
+        )
+    conn.commit()
+
+
+def _cmd_approve(uid: str, args: str) -> str:
+    err = _require_admin(uid, "approve")
+    if err:
+        return err
+    tg_id, err = _parse_tg_id(args, "approve")
+    if err:
+        return err
+    conn = connect()
+    try:
+        migrate(conn)
+        _access_upsert_status(conn, tg_id, "approved")
+        # Строка users нужна ДО первого сообщения человека: _get_user_id в
+        # plugin/tools.py бросает для незнакомого telegram id, а без неё
+        # первый же вызов инструмента моделью падает.
+        conn.execute(
+            "INSERT OR IGNORE INTO users(telegram_user_id, created_at) VALUES (?, ?)",
+            (tg_id, _now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _PENDING_USER_NOTIFICATIONS.append((
+        tg_id,
+        "Доступ открыт. Напиши о себе: рост, дата рождения, пол, город или "
+        "часовой пояс и стартовый вес — настрою цели.",
+    ))
+    return f"✅ Доступ для {tg_id} открыт."
+
+
+def _cmd_deny(uid: str, args: str) -> str:
+    err = _require_admin(uid, "deny")
+    if err:
+        return err
+    tg_id, err = _parse_tg_id(args, "deny")
+    if err:
+        return err
+    conn = connect()
+    try:
+        migrate(conn)
+        _access_upsert_status(conn, tg_id, "denied")
+    finally:
+        conn.close()
+    return f"⛔ Доступ для {tg_id} отклонён."
+
+
+def _cmd_revoke(uid: str, args: str) -> str:
+    err = _require_admin(uid, "revoke")
+    if err:
+        return err
+    tg_id, err = _parse_tg_id(args, "revoke")
+    if err:
+        return err
+    if tg_id in admin_user_ids():
+        return "⚠ Нельзя отозвать доступ администратору."
+    conn = connect()
+    try:
+        migrate(conn)
+        _access_upsert_status(conn, tg_id, "denied")
+    finally:
+        conn.close()
+    return f"⛔ Доступ для {tg_id} отозван. Данные человека остаются в базе."
+
+
+def _cmd_access_list(uid: str) -> str:
+    err = _require_admin(uid, "access")
+    if err:
+        return err
+    conn = connect()
+    try:
+        migrate(conn)
+        rows = conn.execute(
+            "SELECT telegram_user_id, status, username, requested_at, decided_at "
+            "FROM access_list ORDER BY requested_at"
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return "Список доступа пуст."
+    by_status: dict[str, list] = {"pending": [], "approved": [], "denied": []}
+    for r in rows:
+        by_status.setdefault(r["status"], []).append(r)
+    labels = {"pending": "⏳ Ожидают", "approved": "✅ Одобрены", "denied": "⛔ Отклонены"}
+    lines = ["📋 **Доступ:**"]
+    for status in ("pending", "approved", "denied"):
+        entries = by_status.get(status, [])
+        lines.append(f"\n{labels[status]} ({len(entries)}):")
+        if not entries:
+            lines.append("  —")
+        for r in entries:
+            uname = r["username"] or "—"
+            when = r["decided_at"] or r["requested_at"] or "—"
+            lines.append(f"  `{r['telegram_user_id']}` {uname} — {when}")
+    return "\n".join(lines)
+
+
 def run_command(uid: str, text: str) -> str | None:
     """Слэш-команды исполняются без модели — в этом их смысл. None означает
     «не наша команда»: сообщение уходит дальше в обычный разбор."""
@@ -267,6 +477,14 @@ def run_command(uid: str, text: str) -> str | None:
         if uid not in admin_user_ids():
             return "⚠ Команда /model доступна только администраторам."
         return switch_model_cmd(args.strip())
+    if name == "approve":
+        return _cmd_approve(uid, args)
+    if name == "deny":
+        return _cmd_deny(uid, args)
+    if name == "revoke":
+        return _cmd_revoke(uid, args)
+    if name == "access":
+        return _cmd_access_list(uid)
 
     for cmd_name, handler, _desc in registry.SLASH_COMMANDS:
         if cmd_name == name:
@@ -282,21 +500,29 @@ def run_command(uid: str, text: str) -> str | None:
 
 def _user_time_context(conn, uid: str) -> str:
     user_row = conn.execute(
-        "SELECT id, timezone FROM users WHERE telegram_user_id=?", (uid,)
+        "SELECT id, timezone, health_notes FROM users WHERE telegram_user_id=?", (uid,)
     ).fetchone()
+    health_notes = ""
     if user_row:
         config.set_tz(user_row["timezone"])
         u_now = config.user_now(conn, user_row["id"])
         tz_info = f" ({user_row['timezone']})" if user_row["timezone"] else ""
+        health_notes = (user_row["health_notes"] or "").strip()
     else:
         u_now = config.local_now()
         tz_info = ""
-    return (
+    ctx = (
         f"\n\n**[CURRENT TIME & DATE]**\n"
         f"Текущая дата и время пользователя: {u_now.strftime('%Y-%m-%d %H:%M')}{tz_info}.\n"
         f"Сегодня: {u_now.strftime('%d.%m.%Y')} (ТЕКУЩИЙ ГОД: {u_now.year}).\n"
         f"ВАЖНО: Текущий год — {u_now.year}! Ни в коем случае не используй 2025 или 2024 при логировании еды или запросах за сегодня."
     )
+    if health_notes:
+        # Персональные ограничения по здоровью (MU-2): раньше жили общим блоком
+        # в system_promt.md под пометкой user_id=1 и применялись ко всем —
+        # теперь приходят в контексте именно этого человека.
+        ctx += f"\n\nОграничения по здоровью: {health_notes}"
+    return ctx
 
 
 def _open_turn(uid: str, text: str) -> list[dict]:
@@ -462,10 +688,16 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
 
 async def handle_message(message: Message, session: aiohttp.ClientSession, cfg: dict) -> None:
     uid = str(message.from_user.id)
-    if uid not in allowed_users():
-        # В чат не отвечаем вовсе: ответ подтверждает чужому, что бот жив.
-        log.warning("отказано незнакомому telegram id %s", uid)
-        return
+    if uid not in admin_user_ids():
+        status = await asyncio.to_thread(_check_access, uid, message.from_user)
+        if status == "new_pending":
+            await message.answer("Заявка на доступ отправлена администратору. Ответ придёт сюда.")
+            await _notify_admins_of_request(message.bot, uid, message.from_user)
+            return
+        if status != "approved":
+            # pending/denied — молчим: повторный ответ учит слать сообщения снова.
+            log.warning("нет доступа у telegram id %s (%s)", uid, status)
+            return
 
     if message.document:
         async with _user_lock(uid):
@@ -516,6 +748,7 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
         # Хендлеры команд синхронные и лезут в sqlite — в поток, чтобы не
         # блокировать polling. to_thread копирует контекст, ContextVar доедет.
         answer = await asyncio.to_thread(run_command, uid, text)
+        await _flush_pending_notifications(message.bot)
         if answer is not None:
             await send_long(message, answer)
             return
@@ -623,9 +856,15 @@ async def main() -> int:
     if not token:
         log.error("TELEGRAM_BOT_TOKEN не задан (~/.hermes/.env)")
         return 1
-    if not allowed_users():
-        log.error("TELEGRAM_ALLOWED_USERS пуст — бот не ответит никому. Заполните ~/.hermes/.env")
+    if not admin_user_ids():
+        log.error("admin.telegram_admin_ids пуст — некому одобрять доступ. Заполните config.yaml")
         return 1
+    conn = connect()
+    try:
+        migrate(conn)
+        _bootstrap_env_allowlist(conn)
+    finally:
+        conn.close()
 
     cfg = load_config()
     # Проверяем раздел bot ДО первого сообщения. Иначе опечатка в config.yaml

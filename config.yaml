@@ -181,7 +181,8 @@ schedule:
     - {script: meal_window_check, at: "14:00"}
     - {script: meal_window_check, at: "20:00"}
     - {script: evening_report, at: "21:30"}
-    - {script: injection_reminder, at: "21:00", days: [sun]}
+    # ежедневно: скрипт сам молчит у тех, у кого инъекции сегодня нет
+    - {script: injection_reminder, at: "09:00"}
     - {script: weekly_recalc, at: "08:00", days: [mon]}
 
 # Пайплайны ввода и миграция истории (§08, §12) — health_core/ingest/.
@@ -235,10 +236,10 @@ bot:
       model: gemini-3.8-flash
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
-      model: gemini-3.7-flash
+      model: gemini-3.6-flash
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
-      model: gemini-3.6-flash
+      model: gemini-3.7-flash
     - base_url: https://integrate.api.nvidia.com/v1
       api_key_env: NVIDIA_API_KEY
       model: moonshotai/kimi-k3

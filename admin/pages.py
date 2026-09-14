@@ -348,11 +348,39 @@ def _csrf_field(csrf_token: str) -> str:
     return f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">'
 
 
-def layout(title: str, body: str, csrf_token: str, active: str | None = None) -> str:
+def _user_selector_html(users: list[dict] | None, selected_user_id, current_path: str) -> str:
+    """Compact <select> of personas for the nav. Empty when there are 0 or 1
+    users (nothing to switch between) — matches the no-user page still working
+    with no selector at all. Changing it navigates to the CURRENT path (query
+    string stripped) with ?user=<id> — a tiny inline onchange, same style as
+    the existing theme-toggle inline script."""
+    if not users or len(users) < 2:
+        return ""
+    base_path = current_path.split("?", 1)[0] or "/"
+    opts = []
+    for u in users:
+        label = f"#{u['id']} · tg {u['telegram_user_id']}"
+        if u.get("username"):
+            label += f" · {u['username']}"
+        sel = " selected" if u["id"] == selected_user_id else ""
+        opts.append(f'<option value="{_e(u["id"])}"{sel}>{_e(label)}</option>')
+    return (
+        f'<select id="user-selector" title="Выбранный пользователь" '
+        # путь запроса в JS-строку не подставляем: html.escape в атрибуте
+        # раскодируется браузером до исполнения JS — та же дыра, что с confirm()
+        f'onchange="location.search=\'?user=\'+encodeURIComponent(this.value)" '
+        f'style="max-width:220px">{"".join(opts)}</select>'
+    )
+
+
+def layout(title: str, body: str, csrf_token: str, active: str | None = None,
+           users: list[dict] | None = None, selected_user_id=None,
+           current_path: str = "/") -> str:
     links = []
     for key, href, label in NAV:
         cls = ' class="active"' if key == active else ""
         links.append(f'<a href="{href}"{cls}>{html.escape(label)}</a>')
+    selector_html = _user_selector_html(users, selected_user_id, current_path)
     header_html = (
         f'<header class="navbar">'
         f'<div class="nav-top">'
@@ -360,6 +388,7 @@ def layout(title: str, body: str, csrf_token: str, active: str | None = None) ->
         f'<span>🩺</span> <span>Health Agent</span> <span class="brand-tag">Admin</span>'
         f'</div>'
         f'<div class="nav-controls">'
+        f'{selector_html}'
         f'<button type="button" id="theme-toggle-btn" onclick="toggleTheme()" class="theme-toggle" '
         f'title="Переключить светлую / тёмную тему">'
         f'<span id="theme-icon">🌓</span> <span id="theme-text">Тема</span>'
@@ -1029,6 +1058,8 @@ def guards_page(guards_status: list[dict], guards_cfg: dict, comments: dict[str,
         f'Пороги сохраняются хирургически построчно в <code>config.yaml</code> через валидацию YAML '
         f'с сохранением всех комментариев и автоматическим созданием резервной копии <code>.bak</code>.'
         f'</p>'
+        f'<p class="comment" style="margin-bottom:16px;"><strong>Эти настройки глобальные — они применяются '
+        f'ко всем пользователям</strong>, а не только к выбранному в шапке.</p>'
         f'<form method="post" action="/guards/save">'
         f'{_csrf_field(csrf_token)}'
         + "".join(form_sections)
@@ -1180,6 +1211,8 @@ def thresholds_page(parsed: dict, comments: dict[str, str], csrf_token: str,
 <div class="card">
   <h2>config.yaml</h2>
   {msg_html}
+  <p class="comment"><strong>Эти настройки глобальные — они применяются ко всем пользователям</strong>,
+  а не только к выбранному в шапке.</p>
   <p class="comment">Каждое сохранённое поле правится построчно, регулярным выражением по имени ключа
   (та же функция, что использует Telegram-команда admin_cmd set) — файл никогда не пересобирается через
   yaml.dump, поэтому русские комментарии не теряются. Проверка, что результат — валидный YAML, идёт до
