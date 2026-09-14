@@ -1036,6 +1036,54 @@ def handle_log_side_effect(params: dict) -> str:
 
 
 @_handler_wrapper
+def handle_council(params: dict) -> str:
+    """Консилиум (docs/adr/0003-консилиум.md): честный разбор всех данных
+    человека несколькими независимыми моделями в фоне. action=request с
+    reason=manual|dose резервирует прогон (лок + частота — bot.council.reserve)
+    и ставит его в очередь фонового запуска ботом (bot/main.py), отвечая сразу
+    — сама работа занимает минуты и не должна держать ход разговора. action=status
+    — последний результат/статус этого человека."""
+    conn = connect()
+    migrate(conn)
+    user_id = _get_user_id(params, conn)
+    action = (params.get("action") or "status").lower()
+
+    from bot import council
+
+    if action == "status":
+        row = council.latest_run(conn, user_id)
+        conn.close()
+        if row is None:
+            return json.dumps({"status": "none", "text": "Консилиум ещё не созывался."}, ensure_ascii=False)
+        return json.dumps(row, ensure_ascii=False)
+
+    if action == "request":
+        reason = (params.get("reason") or "").lower()
+        if reason not in ("manual", "dose"):
+            conn.close()
+            return json.dumps({"error": "reason должен быть manual или dose"}, ensure_ascii=False)
+        telegram_uid = _caller_telegram_id()
+        if not telegram_uid:
+            conn.close()
+            return json.dumps({"error": "Не удалось определить telegram-пользователя"}, ensure_ascii=False)
+        try:
+            run_id = council.reserve(conn, user_id, reason)
+        except ValueError as e:
+            conn.close()
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+        conn.close()
+        council.queue_run(telegram_uid, user_id, run_id, reason)
+        return json.dumps({
+            "ok": "Консилиум запущен, итог придёт отдельным сообщением.",
+            "run_id": run_id,
+        }, ensure_ascii=False)
+
+    conn.close()
+    return json.dumps({"error": f"Неизвестное действие: {action}. Допустимо: request, status"},
+                      ensure_ascii=False)
+
+
+@_handler_wrapper
 def handle_log_labs(params: dict) -> str:
     """Log lab results with automatic validation and derived calculations."""
     conn = connect()
@@ -4941,6 +4989,7 @@ def register(ctx):
         ("log_water", handle_log_water, schemas.log_water_schema),
         ("log_glucose", handle_log_glucose, schemas.log_glucose_schema),
         ("log_side_effect", handle_log_side_effect, schemas.log_side_effect_schema),
+        ("council", handle_council, schemas.council_schema),
         ("log_labs", handle_log_labs, schemas.log_labs_schema),
         ("log_sleep", handle_log_sleep, schemas.log_sleep_schema),
         ("log_weight", handle_log_weight, schemas.log_weight_schema),
@@ -5070,7 +5119,7 @@ if __name__ == "__main__":
             "get_day_summary", "get_trends", "get_status_bar",
             "query_metrics", "query_food", "pantry", "style", "explain_target", "get_progress",
             "get_evening_report", "register_user", "set_milestone", "admin_cmd", "help",
-            "get_weekly_summary"
+            "get_weekly_summary", "council",
         }
 
         registered_tools = set(ctx.tools.keys())
