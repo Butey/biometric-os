@@ -194,8 +194,6 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
         # Кулдаун ключа привязан к модели: у каждой модели своя квота.
         scope = provider.get("model", "")
         ordered_keys = _ordered_keys(env_name, all_keys, model=scope)
-        now_ts = time.time()
-        healthy_keys = [k for k in ordered_keys if _get_key_state(k, model=scope).cooldown_until <= now_ts]
         prov_timeout = float(provider.get("timeout_s", timeout_s))
 
         url = f"{provider['base_url'].rstrip('/')}/chat/completions"
@@ -246,8 +244,12 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
         for key in ordered_keys:
             state = _get_key_state(key, model=scope)
             now = time.time()
-            if state.cooldown_until > now and healthy_keys:
-                # Если есть здоровые ключи, ключ на кулдауне пропускаем
+            if state.cooldown_until > now and any(
+                _get_key_state(k, model=scope).cooldown_until <= now for k in ordered_keys
+            ):
+                # Пропускаем ключ на кулдауне, только если СЕЙЧАС есть другой
+                # реально здоровый — статичный снимок healthy_keys до цикла не
+                # видел, что здоровые ключи сами ушли в кулдаун по ходу перебора.
                 continue
 
             headers = {
@@ -379,7 +381,12 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
             log.info("модель вернула reasoning (%d симв): %s", len(r), _short(r, 150))
 
         if not tool_calls:
-            return last_text, messages
+            # Текст/reasoning ЭТОГО хода, не last_text — иначе легитимно пустой
+            # финальный ответ (content="", без reasoning) отдавал бы наружу
+            # обрывок reasoning из более раннего хода tool_calls. last_text
+            # остаётся только накопителем для аварийного возврата при max_iters.
+            own_reasoning = message.get("reasoning_content") or message.get("reasoning")
+            return message.get("content") or own_reasoning or "", messages
 
         results = []
         for call in tool_calls:
@@ -541,6 +548,43 @@ if __name__ == "__main__":
                 assert isinstance(text, str) and text, text
                 assert "цикл" in text.lower(), text
             print("OK: 6) max_iters обрывает зацикливание и возвращает строку, а не виснет")
+
+            # --- 7. reasoning с промежуточного хода tool_calls не протекает в
+            # легитимно пустой финальный ответ (утечка chain-of-thought) ---
+            queue = [
+                _resp(200, _msg(content=None, reasoning_content="думаю над вызовом...", tool_calls=[tc])),
+                _resp(200, _msg(content="")),  # финал: пусто, без reasoning
+            ]
+            with patch(__name__ + "._post", _post_ok):
+                text, msgs = await run_loop(session, [{"role": "user", "content": "запиши"}], [{"type": "function"}],
+                                             PROVIDERS, _dispatch_ok)
+                assert text == "", f"reasoning с прошлого хода протёк в ответ: {text!r}"
+            print("OK: 7) reasoning промежуточного хода не протекает в пустой финальный ответ")
+
+            # --- 8. устаревший снимок healthy_keys не обрывает провайдера
+            # раньше времени: оба изначально здоровых ключа 429 в рамках
+            # ОДНОГО запроса, третий (изначально остывающий, но уже отпустивший)
+            # должен быть опробован, а не молча пропущен ---
+            _KEY_STATES.clear()
+            os.environ["TRIPLE_KEYS"] = "key_a,key_b,key_c"
+            triple_provider: list[Provider] = [
+                {"base_url": "https://triple.example/v1", "api_key_env": "TRIPLE_KEYS", "model": "gemini-triple"}
+            ]
+            # key_c был на кулдауне, но он уже истёк к началу этого запроса.
+            _get_key_state("key_c", model="gemini-triple").cooldown_until = time.time() - 1
+            seen = []
+
+            async def _post_triple(session, url, headers, payload, timeout_s=None):
+                seen.append(headers.get("Authorization"))
+                if len(seen) <= 2:
+                    return 429, {"error": {"message": "quota", "details": [{"retryDelay": "60s"}]}}
+                return 200, {"choices": [{"message": _msg(content="ответ с третьего ключа")}]}
+
+            with patch(__name__ + "._post", _post_triple):
+                msg_triple = await chat(session, [{"role": "user", "content": "hi"}], [], triple_provider)
+                assert msg_triple["content"] == "ответ с третьего ключа", (msg_triple, seen)
+                assert len(seen) == 3, seen
+            print("OK: 8) устаревший снимок healthy_keys не пропускает отпустивший ключ")
 
         del os.environ["TEST_KEY_1"]
         del os.environ["TEST_KEY_2"]
