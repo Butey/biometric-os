@@ -472,8 +472,13 @@ def handle_log_food(params: dict) -> str:
                 {"error": f"{i['name']}: source должен быть одним из {_ITEM_SOURCES}, получено {src!r}"},
                 ensure_ascii=False)
         # Модель (GPT) заполняет необязательные поля нулями: per_100g из нулей
-        # или grams=0 затирали присланный kcal нулём.
-        if isinstance(per100, dict) and (not i.get("grams") or not per100.get("kcal")):
+        # затирал присланный kcal нулём. Но per100.kcal==0 — легитимное
+        # значение для реального продукта (вода, чёрный кофе) из food_lookup:
+        # отбрасываем per100 только когда есть прямой kcal, который иначе
+        # был бы затёрт нулём, иначе это единственный источник КБЖУ позиции.
+        if isinstance(per100, dict) and (
+            not i.get("grams") or (i.get("kcal") is not None and not per100.get("kcal"))
+        ):
             per100 = None
         if per100 is None:
             continue
@@ -1061,6 +1066,12 @@ def handle_log_glucose(params: dict) -> str:
     except ValueError as e:
         conn.close()
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+    if mmol_l <= 0:
+        # Модель заполняет непереданное required-поле нулём вместо пропуска
+        # (тот же класс, что per_100g/hr_min) — 0 ммоль/л физиологически
+        # невозможен, точно не значение, которое хотели записать.
+        conn.close()
+        return json.dumps({"error": f"mmol_l должен быть больше нуля, получено {mmol_l:g}"}, ensure_ascii=False)
 
     # Normalize timestamp
     if "T" in at and at.count(":") == 1:
@@ -1464,6 +1475,11 @@ def handle_log_weight(params: dict) -> str:
     except ValueError as e:
         conn.close()
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+    if weight_kg <= 0:
+        # Тот же класс бага, что per_100g/hr_min — модель шлёт 0 вместо
+        # пропуска поля. 0 кг тут же ушёл бы в BMR/дельту/прогноз/вехи.
+        conn.close()
+        return json.dumps({"error": f"weight_kg должен быть больше нуля, получено {weight_kg:g}"}, ensure_ascii=False)
 
     # Normalize timestamp
     if "T" in measured_at and measured_at.count(":") == 1:
@@ -1506,6 +1522,17 @@ def handle_log_weight(params: dict) -> str:
     placeholders = ", ".join("?" * len(insert_values))
     sql = f"INSERT INTO body_metrics({', '.join(insert_fields)}) VALUES ({placeholders}) ON CONFLICT(user_id, burst_key) DO NOTHING"
     cur = conn.execute(sql, insert_values)
+    # burst_key = measured_at без соли: повтор с тем же timestamp — это
+    # ON CONFLICT DO NOTHING, строка тихо не пишется. lastrowid тогда не id
+    # существующей строки и не None, а 0 на свежем соединении — наружу ушёл бы
+    # "успех" с весом, которого в базе нет.
+    if cur.rowcount == 0:
+        conn.rollback()
+        conn.close()
+        return json.dumps(
+            {"error": f"Запись на {measured_at} уже есть — измени время (measured_at) "
+                      f"или удали старую запись перед повторной"},
+            ensure_ascii=False)
     weight_id = cur.lastrowid
     conn.commit()
 
@@ -1615,6 +1642,11 @@ def handle_log_anthropometry(params: dict) -> str:
     except ValueError as e:
         conn.close()
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+    if value_cm <= 0:
+        # Тот же класс бага, что per_100g/hr_min — модель шлёт 0 вместо
+        # пропуска поля. 0 см тут же ушёл бы в trends()/whr() как реальный замер.
+        conn.close()
+        return json.dumps({"error": f"value_cm должен быть больше нуля, получено {value_cm:g}"}, ensure_ascii=False)
 
     # Get previous measurement
     prev = conn.execute(
@@ -4440,6 +4472,34 @@ def handle_register_user(params: dict) -> str:
     elif hr_max_source is not None and hr_max_source not in ("test", "watch"):
         conn.close()
         return json.dumps({"error": "hr_max_source: 'test' или 'watch'"}, ensure_ascii=False)
+
+    # height_cm/base_weight_kg — required в схеме, но register_user используется
+    # и для частичного обновления (COALESCE ниже); модель на таких вызовах
+    # заполняет непереданное required-поле нулём вместо пропуска (тот же класс,
+    # что per_100g/hr_min) — 0 не None, "v is None" в _missing его пропускает,
+    # и COALESCE(0, height_cm) молча стирает реальный рост/вес нулём.
+    if height_cm is not None:
+        try:
+            height_cm = float(height_cm)
+        except (TypeError, ValueError):
+            conn.close()
+            return json.dumps({"error": f"height_cm должен быть числом, получено {height_cm!r}"},
+                              ensure_ascii=False)
+        if not (50 <= height_cm <= 250):
+            conn.close()
+            return json.dumps({"error": f"height_cm вне разумного диапазона 50–250 см: {height_cm:g}"},
+                              ensure_ascii=False)
+    if base_weight_kg is not None:
+        try:
+            base_weight_kg = float(base_weight_kg)
+        except (TypeError, ValueError):
+            conn.close()
+            return json.dumps({"error": f"base_weight_kg должен быть числом, получено {base_weight_kg!r}"},
+                              ensure_ascii=False)
+        if not (20 <= base_weight_kg <= 400):
+            conn.close()
+            return json.dumps({"error": f"base_weight_kg вне разумного диапазона 20–400 кг: {base_weight_kg:g}"},
+                              ensure_ascii=False)
 
     # Профиль без роста, даты рождения и пола бесполезен: BMR по Mifflin считается
     # именно по ним, а без BMR нет ни пола цели, ни гардрейла BMR_FLOOR. Запись,
