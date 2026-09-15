@@ -715,6 +715,46 @@ def test_pharma_dose_ladder_bounds():
         conn.close()
 
 
+def test_pharma_schedule_dose_zero_no_ladder_does_not_wipe():
+    """Препарат без карты лестницы (_check_dose_bounds не выполняется): модель
+    заполняет непереданное поле dose нулём вместо пропуска — 0 не должен
+    затирать уже сохранённую дозу через COALESCE(excluded.dose,dose)."""
+    registry.set_caller("889")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM med_schedule WHERE user_id=889")
+        conn.execute("DELETE FROM users WHERE id=889")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(889,'889',175,'1985-01-01',"
+            "'male','UTC',90,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+
+        r = json.loads(main.dispatch("pharma", {
+            "action": "schedule", "substance": "Незарегистрированный Препарат XYZ",
+            "dose": 5, "unit": "mg", "route": "injection",
+        }))
+        assert "ok" in r, f"первичная запись дозы без карты должна пройти: {r}"
+
+        # Модель хочет обновить только остаток, но шлёт dose=0 вместо пропуска.
+        r = json.loads(main.dispatch("pharma", {
+            "action": "schedule", "substance": "Незарегистрированный Препарат XYZ",
+            "dose": 0, "stock_doses": 3,
+        }))
+        assert "ok" in r, r
+        row = conn.execute(
+            "SELECT dose, stock_doses FROM med_schedule WHERE user_id=889 AND substance=?",
+            ("Незарегистрированный Препарат XYZ",)).fetchone()
+        assert row["dose"] == 5, f"dose=0 затёр реальную дозу: {dict(row)}"
+        assert row["stock_doses"] == 3, dict(row)
+    finally:
+        conn.execute("DELETE FROM med_schedule WHERE user_id=889")
+        conn.execute("DELETE FROM users WHERE id=889")
+        conn.commit()
+        conn.close()
+
+
 def test_log_side_effect_add_list_delete():
     """Запись побочного эффекта → id в ответе → list содержит этот id → delete без id удаляет."""
     registry.set_caller("998")

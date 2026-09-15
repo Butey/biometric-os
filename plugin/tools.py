@@ -3437,6 +3437,12 @@ def handle_pharma(params: dict) -> str:
 
     if action == "schedule":
         dose_param = params.get("dose")
+        if dose_param == 0:
+            # Модель заполняет непереданное поле нулём вместо пропуска (тот же
+            # класс, что per_100g/hr_min) — 0 доз не бывает валидной дозой. Без
+            # этого COALESCE(0, dose) затёр бы настоящую дозу у препарата без
+            # карты лестницы, где проверка диапазона ниже вообще не выполняется.
+            dose_param = None
         by_doctor = bool(params.get("by_doctor"))
         resume_after_break = False
 
