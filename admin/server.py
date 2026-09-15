@@ -58,6 +58,7 @@ PERSONA_TABLES = (
     "daily_targets", "alerts", "med_log", "llm_calls", "import_log",
     "refeed_days", "meal_plan", "workout_plan", "persona_styles", "plan_log",
     "sick_days", "lab_results", "dispatch_log", "side_effects", "my_products",
+    "daily_watch",
 )
 
 
@@ -1826,6 +1827,10 @@ def _cmd_self_check() -> int:
         conn.execute("INSERT INTO water_log(user_id, at, volume_ml) VALUES (?, '2026-08-22 10:00:00', 500)", (uid,))
         conn.execute("INSERT INTO persona_styles(user_id, name, instruction, is_active, created_at) "
                      "VALUES (?, 'debian', 'x', 1, '2026-08-22 00:00:00')", (uid,))
+        # daily_watch: FK user_id -> users(id) с PRAGMA foreign_keys=ON — если
+        # таблицы нет в PERSONA_TABLES, DELETE FROM users падает IntegrityError.
+        conn.execute("INSERT INTO daily_watch(user_id, date, steps, source, created_at) "
+                     "VALUES (?, '2026-08-22', 5000, 'manual', '2026-08-22 00:00:00')", (uid,))
     conn.commit()
 
     victim, survivor = ids[1001], ids[1002]
