@@ -266,7 +266,7 @@ def _format_models_message(providers: list[dict]) -> str:
             lines.append(f"**{i+1}. 🟢 `{m}`** — *основная (активна)*")
         else:
             lines.append(f"{i+1}. `{m}` `[{env}]`")
-    lines.append("\nДля смены нажмите кнопку ниже или введите:\n`/model <номер или название>` (например `/model 2` или `/model deepseek`)")
+    lines.append("\nДля смены нажмите кнопку ниже или введите:\n`/model <номер или название>` (например `/model 2` или `/model gemini`)")
     return "\n".join(lines)
 
 

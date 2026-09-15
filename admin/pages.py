@@ -2206,16 +2206,14 @@ def keys_page(
         msg_html = f'<p class="msg">{html.escape(message)}</p>'
 
     google_keys = keys_dict.get("GOOGLE_API_KEY", [])
-    nvidia_keys = keys_dict.get("NVIDIA_API_KEY", [])
     groq_keys = keys_dict.get("GROQ_API_KEY", [])
     openrouter_keys = keys_dict.get("OPENROUTER_API_KEY", [])
     openai_keys = keys_dict.get("OPENAI_API_KEY", [])
 
-    total_keys = len(google_keys) + len(nvidia_keys) + len(groq_keys) + len(openrouter_keys) + len(openai_keys)
+    total_keys = len(google_keys) + len(groq_keys) + len(openrouter_keys) + len(openai_keys)
 
     # Статистика
     stats_html = "".join([
-        _stat("🟢 NVIDIA Ключи", f'{len(nvidia_keys)}<small>шт</small>', "kimi-k3 / deepseek-v4"),
         _stat("🔑 Google API Ключей", f'{len(google_keys)}<small>шт</small>', "Ротация активна" if len(google_keys) > 1 else "1 ключ"),
         _stat("🤖 Моделей в цепочке", f'{len(providers_list)}<small>мод</small>', "Порядок фолбэка"),
         _stat("🛡️ Резервные ключи", f'{len(groq_keys) + len(openrouter_keys) + len(openai_keys)}<small>шт</small>', "Groq / OpenRouter"),
@@ -2341,7 +2339,6 @@ def keys_page(
   </div>
 </div>"""
 
-    joined_nvidia = "\n".join(nvidia_keys)
     joined_google = "\n".join(google_keys)
     joined_groq = "\n".join(groq_keys)
     joined_openrouter = "\n".join(openrouter_keys)
@@ -2362,12 +2359,6 @@ def keys_page(
   <form method="post" action="/keys">
     {_csrf_field(csrf_token)}
     <input type="hidden" name="action" value="save_keys">
-    
-    <div style="margin-bottom:16px">
-      <label for="nvidia_api_keys"><b>NVIDIA API Ключи</b> (для kimi-k3 и deepseek-v4-flash-0731)</label>
-      <textarea id="nvidia_api_keys" name="nvidia_api_keys" style="min-height:60px;margin-top:6px" placeholder="nvapi-...&#10;nvapi-... (каждый ключ с новой строки)">{html.escape(joined_nvidia)}</textarea>
-      <p class="comment">Ключ можно получить на портале <a href="https://build.nvidia.com" target="_blank">NVIDIA API Catalog (build.nvidia.com)</a>.</p>
-    </div>
 
     <div style="margin-bottom:16px">
       <label for="google_api_keys"><b>Google Gemini API Ключи</b> (основные бесплатные модели)</label>

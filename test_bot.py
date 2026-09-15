@@ -811,33 +811,27 @@ def test_council_request_creates_running_and_answers_immediately():
         conn.close()
 
 
-def test_council_timeout_and_shared_nvidia_quota():
-    """Консилиум не должен получать короткий чатовый timeout_s провайдера, а 429
-    одной модели из пула NVIDIA (quota_group) охлаждает ключ и для соседней."""
+def test_council_timeout():
+    """Консилиум не должен получать короткий чатовый timeout_s провайдера,
+    а свой, намного больший (300с), переданный из config.yaml council.timeout_s."""
     import time
     from bot import council
     seen = []
 
     async def _post(session, url, headers, payload, timeout_s=None):
         seen.append((payload["model"], timeout_s))
-        if payload["model"] == "kimi":
-            return 429, {"error": {"message": "retry in 30s"}}
         return 200, {"choices": [{"message": {"content": "ok"}}]}
 
     llm._post = _post
     llm._KEY_STATES.clear()
-    base = {"base_url": "http://nv", "api_key_env": "FAKE_KEY", "quota_group": "nvidia", "timeout_s": 15}
-    try:
-        asyncio.run(llm.chat(None, [{"role": "user", "content": "?"}], [], [{**base, "model": "kimi"}]))
-    except Exception:
-        pass
-    assert llm._get_key_state("test", model="nvidia").cooldown_until > time.time()
-    assert seen[-1] == ("kimi", 15), seen
+    base = {"base_url": "http://example", "api_key_env": "FAKE_KEY", "timeout_s": 15}
+    asyncio.run(llm.chat(None, [{"role": "user", "content": "?"}], [], [{**base, "model": "test_model"}]))
+    assert seen[-1][1] == 15, seen
 
-    text = asyncio.run(council._call_one(None, "s", "u", {**base, "model": "ds"},
+    text = asyncio.run(council._call_one(None, "s", "u", {**base, "model": "test_council_model"},
                                          timeout_s=300, retry_delay_s=0, max_retries=0))
     assert text == "ok"
-    assert seen[-1] == ("ds", 300), seen
+    assert seen[-1] == ("test_council_model", 300), seen
     llm._KEY_STATES.clear()
 
 

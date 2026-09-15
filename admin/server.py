@@ -262,7 +262,7 @@ def _import_scale_upload(conn, user_id: int, filename: str, data: bytes) -> tupl
 def _collect_keys_dict() -> dict[str, list[str]]:
     """Собирает списки настроенных ключей для стандартных переменных окружения."""
     from bot.llm import get_provider_keys
-    env_vars = ["GOOGLE_API_KEY", "NVIDIA_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"]
+    env_vars = ["GOOGLE_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"]
     out: dict[str, list[str]] = {}
     for var in env_vars:
         keys = get_provider_keys({"api_key_env": var})
@@ -952,15 +952,12 @@ class Handler(BaseHTTPRequestHandler):
 
             g_keys = parse_keys_input(form.get("google_api_keys", ""))
             groq_keys = parse_keys_input(form.get("groq_api_keys", ""))
-            nv_keys = parse_keys_input(form.get("nvidia_api_keys", ""))
             or_keys = parse_keys_input(form.get("openrouter_api_keys", ""))
             oa_keys = parse_keys_input(form.get("openai_api_keys", ""))
 
             updates = {
                 "GOOGLE_API_KEY": g_keys[0] if g_keys else "",
                 "GOOGLE_API_KEYS": ",".join(g_keys) if g_keys else "",
-                "NVIDIA_API_KEY": nv_keys[0] if nv_keys else "",
-                "NVIDIA_API_KEYS": ",".join(nv_keys) if nv_keys else "",
                 "GROQ_API_KEY": groq_keys[0] if groq_keys else "",
                 "GROQ_API_KEYS": ",".join(groq_keys) if groq_keys else "",
                 "OPENROUTER_API_KEY": or_keys[0] if or_keys else "",
@@ -970,7 +967,7 @@ class Handler(BaseHTTPRequestHandler):
             }
             auth.update_env_vars(updates)
             auth.load_env_file(force=True)
-            message = f"API-ключи успешно сохранены (Google: {len(g_keys)} шт., NVIDIA: {len(nv_keys)} шт., Groq: {len(groq_keys)} шт.). Ротация активна."
+            message = f"API-ключи успешно сохранены (Google: {len(g_keys)} шт., Groq: {len(groq_keys)} шт.). Ротация активна."
 
         elif action == "save_providers":
             import yaml
