@@ -122,7 +122,11 @@ def fetch_sources(inn: str) -> dict:
 def save_draft(conn, user_id: int, substance: str, fields: dict, sources: list[str]) -> int:
     """Черновик карты. Один pending на канонический препарат — повторный
     запрос (человек с тем же безкартным препаратом пишет снова) отдаёт id
-    уже созданного черновика, а не плодит дубликаты, которые админу разгребать."""
+    уже созданного черновика, а не плодит дубликаты, которые админу разгребать.
+    sources идут в HTML-ссылку в /drafts (admin/pages.py) — только http(s),
+    не то, что мог подставить javascript:/data: (модель сама формирует эти
+    ссылки из текста, который читает как контекст, — не доверенный ввод)."""
+    sources = [u for u in (sources or []) if isinstance(u, str) and u.startswith(("http://", "https://"))]
     canonical = _meds.canon(substance)
     # SQLite's built-in NOCASE only folds ASCII — Cyrillic "Ретатрутид" vs
     # "ретатрутид" would compare unequal, so the dedup check runs in Python
@@ -360,6 +364,15 @@ if __name__ == "__main__":
         assert row["status"] == "pending"
         assert len(cd.pending_drafts(conn)) == 1
         print(f"OK: save_draft — один pending-черновик (#{d1}) на повторные запросы")
+
+        # ---- save_draft: не-http(s) sources (javascript:/data: — модель могла
+        # подставить их из текста, который читает как контекст) отсеиваются ----
+        d_xss = cd.save_draft(conn, uid, "Тирзепатид-XSS-тест", {},
+                               ["javascript:alert(1)", "https://api.fda.gov/ok", "data:text/html,x"])
+        row_xss = cd.get_draft(conn, d_xss)
+        assert json.loads(row_xss["sources_json"]) == ["https://api.fda.gov/ok"], dict(row_xss)
+        cd.reject(conn, d_xss)  # чтобы не мешал проверке pending_drafts() ниже
+        print("OK: save_draft — не-http(s) sources отсеиваются")
 
         # ---- approve: дописывает временную копию drug_cards.md, meds.card() видит ----
         result = cd.approve(conn, d1, dict(fields))
