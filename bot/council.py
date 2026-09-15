@@ -1,8 +1,7 @@
 """Консилиум (docs/adr/0003-консилиум.md, CONTEXT.md «Консилиум»): честный
 разбор пакета данных health_core.council_data несколькими независимыми
-моделями в фоне. Два аналитика (DeepSeek, Kimi — общий бесплатный пул
-NVIDIA, ~40 запросов/мин) вызываются ПО ОЧЕРЕДИ, не параллельно; судья видит
-их разборы анонимно, в случайном порядке. Хранение — таблица council_runs
+моделями в фоне. Два аналитика (разные модели Gemini) вызываются ПО ОЧЕРЕДИ,
+не параллельно, для экономии общей бесплатной квоты Google; судья видит их разборы анонимно, в случайном порядке. Хранение — таблица council_runs
 (health_core/db.py).
 
 Публичный вход:
@@ -262,7 +261,6 @@ if __name__ == "__main__":
     conn.commit()
     uid = conn.execute("SELECT id FROM users WHERE telegram_user_id=1").fetchone()["id"]
 
-    os.environ["NVIDIA_API_KEY"] = "test"
     os.environ["GOOGLE_API_KEY"] = "test"
 
     def _msg(text: str) -> dict:
@@ -274,11 +272,11 @@ if __name__ == "__main__":
     async def main() -> None:
         with patch(__name__ + "._retry_wait", _fast_wait):
             cfg = _cfg()
-            assert cfg["analysts"] == ["moonshotai/kimi-k3", "deepseek-ai/deepseek-v4-flash-0731"], cfg
-            assert cfg["judge"] and cfg["judge_fallback"] and cfg["max_retries"] == 1
+            assert cfg["analysts"] == ["gemini-3.8-flash", "gemini-3.7-flash"], cfg
+            assert cfg["judge"] == "gemini-3.6-flash" and cfg["judge_fallback"] == "gemini-3.5-flash-lite" and cfg["max_retries"] == 1, cfg
 
             # --- 1) оба аналитика ответили, судья ответил -> complete=1, status=done ---
-            queue = [_msg("разбор кимо"), _msg("разбор дипсик"), _msg("итог судьи")]
+            queue = [_msg("разбор первого аналитика"), _msg("разбор второго аналитика"), _msg("итог судьи")]
 
             async def _post_ok(session, url, headers, payload, timeout_s=None):
                 return 200, {"choices": [{"message": queue.pop(0)}]}
@@ -293,8 +291,8 @@ if __name__ == "__main__":
 
             # --- 2) второй аналитик недоступен весь запас попыток -> судья работает с одним, "неполный" ---
             queue2 = [
-                _msg("разбор кимо"),
-                Exception("сеть легла"), Exception("сеть легла"),  # deepseek: 2 попытки (max_retries=1)
+                _msg("разбор первого аналитика"),
+                Exception("сеть легла"), Exception("сеть легла"),  # второй аналитик: 2 попытки (max_retries=1)
                 _msg("итог по одному разбору"),
             ]
 
@@ -329,8 +327,8 @@ if __name__ == "__main__":
             conn.execute("DELETE FROM council_runs WHERE user_id=?", (uid,))
             conn.commit()
             queue4 = [
-                _msg("разбор кимо"), _msg("разбор дипсик"),
-                Exception("судья лёг"), Exception("судья лёг"),  # judge: 2 попытки
+                _msg("разбор первого аналитика"), _msg("разбор второго аналитика"),
+                Exception("судья лёг"), Exception("судья лёг"),  # судья: 2 попытки
                 _msg("итог от fallback-судьи"),
             ]
 

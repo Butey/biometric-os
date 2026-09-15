@@ -289,35 +289,15 @@ bot:
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
       model: gemini-3.8-flash
-    - base_url: https://integrate.api.nvidia.com/v1
-      api_key_env: NVIDIA_API_KEY
-      model: moonshotai/kimi-k3
-      quota_group: nvidia
-      timeout_s: 15
-      max_tokens: 16384
-      temperature: 1
-      reasoning_effort: max
-    - base_url: https://integrate.api.nvidia.com/v1
-      api_key_env: NVIDIA_API_KEY
-      model: deepseek-ai/deepseek-v4-flash-0731
-      quota_group: nvidia
-      timeout_s: 15
-      temperature: 1
-      top_p: 0.95
-      max_tokens: 16384
-      extra_body:
-        chat_template_kwargs:
-          thinking: true
-          reasoning_effort: high
 council:
-  # DeepSeek и Kimi из пула NVIDIA — общий бесплатный лимит (~40 запросов/мин),
-  # поэтому вызываются по очереди (bot/council.py), не параллельно.
-  analysts: [moonshotai/kimi-k3, deepseek-ai/deepseek-v4-flash-0731]
-  # первый Google-провайдер — Gemini не делит квоту с NVIDIA-пулом аналитиков
-  judge: gemini-3.5-flash-lite
-  judge_fallback: gemini-3.8-flash
-  # Kimi с глубоким рассуждением часто не укладывается в обычные 25с чата —
-  # отдельный таймаут порядка минут (bot/llm.py::chat(timeout_s=...))
+  # Аналитики — две разные модели Gemini, вызываются по очереди (bot/council.py)
+  # для экономии общей бесплатной квоты Google (~40 k запросов/мин на проект).
+  analysts: [gemini-3.8-flash, gemini-3.7-flash]
+  # Судья — третья модель Gemini; при недоступности — Flash-Lite.
+  judge: gemini-3.6-flash
+  judge_fallback: gemini-3.5-flash-lite
+  # Аналитикам отдельный таймаут порядка минут вместо обычных 25с чата —
+  # анализ требует больше времени (bot/llm.py::chat(timeout_s=...))
   timeout_s: 300
   retry_delay_s: 60
   max_retries: 1

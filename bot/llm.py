@@ -177,7 +177,7 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
     сетевая ошибка/таймаут, 5xx или битый ответ.
 
     timeout_s — таймаут одного HTTP-запроса (см. _post); по умолчанию как в
-    обычном чате, консилиум (bot/council.py) передаёт свой, в разы больше.
+    обычном чате, консилиум (bot/council.py) передаёт свой для медленных моделей анализа.
     """
     failures: list[str] = []
 
@@ -191,15 +191,12 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
             failures.append(msg)
             continue
 
-        # Кулдаун ключа живёт в пределах квоты: у Google она на модель, у NVIDIA
-        # общий пул на все модели — такие провайдеры помечены quota_group в config.yaml.
-        scope = provider.get("quota_group") or provider.get("model", "")
+        # Кулдаун ключа привязан к модели: у каждой модели своя квота.
+        scope = provider.get("model", "")
         ordered_keys = _ordered_keys(env_name, all_keys, model=scope)
         now_ts = time.time()
         healthy_keys = [k for k in ordered_keys if _get_key_state(k, model=scope).cooldown_until <= now_ts]
         prov_timeout = float(provider.get("timeout_s", timeout_s))
-        if "nvidia" in provider.get("base_url", "").lower() and "timeout_s" not in provider:
-            prov_timeout = min(prov_timeout, 20.0)
 
         url = f"{provider['base_url'].rstrip('/')}/chat/completions"
         clean_messages = []
