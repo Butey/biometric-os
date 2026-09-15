@@ -1060,6 +1060,34 @@ def test_council_timeout():
     llm._KEY_STATES.clear()
 
 
+def test_daily_target_source_is_blend():
+    """daily_target() шаг 1 — расход дня (ADR 0004, docs/adr/0004-расход-дня.md),
+    взвешенное среднее оценок, а не одна адаптивная-или-затравочная база: тег
+    источника в computed_from/source обязан начинаться с "blend", а не с
+    прежних "adaptive"/"estimated_tdee"/"bmr_floor_seed"."""
+    from health_core.energy import daily_target
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM users WHERE id=781")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "created_at) VALUES(781,'781',180,'1980-01-01','male','UTC','2026-01-01 00:00:00')")
+        conn.execute(
+            "INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg) "
+            "VALUES(781,'blend-src','2026-08-20 07:00:00',90.0)")
+        conn.commit()
+        result = daily_target(conn, 781, "2026-08-20")
+        assert result["source"].startswith("blend"), \
+            f"source обязан начинаться с 'blend' (ADR 0004), получили {result['source']}"
+    finally:
+        conn.execute("DELETE FROM body_metrics WHERE user_id=781")
+        conn.execute("DELETE FROM daily_targets WHERE user_id=781")
+        conn.execute("DELETE FROM users WHERE id=781")
+        conn.commit()
+        conn.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -4178,8 +4178,12 @@ def handle_explain_target(params: dict) -> str:
     # Честный вердикт срока (CONTEXT.md «Недостижимый срок») — computed_from
     # несёт только тег "deadline_unreachable" (план ниже пола), не сам вердикт
     # о недостижимости, который требует ещё и прогноза по факту.
-    from health_core.energy import deadline_verdict
+    from health_core.energy import deadline_verdict, daily_expenditure
     explanation["deadline_verdict"] = deadline_verdict(conn, user_id, date_str)
+
+    # Расход дня (ADR 0004): части блендера и их доли — модель объясняет, из
+    # чего собралась цель, а не только видит итоговый тег "blend:...".
+    explanation["expenditure"] = daily_expenditure(conn, user_id, date_str)
 
     conn.close()
 
