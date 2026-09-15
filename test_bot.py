@@ -91,6 +91,38 @@ def test_dispatch_routes_knowledge():
     assert "log_food" not in out[:50]
 
 
+def test_tool_rules_attach_and_strip():
+    """with_tool_rules приклеивает правила из Core/tool_rules.md к результату
+    инструмента, у которого есть секция (forecast), и не трогает тот, у
+    которого её нет (log_water). strip_tool_rules снимает блок обратно, и
+    снятый текст совпадает с исходным результатом инструмента дословно."""
+    plain = json.dumps({"ok": True}, ensure_ascii=False)
+    with_rules = main.with_tool_rules("forecast", plain)
+    assert with_rules != plain and "[ПРАВИЛА forecast]" in with_rules
+    assert main.with_tool_rules("log_water", plain) == plain, "у log_water нет секции правил"
+    assert main.strip_tool_rules(with_rules) == plain, "strip должен вернуть исходный текст дословно"
+    assert main.strip_tool_rules(plain) == plain, "strip не должен ничего ломать без блока правил"
+
+
+def test_system_prompt_moved_rules_out():
+    """Core/system_promt.md больше не тащит тела шести перенесённых секций —
+    они переехали в Core/tool_rules.md и приезжают только с результатом
+    инструмента, — но заголовки и триггеры (каким инструментом когда
+    пользоваться) остаются на месте."""
+    prompt = main.system_prompt()
+    for header in ("[ПРОГНОЗ МАССЫ]", "[БОЛЕЗНЬ]", "[MILESTONES]",
+                   "[ТРЕНИРОВКИ И ПЛАНЫ НА ДЕНЬ]", "[ХОЛОДИЛЬНИК И ПЛАН ПИТАНИЯ]", "[ПУЛЬС]"):
+        assert header in prompt, f"заголовок {header} пропал из промпта"
+    assert "forecast" in prompt and "sick" in prompt, "триггеры вызова инструментов пропали"
+    for gone in ("Три правила, они важнее удобства ответа",   # ПРОГНОЗ МАССЫ
+                 "Препараты GLP-1-класса",                     # БОЛЕЗНЬ
+                 "достаточно факта",                           # MILESTONES
+                 "VR-шлем и приложения",                       # ТРЕНИРОВКИ И ПЛАНЫ
+                 "не подмешивая случайные продукты",           # ХОЛОДИЛЬНИК
+                 "оценка по возрасту с ошибкой"):               # ПУЛЬС
+        assert gone not in prompt, f"тело перенесённого правила осталось в промпте: {gone!r}"
+
+
 # ---------------------------------------------------------------- полный ход
 
 def test_full_turn_with_tool_call():
@@ -538,7 +570,14 @@ def test_long_answer_split():
 
 
 def test_log_weight_with_id_list_delete():
-    """Запись веса → id в ответе → list содержит этот id → delete без id удаляет."""
+    """Запись веса → id в ответе → list содержит этот id → delete без id удаляет.
+
+    log_weight несёт правила [MILESTONES] (achieved_milestones) — main.dispatch
+    приклеивает их текстом после JSON, поэтому здесь снимаем блок правил
+    strip_tool_rules перед json.loads, как это делает и _close_turn для истории."""
+    def _dispatch_json(name, args):
+        return json.loads(main.strip_tool_rules(main.dispatch(name, args)))
+
     registry.set_caller("999")
     conn = connect()
     migrate(conn)
@@ -552,37 +591,37 @@ def test_log_weight_with_id_list_delete():
         conn.commit()
 
         # Добавляем вес и проверяем ID в ответе
-        result_add = json.loads(main.dispatch("log_weight", {
+        result_add = _dispatch_json("log_weight", {
             "weight_kg": 75.5,
             "measured_at": "2026-01-01 12:00:00"
-        }))
+        })
         assert "weight_id" in result_add, f"нет weight_id в ответе: {result_add}"
         weight_id = result_add["weight_id"]
         assert weight_id > 0, f"weight_id должен быть положительным, получено {weight_id}"
 
         # Проверяем что запись есть в list
-        result_list = json.loads(main.dispatch("log_weight", {
+        result_list = _dispatch_json("log_weight", {
             "action": "list",
             "limit": 10
-        }))
+        })
         assert "entries" in result_list, f"нет entries в list: {result_list}"
         assert len(result_list["entries"]) > 0, "list пуст"
         found = any(e["weight_id"] == weight_id for e in result_list["entries"])
         assert found, f"weight_id {weight_id} не найден в list: {result_list}"
 
         # Удаляем последнюю запись без ID и проверяем что удалилась нужная
-        result_del = json.loads(main.dispatch("log_weight", {
+        result_del = _dispatch_json("log_weight", {
             "action": "delete"
-        }))
+        })
         assert "deleted" in result_del, f"нет deleted в ответе: {result_del}"
         assert result_del["deleted"]["weight_id"] == weight_id, \
             f"удалилась не та запись: {result_del['deleted']['weight_id']} != {weight_id}"
 
         # Проверяем что запись действительно удалена
-        result_list2 = json.loads(main.dispatch("log_weight", {
+        result_list2 = _dispatch_json("log_weight", {
             "action": "list",
             "limit": 10
-        }))
+        })
         found2 = any(e["weight_id"] == weight_id for e in result_list2["entries"])
         assert not found2, f"weight_id {weight_id} всё ещё есть в list после удаления"
 

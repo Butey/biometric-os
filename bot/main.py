@@ -54,6 +54,7 @@ from health_core.db import connect, migrate
 log = logging.getLogger("bot")
 
 SOUL_PATH = ROOT / "Core" / "system_promt.md"
+TOOL_RULES_PATH = ROOT / "Core" / "tool_rules.md"
 TELEGRAM_LIMIT = 4096
 
 # Встроенные команды шлюза, которых мы лишились вместе с Hermes. Плагин их не
@@ -120,12 +121,60 @@ def tool_specs() -> list[dict]:
     }]
 
 
+_tool_rules_cache: tuple[float, dict[str, str]] | None = None
+_TOOL_RULES_MARK = "\n\n[ПРАВИЛА "
+
+
+def _tool_rules() -> dict[str, str]:
+    """Core/tool_rules.md -> {имя инструмента: текст правил}, секции по `## имя`.
+    Перечитывается по mtime, тот же приём, что у system_prompt()."""
+    global _tool_rules_cache
+    mtime = TOOL_RULES_PATH.stat().st_mtime
+    if _tool_rules_cache is None or _tool_rules_cache[0] != mtime:
+        rules: dict[str, str] = {}
+        name, buf = None, []
+        for line in TOOL_RULES_PATH.read_text(encoding="utf-8").splitlines():
+            if line.startswith("## "):
+                if name is not None:
+                    rules[name] = "\n".join(buf).strip()
+                name, buf = line[3:].strip(), []
+            elif name is not None:
+                buf.append(line)
+        if name is not None:
+            rules[name] = "\n".join(buf).strip()
+        _tool_rules_cache = (mtime, rules)
+    return _tool_rules_cache[1]
+
+
+def with_tool_rules(name: str, result: str) -> str:
+    """Приклеить к результату инструмента его правила из Core/tool_rules.md —
+    модель видит их в ходе, где вызвала инструмент, а не в каждом системном
+    промпте (см. Core/tool_rules.md — так экономится ~2.3к токенов на вызов).
+    Инструментов без секции в tool_rules.md (большинство) не касается."""
+    rule = _tool_rules().get(name)
+    if not rule:
+        return result
+    return f"{result}{_TOOL_RULES_MARK}{name}]\n{rule}"
+
+
+def strip_tool_rules(text: str) -> str:
+    """Обратное к with_tool_rules: убрать приклеенный блок правил перед тем,
+    как сохранить результат инструмента в chat_history — иначе он платит
+    токенами в каждом последующем ходе, а не только в том, где был нужен."""
+    idx = text.find(_TOOL_RULES_MARK)
+    return text[:idx] if idx != -1 else text
+
+
 def dispatch(name: str, args: dict) -> str:
     """Единая точка исполнения инструмента. knowledge живёт не в плагине,
-    поэтому маршрутизируется здесь, а не внутри registry."""
+    поэтому маршрутизируется здесь, а не внутри registry. Дергается только
+    из цикла LLM (llm.run_loop) — слэш-команды и скрипты идут через
+    registry.dispatch напрямую и правил инструментов не видят."""
     if name == "knowledge":
-        return knowledge.read(args.get("topic", ""), args.get("query"))
-    return registry.dispatch(name, args)
+        result = knowledge.read(args.get("topic", ""), args.get("query"))
+    else:
+        result = registry.dispatch(name, args)
+    return with_tool_rules(name, result)
 
 
 def allowed_users() -> set[str]:
@@ -626,6 +675,8 @@ def _close_turn(uid: str, new_messages: list[dict]) -> None:
     conn = connect()
     try:
         for m in new_messages:
+            if m.get("role") == "tool" and isinstance(m.get("content"), str):
+                m = {**m, "content": strip_tool_rules(m["content"])}
             history.append(conn, uid, m)
     finally:
         conn.close()
