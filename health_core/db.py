@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -452,16 +452,20 @@ CREATE TABLE IF NOT EXISTS my_products (
     UNIQUE(user_id, name_key)
 );
 
--- v25: дневной пульс с часов (CONTEXT.md «Дневной пульс») — один набор
--- min/avg/max на календарный день, повторная запись дня заменяет прежнюю
--- (UNIQUE(user_id, date) + upsert в health_core/heart_rate.py).
-CREATE TABLE IF NOT EXISTS daily_heart_rate (
+-- v26 (было daily_heart_rate в v25): день с часов (CONTEXT.md «День с часов») —
+-- дневной пульс, шаги, калории активности, стресс, HRV; одна строка на
+-- календарный день, повторная запись показателя заменяет прежнюю.
+CREATE TABLE IF NOT EXISTS daily_watch (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id),
     date TEXT NOT NULL,
     hr_min INTEGER,
     hr_avg INTEGER,
     hr_max INTEGER,
+    steps INTEGER,
+    active_kcal INTEGER,
+    stress_avg INTEGER,
+    hrv_ms INTEGER,
     source TEXT,
     created_at TEXT NOT NULL,
     UNIQUE(user_id, date)
@@ -654,6 +658,18 @@ def _migrate_v24_to_v25(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v25_to_v26(conn: sqlite3.Connection) -> None:
+    """v25->v26: daily_heart_rate -> daily_watch (+ шаги, калории активности,
+    стресс, HRV). DDL выше уже создал пустую daily_watch, поэтому не RENAME,
+    а перенос строк и удаление старой таблицы."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_heart_rate'").fetchone():
+        conn.execute(
+            "INSERT OR IGNORE INTO daily_watch(user_id, date, hr_min, hr_avg, hr_max, source, created_at) "
+            "SELECT user_id, date, hr_min, hr_avg, hr_max, source, created_at FROM daily_heart_rate"
+        )
+        conn.execute("DROP TABLE daily_heart_rate")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
     row = conn.execute("SELECT version FROM schema_version").fetchone()
@@ -700,6 +716,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v23_to_v24(conn)
         if row["version"] < 25:
             _migrate_v24_to_v25(conn)
+        if row["version"] < 26:
+            _migrate_v25_to_v26(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 

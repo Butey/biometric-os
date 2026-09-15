@@ -773,7 +773,7 @@ def test_log_heart_rate_upsert_validate_autoraise_trends():
         r2 = _dispatch_json("log_heart_rate", {
             "days": [{"date": "2026-08-20", "hr_min": 50, "hr_avg": 68, "hr_max": 118}]})
         assert r2["days"][0]["action"] == "replaced", r2
-        n = conn.execute("SELECT COUNT(*) c FROM daily_heart_rate WHERE user_id=996 AND date='2026-08-20'").fetchone()["c"]
+        n = conn.execute("SELECT COUNT(*) c FROM daily_watch WHERE user_id=996 AND date='2026-08-20'").fetchone()["c"]
         assert n == 1, f"upsert должен оставить одну строку, получили {n}"
 
         # --- валидация: min>max и дата из будущего отклоняются с понятной причиной ---
@@ -805,7 +805,7 @@ def test_log_heart_rate_upsert_validate_autoraise_trends():
         assert urow2["hr_max_bpm"] == 210 and urow2["hr_max_source"] == "test", "тест не должен перебиваться часами"
 
         # --- вниз автоматически не снижается (чистая история без старых высоких дней) ---
-        conn.execute("DELETE FROM daily_heart_rate WHERE user_id=996")
+        conn.execute("DELETE FROM daily_watch WHERE user_id=996")
         conn.execute("UPDATE users SET hr_max_bpm=210, hr_max_source='watch' WHERE id=996")
         conn.commit()
         _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-26", "hr_min": 55, "hr_avg": 65, "hr_max": 100}]})

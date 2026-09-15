@@ -72,7 +72,7 @@ def _maybe_raise_max(conn, user_id: int) -> dict | None:
 
     since = (today - timedelta(days=90)).isoformat()
     rows = conn.execute(
-        "SELECT hr_max FROM daily_heart_rate WHERE user_id=? AND date>=? AND hr_max IS NOT NULL "
+        "SELECT hr_max FROM daily_watch WHERE user_id=? AND date>=? AND hr_max IS NOT NULL "
         "ORDER BY hr_max DESC LIMIT 2",
         (user_id, since),
     ).fetchall()
@@ -105,10 +105,10 @@ def save_days(conn, user_id: int, days: list, source: str = "watch") -> dict:
             results.append({"date": date_str, "error": str(e)})
             continue
         existing = conn.execute(
-            "SELECT id FROM daily_heart_rate WHERE user_id=? AND date=?", (user_id, d_iso)
+            "SELECT id FROM daily_watch WHERE user_id=? AND date=?", (user_id, d_iso)
         ).fetchone()
         conn.execute(
-            "INSERT INTO daily_heart_rate(user_id, date, hr_min, hr_avg, hr_max, source, created_at) "
+            "INSERT INTO daily_watch(user_id, date, hr_min, hr_avg, hr_max, source, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(user_id, date) DO UPDATE SET "
             "hr_min=excluded.hr_min, hr_avg=excluded.hr_avg, hr_max=excluded.hr_max, "
@@ -126,7 +126,7 @@ def save_days(conn, user_id: int, days: list, source: str = "watch") -> dict:
 
 
 def list_days(conn, user_id: int, limit: int = 30, since_days: int | None = None) -> list[dict]:
-    q = "SELECT date, hr_min, hr_avg, hr_max, source FROM daily_heart_rate WHERE user_id=?"
+    q = "SELECT date, hr_min, hr_avg, hr_max, source FROM daily_watch WHERE user_id=?"
     args: list = [user_id]
     if since_days is not None:
         since = (datetime.strptime(config.user_today(conn, user_id), "%Y-%m-%d").date()
@@ -142,12 +142,12 @@ def delete_day(conn, user_id: int, date: str | None) -> str | None:
     """Удаляет запись за дату; без даты — последнюю. None, если удалять нечего."""
     if date is None:
         row = conn.execute(
-            "SELECT date FROM daily_heart_rate WHERE user_id=? ORDER BY date DESC LIMIT 1", (user_id,)
+            "SELECT date FROM daily_watch WHERE user_id=? ORDER BY date DESC LIMIT 1", (user_id,)
         ).fetchone()
         if row is None:
             return None
         date = row["date"]
-    cur = conn.execute("DELETE FROM daily_heart_rate WHERE user_id=? AND date=?", (user_id, date))
+    cur = conn.execute("DELETE FROM daily_watch WHERE user_id=? AND date=?", (user_id, date))
     conn.commit()
     return date if cur.rowcount else None
 
@@ -160,13 +160,13 @@ def trend_block(conn, user_id: int) -> dict | None:
     start_prev = (today - timedelta(days=55)).isoformat()
 
     recent = conn.execute(
-        "SELECT hr_min, hr_avg FROM daily_heart_rate WHERE user_id=? AND date>=?",
+        "SELECT hr_min, hr_avg FROM daily_watch WHERE user_id=? AND date>=?",
         (user_id, start_recent),
     ).fetchall()
     if not recent:
         return None
     prev = conn.execute(
-        "SELECT hr_min, hr_avg FROM daily_heart_rate WHERE user_id=? AND date>=? AND date<?",
+        "SELECT hr_min, hr_avg FROM daily_watch WHERE user_id=? AND date>=? AND date<?",
         (user_id, start_prev, start_recent),
     ).fetchall()
 
@@ -205,9 +205,9 @@ if __name__ == "__main__":
     assert r1["days"][0]["action"] == "added", r1
     r2 = save_days(conn, uid, [{"date": "2026-09-01", "hr_min": 50, "hr_avg": 68, "hr_max": 118}])
     assert r2["days"][0]["action"] == "replaced", r2
-    n = conn.execute("SELECT COUNT(*) c FROM daily_heart_rate WHERE user_id=?", (uid,)).fetchone()["c"]
+    n = conn.execute("SELECT COUNT(*) c FROM daily_watch WHERE user_id=?", (uid,)).fetchone()["c"]
     assert n == 1, f"upsert должен оставить одну строку, получили {n}"
-    row = conn.execute("SELECT hr_min FROM daily_heart_rate WHERE user_id=? AND date='2026-09-01'", (uid,)).fetchone()
+    row = conn.execute("SELECT hr_min FROM daily_watch WHERE user_id=? AND date='2026-09-01'", (uid,)).fetchone()
     assert row["hr_min"] == 50, dict(row)
 
     # --- валидация: min > max отклоняется, остальные дни батча не страдают ---
@@ -224,7 +224,7 @@ if __name__ == "__main__":
     assert "error" in r4["days"][0] and "будущем" in r4["days"][0]["error"], r4
 
     # --- авто-поднятие максимума: один всплеск ничего не делает ---
-    conn.execute("DELETE FROM daily_heart_rate WHERE user_id=?", (uid,))
+    conn.execute("DELETE FROM daily_watch WHERE user_id=?", (uid,))
     conn.commit()
     r5 = save_days(conn, uid, [{"date": "2026-08-25", "hr_max": 200}])
     assert r5["max_hr_update"] is None, "один день выше формулы не должен поднимать максимум"
@@ -245,7 +245,7 @@ if __name__ == "__main__":
     assert urow2["hr_max_bpm"] == 210 and urow2["hr_max_source"] == "test", "тест не должен перебиваться часами"
 
     # --- вниз автоматически не снижается (чистая история — без старых высоких дней) ---
-    conn.execute("DELETE FROM daily_heart_rate WHERE user_id=?", (uid,))
+    conn.execute("DELETE FROM daily_watch WHERE user_id=?", (uid,))
     conn.execute("UPDATE users SET hr_max_bpm=210, hr_max_source='watch' WHERE id=?", (uid,))
     conn.commit()
     save_days(conn, uid, [{"date": "2026-08-29", "hr_max": 130}])
