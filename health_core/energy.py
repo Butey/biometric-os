@@ -1,7 +1,8 @@
 """Калораж — §09. Формулы, коэффициенты и порядок клампа воспроизводятся дословно.
 
 Порядок применения (§09) — пять шагов:
-  1  TDEE_факт ← адаптивная база (или формула-затравка BMR_floor, если лог неполон)
+  1  TDEE_факт ← расход дня, взвешенное среднее оценок по весу/еде, шагам и
+     часам (см. daily_expenditure, docs/adr/0004-расход-дня.md)
   2  срок до вехи → требуемый дефицит
   3  clamp: цель ≥ безопасного пола (kcal_floor — от жировой массы, не BMR)
   4  распределение по дням недели, недельная сумма неизменна
@@ -278,14 +279,16 @@ def _morning_weights(conn: sqlite3.Connection, user_id: int, start: str, end: st
     return [r["weight_kg"] for r in rows]
 
 
-def adaptive_tdee(
-    conn: sqlite3.Connection, user_id: int, window_days: int = 14, for_date: str | None = None
-) -> float | None:
-    """TDEE_факт = средний_intake_Nд + (Δвес_Nд · 7700 / N).
+def _adaptive_tdee_core(
+    conn: sqlite3.Connection, user_id: int, window_days: int, for_date: str | None, min_days: int
+) -> tuple[float | None, int]:
+    """Общее тело adaptive_tdee() и адаптивной части daily_expenditure() (ADR
+    0004) — отличаются только порогом полноты лога (min_days: 11/14 у
+    adaptive_tdee, policy.blend_min_logged_days у блендера). Возвращает (TDEE
+    или None, число залогированных дней в окне) — logged_days нужен блендеру
+    для доли адаптивной части независимо от того, прошла ли она сама порог.
 
-    Достоверность требует еду залогированной минимум 11 из 14 дней (порог
-    масштабируется пропорционально для нестандартного окна). Иначе — None,
-    калибровка замораживается, а не подгоняется.
+    TDEE_факт = средний_intake_Nд + (Δвес_Nд · 7700 / N).
 
     Окно по умолчанию заканчивается сегодня (для forecast.py/report.py, которым
     нужен именно текущий TDEE). daily_target() пересчитывает цель задним числом
@@ -301,9 +304,8 @@ def adaptive_tdee(
         "AND date(eaten_at) BETWEEN ? AND ?",
         (user_id, start_s, end_s),
     ).fetchone()["c"]
-    min_days = -(-window_days * 11 // 14)  # ceil, воспроизводит порог 11/14 по умолчанию
     if logged_days < min_days:
-        return None
+        return None, logged_days
 
     daily_kcals = conn.execute(
         "SELECT SUM(fi.kcal) kcal FROM food_log fl JOIN food_items fi ON fi.food_log_id = fl.id "
@@ -312,12 +314,12 @@ def adaptive_tdee(
     ).fetchall()
     kcal_values = [r["kcal"] for r in daily_kcals if r["kcal"] is not None]
     if not kcal_values:
-        return None
+        return None, logged_days
     mean_intake = sum(kcal_values) / len(kcal_values)
 
     weights = _morning_weights(conn, user_id, start_s, end_s)
     if len(weights) < 2:
-        return None
+        return None, logged_days
     delta_weight = weights[-1] - weights[0]
 
     tdee = mean_intake - (delta_weight * 7700 / window_days)
@@ -325,7 +327,21 @@ def adaptive_tdee(
     # в окно попали недописанные дни (220 ккал за день в логе). Такая калибровка
     # хуже, чем никакой: от неё считается пол, и цель проваливалась до ~1090 ккал.
     if tdee < bmr_floor(conn, user_id):
-        return None
+        return None, logged_days
+    return tdee, logged_days
+
+
+def adaptive_tdee(
+    conn: sqlite3.Connection, user_id: int, window_days: int = 14, for_date: str | None = None
+) -> float | None:
+    """TDEE_факт = средний_intake_Nд + (Δвес_Nд · 7700 / N).
+
+    Достоверность требует еду залогированной минимум 11 из 14 дней (порог
+    масштабируется пропорционально для нестандартного окна). Иначе — None,
+    калибровка замораживается, а не подгоняется. См. _adaptive_tdee_core —
+    тот же расчёт с более низким порогом идёт в daily_expenditure() (ADR 0004)."""
+    min_days = -(-window_days * 11 // 14)  # ceil, воспроизводит порог 11/14 по умолчанию
+    tdee, _logged_days = _adaptive_tdee_core(conn, user_id, window_days, for_date, min_days)
     return tdee
 
 
@@ -469,12 +485,7 @@ def deadline_verdict(conn: sqlite3.Connection, user_id: int, date_: str | None =
     # Те же примитивы (шаг 1 и пол §09), что daily_target() уже считает для
     # этой же даты — деривация одна и та же, вызвана заново для вехи-вердикта.
     milestone_deficit = _deadline_deficit(conn, user_id, milestone, date_)
-    adaptive = adaptive_tdee(conn, user_id, for_date=date_)
-    if adaptive is not None:
-        base = adaptive
-    else:
-        base = bmr_floor(conn, user_id) * (load()["policy"].get("activity_factor") or 1.0)
-    full_tdee = base + _tcx_net(conn, user_id, date_)
+    full_tdee = daily_expenditure(conn, user_id, date_)["kcal"]
     floor, _ = kcal_floor(conn, user_id, full_tdee)
     # milestone_deficit истинный: не None, не 0.0 (порог уже достигнут), не
     # inf-нейтральный по умолчанию — тот же гейт, что в daily_target().
@@ -508,34 +519,101 @@ def deadline_verdict(conn: sqlite3.Connection, user_id: int, date_: str | None =
     return verdict
 
 
+def daily_expenditure(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
+    """Расход дня (ADR 0004, docs/adr/0004-расход-дня.md) — взвешенное среднее
+    трёх оценок расхода вместо одной адаптивной-или-затравочной базы.
+
+    parts: {"adaptive"|"steps"|"watch"|"activity_factor": {"estimate", "share"}
+    или None, если часть недоступна}. kcal = Σ estimate × share. logged_days —
+    дни с логом еды в 14-дневном окне (та же величина двигает долю адаптивной
+    части). tags — имена частей с долей > 0, в порядке
+    adaptive/steps/watch/activity_factor: источник тега "blend:..." в
+    daily_target().
+
+    Доля адаптивной части a = policy.blend_adaptive_max_share × logged_days/14,
+    и только если сама часть доступна (иначе a=0). Остаток 1-a делят поровну
+    доступные {steps, watch}; если недоступна ни одна — весь остаток уходит
+    activity_factor (BMR × коэффициент активности + тренировочная добавка, как
+    в daily_target() до ADR 0004). Тренировочная добавка (_tcx_net) входит в
+    adaptive/steps/activity_factor как есть — watch её не берёт: часы уже
+    считают калории тренировки в active_kcal, добавлять её ещё раз было бы
+    двойным счётом."""
+    policy = load()["policy"]
+    bmr = bmr_floor(conn, user_id)
+    tcx_net = _tcx_net(conn, user_id, date)
+
+    min_days = policy.get("blend_min_logged_days", 4)
+    adaptive_est, logged_days = _adaptive_tdee_core(conn, user_id, 14, date, min_days)
+
+    parts: dict[str, dict | None] = {"adaptive": None, "steps": None, "watch": None, "activity_factor": None}
+    a = 0.0
+    if adaptive_est is not None:
+        a = policy.get("blend_adaptive_max_share", 0.6) * logged_days / 14
+        parts["adaptive"] = {"estimate": adaptive_est + tcx_net, "share": a}
+
+    window_days = policy.get("blend_watch_window_days", 7)
+    end = datetime.fromisoformat(date[:10]).date()
+    start = end.fromordinal(end.toordinal() - window_days + 1)
+    start_s, end_s = start.isoformat(), end.isoformat()
+
+    steps_vals = [
+        r["steps"] for r in conn.execute(
+            "SELECT steps FROM daily_watch WHERE user_id=? AND date BETWEEN ? AND ? AND steps IS NOT NULL",
+            (user_id, start_s, end_s),
+        ).fetchall()
+    ]
+    active_vals = [
+        r["active_kcal"] for r in conn.execute(
+            "SELECT active_kcal FROM daily_watch WHERE user_id=? AND date BETWEEN ? AND ? AND active_kcal IS NOT NULL",
+            (user_id, start_s, end_s),
+        ).fetchall()
+    ]
+
+    weight_kg = _smoothed_weight_kg(conn, user_id)
+    steps_est = None
+    if steps_vals and weight_kg is not None:
+        mean_steps = sum(steps_vals) / len(steps_vals)
+        over_steps = max(0.0, mean_steps - policy.get("blend_steps_free", 3000))
+        steps_est = (
+            bmr * policy.get("blend_steps_base_factor", 1.2)
+            + over_steps * policy.get("blend_kcal_per_step_kg", 0.0005) * weight_kg
+            + tcx_net
+        )
+
+    watch_est = None
+    if active_vals:
+        mean_active = sum(active_vals) / len(active_vals)
+        watch_est = bmr * policy.get("blend_watch_base_factor", 1.1) + mean_active * policy.get("blend_watch_discount", 0.8)
+
+    remaining = 1.0 - a
+    available = [n for n, est in (("steps", steps_est), ("watch", watch_est)) if est is not None]
+    if available:
+        share_each = remaining / len(available)
+        if steps_est is not None:
+            parts["steps"] = {"estimate": steps_est, "share": share_each}
+        if watch_est is not None:
+            parts["watch"] = {"estimate": watch_est, "share": share_each}
+    else:
+        factor = policy.get("activity_factor") or 1.0
+        parts["activity_factor"] = {"estimate": bmr * factor + tcx_net, "share": remaining}
+
+    kcal = sum(p["estimate"] * p["share"] for p in parts.values() if p is not None)
+    tags = [n for n in ("adaptive", "steps", "watch", "activity_factor") if parts[n] and parts[n]["share"] > 0]
+
+    return {"kcal": kcal, "parts": parts, "logged_days": logged_days, "tags": tags}
+
+
 def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
     bmr = bmr_floor(conn, user_id)
-    adaptive = adaptive_tdee(conn, user_id, for_date=date)
-    if adaptive is not None:
-        base, seed_tag = adaptive, "adaptive"
-    else:
-        # Пока калибровки нет (еда залогирована меньше 11 дней из 14), базой был
-        # голый BMR. Это запирало систему: дефицит вычитается из базы, база равна
-        # полу, значит ЛЮБОЙ дефицит уходит под пол и обрезается — цель навсегда
-        # равна BMR, а срок вехи объявляется недостижимым. Человек видит «система
-        # не даёт похудеть» и уходит считать калораж на стороне.
-        #
-        # Оценка расхода = BMR × коэффициент активности. Это заведомо грубее
-        # измеренного TDEE, поэтому: (1) коэффициент консервативный и покрывает
-        # только бытовую активность — тренировки уже приходят отдельно в tcx_net,
-        # и удваивать их нельзя; (2) как только наберётся 11 дней из 14, adaptive
-        # забирает базу себе и оценка больше не участвует; (3) нижняя граница
-        # держится всегда — см. kcal_floor, она считается от жировой массы.
-        factor = load()["policy"].get("activity_factor") or 1.0
-        base = bmr * factor
-        seed_tag = "estimated_tdee" if factor != 1.0 else "bmr_floor_seed"
+    expenditure = daily_expenditure(conn, user_id, date)
+    full_tdee = expenditure["kcal"]  # шаг 1 (ADR 0004: расход дня — блендер), без дефицита и без клампа
     tcx_net = _tcx_net(conn, user_id, date)
-    full_tdee = base + tcx_net  # шаг 1 (+ тренировочная добавка), без дефицита и без клампа
 
     # Пол считается ПОСЛЕ расхода и от него: безопасный дефицит ограничен тем,
     # сколько энергии способен отдать жир, а не абстрактным BMR. См. kcal_floor.
     floor, floor_reason = kcal_floor(conn, user_id, full_tdee)
 
+    seed_tag = "blend:" + "+".join(expenditure["tags"]) if expenditure["tags"] else "blend"
     tags = [seed_tag]
     if tcx_net:
         tags.append("tcx")
@@ -1020,6 +1098,128 @@ if __name__ == "__main__":
         conn.commit()
         assert deadline_verdict(conn, uid, today.isoformat()) is None, "без активной вехи со сроком вердикта нет"
         print("OK: без активной вехи со сроком deadline_verdict возвращает None")
+
+        # ---- daily_expenditure(): блендер расхода дня (ADR 0004) ----
+        def _reset_all(uid):
+            conn.execute("DELETE FROM body_metrics WHERE user_id=?", (uid,))
+            conn.execute("DELETE FROM food_log WHERE user_id=?", (uid,))
+            conn.execute("DELETE FROM daily_watch WHERE user_id=?", (uid,))
+
+        def _add_food_day(uid, d, kcal):
+            cur = conn.execute(
+                "INSERT INTO food_log(user_id, eaten_at, meal_slot) VALUES (?, ?, 'lunch')",
+                (uid, f"{d} 12:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO food_items(food_log_id, name, kcal) VALUES (?, 'blend-food', ?)",
+                (cur.lastrowid, kcal),
+            )
+
+        def _add_watch_day(uid, d, steps=None, active_kcal=None):
+            conn.execute(
+                "INSERT INTO daily_watch(user_id, date, steps, active_kcal, source, created_at) "
+                "VALUES (?, ?, ?, ?, 'selfcheck', ?)",
+                (uid, d, steps, active_kcal, f"{d} 23:00:00"),
+            )
+
+        de_date = today.isoformat()
+
+        # общий фон: 14 дней постоянного веса 100.0 кг (Δвес=0 -> измеренный TDEE = средний intake)
+        _reset_all(uid)
+        for days_ago in range(13, -1, -1):
+            _add_metric(days_ago, 100.0)
+        conn.commit()
+        bmr_de = bmr_floor(conn, uid)
+        factor_de = load()["policy"].get("activity_factor") or 1.0
+
+        # 1) полный лог (14/14), часов нет -> adaptive 0.6 + activity_factor 0.4 (§1 бита ADR 0004)
+        for days_ago in range(13, -1, -1):
+            _add_food_day(uid, (today - timedelta(days=days_ago)).isoformat(), 2600)
+        conn.commit()
+        exp1 = daily_expenditure(conn, uid, de_date)
+        assert exp1["logged_days"] == 14, exp1
+        assert exp1["parts"]["steps"] is None and exp1["parts"]["watch"] is None, exp1
+        assert abs(exp1["parts"]["adaptive"]["share"] - 0.6) < 1e-9, exp1
+        assert abs(exp1["parts"]["activity_factor"]["share"] - 0.4) < 1e-9, exp1
+        expected_kcal1 = 0.6 * 2600 + 0.4 * (bmr_de * factor_de)
+        assert abs(exp1["kcal"] - expected_kcal1) < 0.01, (exp1["kcal"], expected_kcal1)
+        assert exp1["tags"] == ["adaptive", "activity_factor"], exp1["tags"]
+        print(f"OK: daily_expenditure полный лог без часов -> доли 0.6/0.4, kcal={exp1['kcal']:.1f}")
+
+        # 2) + шаги и часы за последние 7 дней -> 0.6/0.2/0.2, kcal — ручная взвешенная сумма
+        for days_ago in range(6, -1, -1):
+            _add_watch_day(uid, (today - timedelta(days=days_ago)).isoformat(), steps=8000, active_kcal=400)
+        conn.commit()
+        exp2 = daily_expenditure(conn, uid, de_date)
+        for name in ("adaptive", "steps", "watch"):
+            assert exp2["parts"][name] is not None, exp2
+        assert exp2["parts"]["activity_factor"] is None, exp2
+        assert abs(exp2["parts"]["adaptive"]["share"] - 0.6) < 1e-9, exp2
+        assert abs(exp2["parts"]["steps"]["share"] - 0.2) < 1e-9, exp2
+        assert abs(exp2["parts"]["watch"]["share"] - 0.2) < 1e-9, exp2
+        weight_de = _smoothed_weight_kg(conn, uid)
+        steps_est_expected = bmr_de * 1.2 + max(0, 8000 - 3000) * 0.0005 * weight_de
+        watch_est_expected = bmr_de * 1.1 + 400 * 0.8
+        expected_kcal2 = 0.6 * 2600 + 0.2 * steps_est_expected + 0.2 * watch_est_expected
+        assert abs(exp2["kcal"] - expected_kcal2) < 0.01, (exp2["kcal"], expected_kcal2)
+        assert exp2["tags"] == ["adaptive", "steps", "watch"], exp2["tags"]
+        print(f"OK: daily_expenditure + шаги/часы -> доли 0.6/0.2/0.2, kcal={exp2['kcal']:.1f}")
+
+        # 5) пол по-прежнему клампит цель, даже когда расход — смесь нескольких частей,
+        # не только activity_factor: невозможный срок доводит блендированную цель ровно до пола.
+        conn.execute(
+            "UPDATE body_metrics SET fat_pct=40.0 WHERE user_id=? AND date(measured_at)=?",
+            (uid, today.isoformat()),
+        )
+        conn.commit()
+        floor2, _ = kcal_floor(conn, uid, exp2["kcal"])
+        conn.execute(
+            "INSERT INTO milestones(user_id, name, metric, threshold, deadline) VALUES (?, 'blend-floor', 'weight_kg', 70, ?)",
+            (uid, (today + timedelta(days=3)).isoformat()),
+        )
+        conn.commit()
+        result5 = daily_target(conn, uid, de_date)
+        assert result5["kcal"] == floor2, (result5["kcal"], floor2)
+        assert result5["source"].startswith("blend:adaptive+steps+watch"), result5["source"]
+        assert "clamped" in result5["source"], result5["source"]
+        conn.execute("DELETE FROM milestones WHERE user_id=? AND name='blend-floor'", (uid,))
+        conn.execute("UPDATE body_metrics SET fat_pct=NULL WHERE user_id=? AND date(measured_at)=?",
+                     (uid, today.isoformat()))
+        conn.commit()
+        print(f"OK: пол ({floor2:.0f}) применяется к блендированному расходу adaptive+steps+watch, source={result5['source']}")
+
+        # 3) всего 3 залогированных дня -> адаптивная часть недоступна (порог blend_min_logged_days=4), 0.5/0.5
+        conn.execute("DELETE FROM food_log WHERE user_id=?", (uid,))
+        for days_ago in range(2, -1, -1):
+            _add_food_day(uid, (today - timedelta(days=days_ago)).isoformat(), 2600)
+        conn.commit()
+        exp3 = daily_expenditure(conn, uid, de_date)
+        assert exp3["logged_days"] == 3, exp3
+        assert exp3["parts"]["adaptive"] is None, exp3
+        assert abs(exp3["parts"]["steps"]["share"] - 0.5) < 1e-9, exp3
+        assert abs(exp3["parts"]["watch"]["share"] - 0.5) < 1e-9, exp3
+        expected_kcal3 = 0.5 * steps_est_expected + 0.5 * watch_est_expected
+        assert abs(exp3["kcal"] - expected_kcal3) < 0.01, (exp3["kcal"], expected_kcal3)
+        assert exp3["tags"] == ["steps", "watch"], exp3["tags"]
+        print("OK: daily_expenditure 3 дня лога -> адаптивная часть недоступна, шаги/часы 0.5/0.5")
+
+        # 4) совсем ничего -> activity_factor 1.0, тот же путь, что старый estimated_tdee
+        _reset_all(uid)
+        _add_metric(0, 100.0)
+        conn.commit()
+        exp4 = daily_expenditure(conn, uid, today.isoformat())
+        assert exp4["parts"]["adaptive"] is None, exp4
+        assert exp4["parts"]["steps"] is None and exp4["parts"]["watch"] is None, exp4
+        assert abs(exp4["parts"]["activity_factor"]["share"] - 1.0) < 1e-9, exp4
+        bmr4 = bmr_floor(conn, uid)
+        expected_kcal4 = bmr4 * factor_de
+        assert abs(exp4["kcal"] - expected_kcal4) < 0.01, (exp4["kcal"], expected_kcal4)
+        assert exp4["tags"] == ["activity_factor"], exp4["tags"]
+        print(f"OK: daily_expenditure без данных -> activity_factor 1.0, kcal={exp4['kcal']:.1f} = BMR×коэффициент "
+              f"(тот же путь, что старый estimated_tdee)")
+
+        _reset_all(uid)
+        conn.commit()
 
         conn.close()
         print("OK: energy.py self-check passed")
