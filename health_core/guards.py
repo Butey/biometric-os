@@ -701,6 +701,76 @@ def check_binge_risk(conn: sqlite3.Connection, user_id: int):
     return _alert("BINGE_RISK", severity, message, fired_count, min_factors)
 
 
+# ---------------------------------------------------------------- RECOVERY_LOW
+
+def check_recovery_low(conn: sqlite3.Connection, user_id: int):
+    """CONTEXT.md «Сигнал восстановления»: 3 календарных дня подряд, оканчивающихся
+    сегодня или вчера (последний день с обоими показателями), HRV заметно ниже
+    своей медианы за 28 дней ПЕРЕД этими тремя днями И hr_min заметно выше своей —
+    повод облегчить тренировку, не диагноз. Молчит без данных, без медиан
+    (нужно >=10 дней на метрику в окне медианы) и если любой из 3 дней болен/рефид."""
+    cfg = _cfg()
+    today = _now().date()
+
+    end_day = None
+    for offset in (0, 1):
+        d = today - timedelta(days=offset)
+        row = conn.execute(
+            "SELECT hrv_ms, hr_min FROM daily_watch WHERE user_id=? AND date=?", (user_id, d.isoformat())
+        ).fetchone()
+        if row is not None and row["hrv_ms"] is not None and row["hr_min"] is not None:
+            end_day = d
+            break
+    if end_day is None:
+        return None
+
+    three_days = [end_day - timedelta(days=i) for i in (2, 1, 0)]
+
+    from health_core import sick
+    from health_core.energy import _is_refeed
+    for d in three_days:
+        if sick.is_sick(conn, user_id, d.isoformat()) or _is_refeed(conn, user_id, d.isoformat()):
+            return None
+
+    day_rows = {}
+    for d in three_days:
+        row = conn.execute(
+            "SELECT hrv_ms, hr_min FROM daily_watch WHERE user_id=? AND date=?", (user_id, d.isoformat())
+        ).fetchone()
+        if row is None or row["hrv_ms"] is None or row["hr_min"] is None:
+            return None  # неполные 3 дня — сигнал не проверить
+        day_rows[d] = row
+
+    window_end = three_days[0] - timedelta(days=1)
+    window_start = window_end - timedelta(days=27)
+    hist = conn.execute(
+        "SELECT hrv_ms, hr_min FROM daily_watch WHERE user_id=? AND date>=? AND date<=?",
+        (user_id, window_start.isoformat(), window_end.isoformat()),
+    ).fetchall()
+    hrv_vals = [r["hrv_ms"] for r in hist if r["hrv_ms"] is not None]
+    hrmin_vals = [r["hr_min"] for r in hist if r["hr_min"] is not None]
+    if len(hrv_vals) < 10 or len(hrmin_vals) < 10:
+        return None
+
+    hrv_med = statistics.median(hrv_vals)
+    hrmin_med = statistics.median(hrmin_vals)
+    hrv_threshold = hrv_med * (1 - cfg["recovery_hrv_drop_pct"] / 100)
+    hrmin_threshold = hrmin_med + cfg["recovery_hr_min_rise_bpm"]
+
+    for d in three_days:
+        r = day_rows[d]
+        if not (r["hrv_ms"] <= hrv_threshold and r["hr_min"] >= hrmin_threshold):
+            return None
+
+    worst_hrv = min(day_rows[d]["hrv_ms"] for d in three_days)
+    return _alert(
+        "RECOVERY_LOW", "warning",
+        f"HRV и минимальный пульс сигналят о недовосстановлении {three_days[0]}—{three_days[-1]} "
+        f"(3 дня подряд). Не диагноз — повод сделать сегодняшнюю тренировку легче.",
+        round(worst_hrv), round(hrv_threshold),
+    )
+
+
 # ---------------------------------------------------------------- диспетчер
 
 _CHECKS = (
@@ -720,6 +790,7 @@ _CHECKS = (
     check_measure_soon,
     check_binge_risk,
     check_weight_regain,
+    check_recovery_low,
 )
 
 # Режим болезни (health_core/sick.py) глушит поведенческие гардрейлы: во время
@@ -731,6 +802,7 @@ _CHECKS = (
 SICK_QUIET_CODES = frozenset({
     "UNDEREATING", "BINGE_RISK", "PROTEIN_SKEW", "PLATEAU", "RATE_HIGH",
     "STALE_CALIB", "NO_MEASURE", "MEASURE_SOON", "LBM_RATIO", "LBM_DRIFT",
+    "RECOVERY_LOW",
 })
 
 
@@ -937,6 +1009,16 @@ GUARD_DEFINITIONS = {
         "rationale": "Ограничение сна повышает грелин и снижает лептин, усиливая голод и тягу к калорийной еде (Spiegel et al., 2004). Большой накопленный дефицит энергии сам по себе провоцирует компенсаторное переедание. Более высокобелковый завтрак повышает насыщение и снижает потребление калорий в течение дня (Leidy et al., 2013). По отдельности факторы шумные, но их совпадение — устойчивый предиктор срыва.",
         "action": "Полноценный белковый приём пищи в ближайшее время, не углублять дефицит сегодня.",
         "keys": ["binge_window_days", "binge_deficit_kcal", "binge_sleep_min", "binge_breakfast_protein_g", "binge_min_factors"],
+    },
+    "RECOVERY_LOW": {
+        "code": "RECOVERY_LOW",
+        "name": "Сигнал восстановления (3 дня)",
+        "category": "Здоровье и метаболизм",
+        "default_severity": "warning",
+        "description": "3 календарных дня подряд HRV заметно ниже своей медианы за 28 дней и одновременно минимальный пульс заметно выше своей — по данным часов.",
+        "rationale": "Снижение вариабельности пульса (HRV) вместе с ростом минимального пульса во сне — устойчивый признак недовосстановления (накопленный стресс, недосып, начало болезни). Не диагноз, а повод не наращивать нагрузку сегодня.",
+        "action": "Сделать сегодняшнюю тренировку легче или пропустить, проверить сон и стресс.",
+        "keys": ["recovery_hrv_drop_pct", "recovery_hr_min_rise_bpm"],
     },
 }
 
@@ -1162,6 +1244,10 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
         elif code == "BINGE_RISK":
             item["threshold_val"] = f"< {cfg['binge_min_factors']} факторов"
             item["current_val"] = "Триада не выявлена"
+
+        elif code == "RECOVERY_LOW":
+            item["threshold_val"] = f"HRV −{cfg['recovery_hrv_drop_pct']:.0f}%, HRmin +{cfg['recovery_hr_min_rise_bpm']:.0f} — 3 дня подряд"
+            item["current_val"] = "Восстановление в норме"
 
         results.append(item)
 
@@ -1882,5 +1968,41 @@ if __name__ == "__main__":
 
             print("OK: WEIGHT_REGAIN — 3.5% срабатывает, 2.5% молчит, скачок только в дни рефида "
                   "молчит, мало точек молчит")
+
+            # --- RECOVERY_LOW: 3 дня подряд HRV заметно ниже медианы и hr_min заметно выше — срабатывает ---
+            from health_core import watch as _watch
+            u_rec_fire = make_user(180, height_cm=185, created_days_ago=60)
+            today_rec = _now().date()
+            # 28-дневное окно медианы ДО трёх последних дней: hrv=50, hr_min=55
+            for days_ago in range(3, 31):
+                d = (today_rec - timedelta(days=days_ago)).isoformat()
+                _watch.save_days(conn, u_rec_fire, [{"date": d, "hrv_ms": 50, "hr_min": 55}])
+            # последние 3 дня: HRV заметно ниже (40 <= 50*0.85=42.5), hr_min заметно выше (62 >= 55+5=60)
+            for days_ago in (2, 1, 0):
+                d = (today_rec - timedelta(days=days_ago)).isoformat()
+                _watch.save_days(conn, u_rec_fire, [{"date": d, "hrv_ms": 40, "hr_min": 62}])
+            conn.commit()
+            alerts_rec_fire = check_all(conn, u_rec_fire)
+            assert any(a["code"] == "RECOVERY_LOW" for a in alerts_rec_fire), (
+                f"RECOVERY_LOW должен сработать на синтетических данных, получили {alerts_rec_fire}"
+            )
+
+            # --- тихо, если один из 3 дней болен ---
+            from health_core import sick as sick_mod2
+            u_rec_sick = make_user(181, height_cm=185, created_days_ago=60)
+            for days_ago in range(3, 31):
+                d = (today_rec - timedelta(days=days_ago)).isoformat()
+                _watch.save_days(conn, u_rec_sick, [{"date": d, "hrv_ms": 50, "hr_min": 55}])
+            for days_ago in (2, 1, 0):
+                d = (today_rec - timedelta(days=days_ago)).isoformat()
+                _watch.save_days(conn, u_rec_sick, [{"date": d, "hrv_ms": 40, "hr_min": 62}])
+            sick_mod2.start(conn, u_rec_sick, (today_rec - timedelta(days=1)).isoformat(), 1, note="грипп")
+            conn.commit()
+            alerts_rec_sick = check_all(conn, u_rec_sick)
+            assert not any(a["code"] == "RECOVERY_LOW" for a in alerts_rec_sick), (
+                f"RECOVERY_LOW должен молчать, если один из 3 дней болен, получили {alerts_rec_sick}"
+            )
+
+            print("OK: RECOVERY_LOW — 3 дня HRV↓/HRmin↑ подряд срабатывает, день болезни в тройке глушит")
         finally:
             conn.close()

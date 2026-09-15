@@ -14,7 +14,8 @@ from health_core.report import whr, trends
 from health_core.nutrition import day_macros
 from health_core.meds import stock_runs_out
 from health_core import glp1
-from health_core import heart_rate as _heart_rate
+from health_core import watch as _watch
+from health_core.guards import check_recovery_low
 
 
 def _since(days: int) -> str:
@@ -183,7 +184,9 @@ def build(conn: sqlite3.Connection, user_id: int) -> dict:
         "sleep_activity_28d": _sleep_activity_28d(conn, user_id),
         "refeed_sick_days_28d": _refeed_sick_days_28d(conn, user_id),
         "recent_alerts_28d": _recent_alerts_28d(conn, user_id),
-        "daily_hr_28d": _heart_rate.trend_block(conn, user_id),
+        "daily_watch_28d": _watch.trend_block(conn, user_id),
+        "steps_drop_28d": _watch.steps_drop(conn, user_id),
+        "recovery_low": check_recovery_low(conn, user_id),
     }
 
 
@@ -240,9 +243,12 @@ if __name__ == "__main__":
         assert set(empty) == {
             "weight_trend", "body_composition", "waist_12w", "nutrition_vs_target_28d",
             "kcal_floor", "meds", "side_effects_12w", "sleep_activity_28d",
-            "refeed_sick_days_28d", "recent_alerts_28d", "daily_hr_28d",
+            "refeed_sick_days_28d", "recent_alerts_28d", "daily_watch_28d",
+            "steps_drop_28d", "recovery_low",
         }
-        assert empty["daily_hr_28d"] is None, "нет данных пульса -> блок None, а не выдуманные числа"
+        assert empty["daily_watch_28d"] is None, "нет данных с часов -> блок None, а не выдуманные числа"
+        assert empty["steps_drop_28d"] is None, "нет данных шагов -> None"
+        assert empty["recovery_low"] is None, "нет данных часов -> RECOVERY_LOW молчит"
         assert empty["weight_trend"]["4w"]["weight_delta_kg"] is None
         assert empty["body_composition"]["fat_mass_kg"] is None
         assert empty["waist_12w"] == []

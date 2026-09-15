@@ -743,13 +743,14 @@ def test_log_side_effect_add_list_delete():
         conn.close()
 
 
-def test_log_heart_rate_upsert_validate_autoraise_trends():
-    """Дневной пульс (CONTEXT.md «Дневной пульс», «Максимальный пульс»):
-    upsert дня, отказы на неправдоподобных значениях, авто-поднятие личного
-    максимума (два дня подряд выше текущего, тест не перебивается, вниз не
-    снижается), и наличие блока в get_trends.
+def test_log_watch_day_upsert_validate_autoraise_trends():
+    """День с часов (CONTEXT.md «День с часов», «Дневной пульс», «Максимальный
+    пульс»): upsert дня ПО КАЖДОМУ ПОКАЗАТЕЛЮ отдельно, отказы на
+    неправдоподобных значениях, авто-поднятие личного максимума (два дня
+    подряд выше текущего, тест не перебивается, вниз не снижается), и наличие
+    блока в get_trends.
 
-    log_heart_rate и get_trends несут секции в tool_rules.md — main.dispatch
+    log_watch_day и get_trends несут секции в tool_rules.md — main.dispatch
     приклеивает их текстом после JSON, поэтому здесь снимаем блок правил
     strip_tool_rules перед json.loads (как test_log_weight_with_id_list_delete)."""
     def _dispatch_json(name, args):
@@ -767,31 +768,43 @@ def test_log_heart_rate_upsert_validate_autoraise_trends():
         conn.commit()
 
         # --- upsert: повторная запись дня заменяет прежнюю, не плодит вторую строку ---
-        r1 = _dispatch_json("log_heart_rate", {
+        r1 = _dispatch_json("log_watch_day", {
             "days": [{"date": "2026-08-20", "hr_min": 55, "hr_avg": 70, "hr_max": 120}]})
         assert r1["days"][0]["action"] == "added", r1
-        r2 = _dispatch_json("log_heart_rate", {
+        r2 = _dispatch_json("log_watch_day", {
             "days": [{"date": "2026-08-20", "hr_min": 50, "hr_avg": 68, "hr_max": 118}]})
         assert r2["days"][0]["action"] == "replaced", r2
         n = conn.execute("SELECT COUNT(*) c FROM daily_watch WHERE user_id=996 AND date='2026-08-20'").fetchone()["c"]
         assert n == 1, f"upsert должен оставить одну строку, получили {n}"
 
-        # --- валидация: min>max и дата из будущего отклоняются с понятной причиной ---
-        r3 = _dispatch_json("log_heart_rate", {
+        # --- per-metric upsert: батч с одними шагами не стирает пульс того же дня ---
+        r2b = _dispatch_json("log_watch_day", {"days": [{"date": "2026-08-20", "steps": 7000}]})
+        assert r2b["days"][0]["action"] == "replaced", r2b
+        row_pm = conn.execute(
+            "SELECT hr_min, hr_avg, hr_max, steps FROM daily_watch WHERE user_id=996 AND date='2026-08-20'"
+        ).fetchone()
+        assert row_pm["hr_min"] == 50 and row_pm["hr_avg"] == 68 and row_pm["hr_max"] == 118, dict(row_pm)
+        assert row_pm["steps"] == 7000, dict(row_pm)
+
+        # --- валидация: min>max, диапазон шагов и дата из будущего отклоняются с понятной причиной ---
+        r3 = _dispatch_json("log_watch_day", {
             "days": [{"date": "2026-08-21", "hr_min": 100, "hr_max": 90}]})
         assert "error" in r3["days"][0], r3
 
+        r3b = _dispatch_json("log_watch_day", {"days": [{"date": "2026-08-21", "steps": 999999}]})
+        assert "error" in r3b["days"][0], r3b
+
         from datetime import date as _date, timedelta as _td
         future = (_date.today() + _td(days=30)).isoformat()
-        r4 = _dispatch_json("log_heart_rate", {"days": [{"date": future, "hr_avg": 70}]})
+        r4 = _dispatch_json("log_watch_day", {"days": [{"date": future, "hr_avg": 70}]})
         assert "error" in r4["days"][0] and "будущ" in r4["days"][0]["error"], r4
 
         # --- авто-поднятие максимума: один день выше формулы ничего не делает ---
-        r5 = _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-22", "hr_max": 230}]})
+        r5 = _dispatch_json("log_watch_day", {"days": [{"date": "2026-08-22", "hr_max": 230}]})
         assert r5["max_hr_update"] is None, "один всплеск не должен поднимать личный максимум"
 
         # --- второй день выше текущего — поднимает, source='watch' ---
-        r6 = _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-23", "hr_max": 225}]})
+        r6 = _dispatch_json("log_watch_day", {"days": [{"date": "2026-08-23", "hr_max": 225}]})
         assert r6["max_hr_update"] is not None and r6["max_hr_update"]["new"] == 225, r6
         urow = conn.execute("SELECT hr_max_bpm, hr_max_source FROM users WHERE id=996").fetchone()
         assert urow["hr_max_bpm"] == 225 and urow["hr_max_source"] == "watch", dict(urow)
@@ -799,8 +812,8 @@ def test_log_heart_rate_upsert_validate_autoraise_trends():
         # --- источник 'test' часами не перебивается, даже двумя днями выше ---
         conn.execute("UPDATE users SET hr_max_bpm=210, hr_max_source='test' WHERE id=996")
         conn.commit()
-        _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-24", "hr_max": 235}]})
-        _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-25", "hr_max": 236}]})
+        _dispatch_json("log_watch_day", {"days": [{"date": "2026-08-24", "hr_max": 235}]})
+        _dispatch_json("log_watch_day", {"days": [{"date": "2026-08-25", "hr_max": 236}]})
         urow2 = conn.execute("SELECT hr_max_bpm, hr_max_source FROM users WHERE id=996").fetchone()
         assert urow2["hr_max_bpm"] == 210 and urow2["hr_max_source"] == "test", "тест не должен перебиваться часами"
 
@@ -808,15 +821,110 @@ def test_log_heart_rate_upsert_validate_autoraise_trends():
         conn.execute("DELETE FROM daily_watch WHERE user_id=996")
         conn.execute("UPDATE users SET hr_max_bpm=210, hr_max_source='watch' WHERE id=996")
         conn.commit()
-        _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-26", "hr_min": 55, "hr_avg": 65, "hr_max": 100}]})
-        _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-27", "hr_min": 56, "hr_avg": 66, "hr_max": 101}]})
+        _dispatch_json("log_watch_day", {"days": [{"date": "2026-08-26", "hr_min": 55, "hr_avg": 65, "hr_max": 100}]})
+        _dispatch_json("log_watch_day", {"days": [{"date": "2026-08-27", "hr_min": 56, "hr_avg": 66, "hr_max": 101}]})
         urow3 = conn.execute("SELECT hr_max_bpm FROM users WHERE id=996").fetchone()
         assert urow3["hr_max_bpm"] == 210, "максимум не должен снижаться от низких дней"
 
-        # --- get_trends содержит блок дневного пульса ---
+        # --- get_trends содержит блок дня с часов ---
         trends = _dispatch_json("get_trends", {})
-        assert "daily_hr" in trends, f"нет поля daily_hr в get_trends: {trends}"
-        assert trends["daily_hr"] is not None and trends["daily_hr"]["coverage_days"] == 2, trends["daily_hr"]
+        assert "daily_watch" in trends, f"нет поля daily_watch в get_trends: {trends}"
+        assert trends["daily_watch"] is not None and trends["daily_watch"]["coverage_days"] == 2, trends["daily_watch"]
+    finally:
+        conn.close()
+
+
+def test_log_watch_day_step_goal_and_steps_drop():
+    """CONTEXT.md «Цель шагов»: медиана 28д до последнего понедельника +1000,
+    потолок 10000, <7 дней с шагами в окне -> None. steps_drop: падение
+    медианы шагов >= guards.steps_drop_pct между окнами 28/28."""
+    from datetime import datetime as _dt, timedelta as _td
+    from health_core import watch as _watch
+    from health_core.config import user_today as _user_today
+
+    registry.set_caller("995")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM users WHERE id=995")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(995,'995',180,'1990-01-01',"
+            "'male','UTC',75,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+        uid = 995
+        today = _dt.strptime(_user_today(conn, uid), "%Y-%m-%d").date()
+        monday = today - _td(days=today.weekday())
+
+        for i in range(5):
+            d = (monday - _td(days=i)).isoformat()
+            _watch.save_days(conn, uid, [{"date": d, "steps": 5000}])
+        assert _watch.step_goal(conn, uid, today.isoformat()) is None, "меньше 7 дней с шагами в окне -> None"
+
+        for i in range(5, 10):
+            d = (monday - _td(days=i)).isoformat()
+            _watch.save_days(conn, uid, [{"date": d, "steps": 5000}])
+        assert _watch.step_goal(conn, uid, today.isoformat()) == 6000, "медиана 5000 + 1000 = 6000"
+
+        for i in range(10):
+            d = (monday - _td(days=i)).isoformat()
+            _watch.save_days(conn, uid, [{"date": d, "steps": 20000}])
+        assert _watch.step_goal(conn, uid, today.isoformat()) == 10000, "потолок цели шагов — 10000"
+
+        # --- steps_drop: падение медианы >=15% между последними 28д и предыдущими 28д ---
+        conn.execute("DELETE FROM daily_watch WHERE user_id=?", (uid,))
+        conn.commit()
+        assert _watch.steps_drop(conn, uid) is None, "нет данных -> None"
+        for days_ago in range(7):
+            d = (today - _td(days=days_ago)).isoformat()
+            _watch.save_days(conn, uid, [{"date": d, "steps": 4000}])
+        assert _watch.steps_drop(conn, uid) is None, "нет предыдущего окна -> None"
+        for days_ago in range(28, 35):
+            d = (today - _td(days=days_ago)).isoformat()
+            _watch.save_days(conn, uid, [{"date": d, "steps": 10000}])
+        sd = _watch.steps_drop(conn, uid)
+        assert sd is not None and sd["drop_pct"] >= 15, sd
+    finally:
+        conn.close()
+
+
+def test_recovery_low_fires_and_sick_silences():
+    """RECOVERY_LOW (CONTEXT.md «Сигнал восстановления»): 3 дня подряд HRV
+    заметно ниже своей медианы и hr_min заметно выше своей — срабатывает через
+    check_all; молчит, если один из 3 дней помечен больным."""
+    from datetime import timedelta as _td
+    from health_core import watch as _watch, sick
+    from health_core.guards import check_all, _now
+
+    registry.set_caller("994")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM users WHERE id=994")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(994,'994',180,'1990-01-01',"
+            "'male','UTC',75,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+        uid = 994
+        today = _now().date()
+
+        for days_ago in range(3, 31):
+            d = (today - _td(days=days_ago)).isoformat()
+            _watch.save_days(conn, uid, [{"date": d, "hrv_ms": 50, "hr_min": 55}])
+        for days_ago in (2, 1, 0):
+            d = (today - _td(days=days_ago)).isoformat()
+            _watch.save_days(conn, uid, [{"date": d, "hrv_ms": 40, "hr_min": 62}])
+        conn.commit()
+        alerts = check_all(conn, uid)
+        assert any(a["code"] == "RECOVERY_LOW" for a in alerts), f"RECOVERY_LOW должен сработать, получили {alerts}"
+
+        sick.start(conn, uid, (today - _td(days=1)).isoformat(), 1, note="грипп")
+        conn.commit()
+        alerts_sick = check_all(conn, uid)
+        assert not any(a["code"] == "RECOVERY_LOW" for a in alerts_sick), (
+            f"RECOVERY_LOW должен молчать, если один из 3 дней болен, получили {alerts_sick}"
+        )
     finally:
         conn.close()
 

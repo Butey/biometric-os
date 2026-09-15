@@ -24,7 +24,7 @@ DESCRIPTIONS = {
     "log_water": "Записать выпитую воду в мл.",
     "log_glucose": "Записать замер сахара крови (ммоль/л), опционально контекст (до/после еды).",
     "log_side_effect": "Записать побочный эффект с тяжестью mild/moderate/severe. Без привязки к препарату — связь по времени приёма устанавливает модель.",
-    "log_heart_rate": "Записать дневной пульс с часов (min/avg/max за конкретный день, можно сразу несколько дней). Только суточные значения — сводки за неделю/месяц не принимать.",
+    "log_watch_day": "Записать день с часов: пульс (min/avg/max), шаги, калории активности, стресс, HRV за конкретный день, можно сразу несколько дней. Только суточные значения — сводки за неделю/месяц не принимать. Запись дня заменяет только присланные показатели.",
     "council": "Консилиум: честный разбор всех данных человека несколькими независимыми моделями в фоне. request запускает разбор и сразу отвечает, итог придёт отдельным сообщением; status — последний результат.",
     "log_labs": "Анализы крови текстом (маркеры и единицы — см. параметр markers): add — записать на дату сдачи; list — история; delete — по lab_id; derived — HOMA-IR, eGFR, non-HDL, eAG, TyG, TG/HDL, AIP, FIB-4.",
     "log_sleep": "Записать сон за ночь: длительность в минутах, время отбоя и подъёма, субъективная оценка 1-5.",
@@ -252,7 +252,7 @@ if __name__ == "__main__":
     conn.commit()
 
     expected_tools = {
-        "log_food", "food_lookup", "log_water", "log_glucose", "log_side_effect", "log_heart_rate", "log_labs", "log_sleep", "log_weight",
+        "log_food", "food_lookup", "log_water", "log_glucose", "log_side_effect", "log_watch_day", "log_labs", "log_sleep", "log_weight",
         "equipment", "plan_day", "log_workout", "refeed", "sick", "forecast",
         "log_anthropometry", "log_med", "pharma", "drug_card_draft", "plans", "import_scale_export",
         "get_day_summary", "get_trends", "get_status_bar",

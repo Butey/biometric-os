@@ -169,6 +169,13 @@ guards:
   binge_sleep_min: 390
   binge_breakfast_protein_g: 20
   binge_min_factors: 2
+  # падение медианы шагов (28д против прошлых 28д), % — health_core/watch.py::steps_drop
+  steps_drop_pct: 15
+  # RECOVERY_LOW (CONTEXT.md «Сигнал восстановления») — 3 дня подряд HRV заметно
+  # ниже своей медианы за 28 дней И hr_min заметно выше своей; не диагноз, повод
+  # облегчить тренировку
+  recovery_hrv_drop_pct: 15
+  recovery_hr_min_rise_bpm: 5
 
 # Окна приёмов пищи (CONTEXT.md «Окно приёма пищи») — health_core/chrono.py::meal_slot.
 # Одно определение на запись (log_food), статус-бар и напоминания (meal_window_check).

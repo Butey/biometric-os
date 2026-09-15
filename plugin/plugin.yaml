@@ -21,7 +21,7 @@ provides_tools:
   - log_water
   - log_glucose
   - log_side_effect
-  - log_heart_rate
+  - log_watch_day
   - log_labs
   - log_weight
   - log_anthropometry
