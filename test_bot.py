@@ -563,6 +563,26 @@ def test_food_lookup_remember_match_and_log_food_per_100g():
         }))
         assert "error" not in result, result
         assert result["items"][0]["kcal"] == 39, result
+
+        # per_100g.kcal==0 легитимен для реального продукта (вода) и не
+        # должен требовать прямого kcal — не путать с "не передано".
+        result = json.loads(main.dispatch("log_food", {
+            "items": [{
+                "name": "Вода", "grams": 300, "source": "off",
+                "per_100g": {"kcal": 0, "protein_g": 0, "fat_g": 0, "carbs_g": 0},
+            }],
+        }))
+        assert "error" not in result, result
+        assert result["items"][0]["kcal"] == 0, result
+
+        # Отрицательные grams через per_100g не должны дать отрицательные kcal/БЖУ.
+        result = json.loads(main.dispatch("log_food", {
+            "items": [{
+                "name": "Перец болгарский", "grams": -100, "source": "estimate",
+                "per_100g": {"kcal": 30, "protein_g": 1.0, "fat_g": 0.2, "carbs_g": 6.0},
+            }],
+        }))
+        assert "error" in result, f"отрицательные grams должны быть отклонены: {result}"
     finally:
         conn.execute("DELETE FROM alerts WHERE user_id=881")
         conn.execute("DELETE FROM food_log WHERE user_id=881")

@@ -533,6 +533,21 @@ def handle_log_food(params: dict) -> str:
             {"error": f"Не хватает КБЖУ у позиций: {'; '.join(_bad)}. "
                       f"Оценку тоже можно, но числа обязательны."},
             ensure_ascii=False)
+    # Отрицательные grams (per_100g-ветка выше не гейтит знак: `not -100`
+    # ложно, отрицательное — истинное значение в Python) дают отрицательные
+    # kcal/БЖУ — тихо портят дневную сумму и все гарды (UNDEREATING,
+    # BINGE_RISK, LIPID_GUARD). Единый гейт на выходе — для обеих веток,
+    # per_100g и прямых чисел от модели.
+    _neg = []
+    for i in items:
+        bad_fields = [f for f in _MACRO_FIELDS if (i.get(f) or 0) < 0]
+        if bad_fields:
+            _neg.append(f"{i.get('name') or '?'} ({', '.join(bad_fields)})")
+    if _neg:
+        conn.close()
+        return json.dumps(
+            {"error": f"Отрицательные значения у позиций: {'; '.join(_neg)}."},
+            ensure_ascii=False)
 
     # Одна позиция = один приём пищи. Модель иногда схлопывает весь день в один
     # item (наблюдалось на проде: 'Полный рацион за 21.08 (Завтрак, перекус,
