@@ -289,6 +289,11 @@ bot:
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
       model: gemini-3.8-flash
+    # Резерв вне квоты Google. :free — лимиты OpenRouter на бесплатные модели,
+    # и бесплатные эндпоинты могут сохранять запросы.
+    - base_url: https://openrouter.ai/api/v1
+      api_key_env: OPENROUTER_API_KEY
+      model: google/gemma-4-31b-it:free
 council:
   # Аналитики — две разные модели Gemini, вызываются по очереди (bot/council.py)
   # чтобы не выбивать общую бесплатную квоту Google, на которой работает чат.

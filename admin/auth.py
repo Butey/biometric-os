@@ -38,7 +38,9 @@ def load_env_file(path: Path = ENV_PATH, force: bool = False) -> None:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        if key and (force or key not in os.environ):
+        # Пустую переменную тоже заполняем: ключ, добавленный в админке, иначе
+        # не дойдёт до уже запущенного бота без перезапуска.
+        if key and (force or not os.environ.get(key)):
             os.environ[key] = _strip_inline_comment(value)
 
 
