@@ -29,8 +29,9 @@ def _sport_from_filename(path: str) -> str | None:
 
 
 def _parse_summary(path: str) -> dict:
-    started_at = kcal = avg_hr = duration_sec = None
-    in_lap = False  # в датасете ровно один Lap на файл; Calories вне Lap — итог тренировки
+    started_at = kcal = lap_kcal = avg_hr = duration_sec = None
+    in_lap = False  # в датасете ровно один Lap на файл; Calories вне Lap — итог тренировки,
+    # но у части файлов (без GPS-дубля вне Lap) итог указан только внутри Lap — тогда берём его.
     for event, el in ET.iterparse(path, events=("start", "end")):
         tag = el.tag.split("}")[-1]
         if event == "start":
@@ -41,6 +42,8 @@ def _parse_summary(path: str) -> dict:
             started_at = (el.text or "").strip()
         elif tag == "Calories" and not in_lap and kcal is None:
             kcal = el.text
+        elif tag == "Calories" and in_lap and lap_kcal is None:
+            lap_kcal = el.text
         elif tag == "TotalTimeSeconds" and duration_sec is None:
             duration_sec = el.text
         elif tag == "HeartRateBpm" and avg_hr is None:
@@ -49,6 +52,7 @@ def _parse_summary(path: str) -> dict:
             in_lap = False
         el.clear()  # освобождаем содержимое узла (включая трекпоинты) сразу после чтения
 
+    kcal = kcal if kcal is not None else lap_kcal
     return {
         "started_at": started_at,
         "duration_sec": float(duration_sec) if duration_sec else None,
@@ -87,3 +91,12 @@ def import_tcx(conn, user_id: int, path: str) -> dict:
     )
     conn.commit()
     return {"added": added, "skipped": 1 - added}
+
+
+if __name__ == "__main__":
+    # Регрессия: файлы без GPS-дубля Calories вне Lap — итог только внутри
+    # Lap, раньше терялся молча (kcal=None на реальных тренировках).
+    _f = "Metrics/Activity/20260730Бег на улице.tcx"
+    _s = _parse_summary(_f)
+    assert _s["kcal"] == 421.0, _s
+    print("OK: tcx._parse_summary — kcal только внутри Lap не теряется")
