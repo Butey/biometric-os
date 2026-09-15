@@ -31,7 +31,10 @@ def _validate_day(date_str, raw: dict, today: str) -> tuple[str, dict]:
     vals = {}
     for name, (lo, hi) in _RANGES.items():
         raw_v = raw.get(name)
-        if raw_v is None:
+        # Модель (GPT) заполняет непереданные числовые поля нулём. Там, где 0
+        # заведомо не бывает реальным значением (нижняя граница диапазона >0),
+        # это неотличимо от "не прислали" — не отклоняем всю запись дня.
+        if raw_v is None or (raw_v == 0 and lo > 0):
             vals[name] = None
             continue
         try:
@@ -292,6 +295,15 @@ if __name__ == "__main__":
     save_days(conn, uid, [{"date": "2026-09-01", "steps": 9000}])
     row_pm2 = conn.execute("SELECT hr_min, steps FROM daily_watch WHERE user_id=? AND date='2026-09-01'", (uid,)).fetchone()
     assert row_pm2["hr_min"] == 50 and row_pm2["steps"] == 9000, dict(row_pm2)
+
+    # --- GPT заполняет непереданные hr/hrv нулём — не должно валить steps ---
+    r_zero = save_days(conn, uid, [{
+        "date": "2026-09-02", "steps": 540, "hr_min": 0, "hr_avg": 0, "hr_max": 0,
+        "active_kcal": 0, "hrv_ms": 0, "stress_avg": 0,
+    }])
+    assert "error" not in r_zero["days"][0], r_zero
+    row_zero = conn.execute("SELECT steps, hr_min FROM daily_watch WHERE user_id=? AND date='2026-09-02'", (uid,)).fetchone()
+    assert row_zero["steps"] == 540 and row_zero["hr_min"] is None, dict(row_zero)
 
     # --- валидация: min > max отклоняется, остальные дни батча не страдают ---
     r3 = save_days(conn, uid, [
