@@ -139,9 +139,14 @@ def check_lbm_drift(conn: sqlite3.Connection, user_id: int):
 
 def check_ffmi_floor(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
+    # "Утренний замер" — окно 06:00-11:00, как и везде в проекте (§09,
+    # energy.py _morning_weights): биоимпеданс вне этого окна не в том
+    # состоянии гидратации, для которого калиброван расчёт. Верхней границы
+    # без нижней хватало впустить ночной замер (00:00-06:00) в критический гард.
     row = conn.execute(
         "SELECT ffm_kg FROM body_metrics "
-        "WHERE user_id=? AND ffm_kg IS NOT NULL AND CAST(strftime('%H', measured_at) AS INTEGER) < 11 "
+        "WHERE user_id=? AND ffm_kg IS NOT NULL "
+        "AND time(measured_at) BETWEEN '06:00:00' AND '11:00:00' "
         "ORDER BY measured_at DESC LIMIT 1",
         (user_id,),
     ).fetchone()
@@ -349,7 +354,9 @@ def check_rate_high(conn: sqlite3.Connection, user_id: int):
     ).fetchall()
     if len(rows) < min_points:
         return None
-    days_covered = (_parse(rows[-1]["measured_at"]) - _parse(rows[0]["measured_at"])).days
+    # .date()-разница, не полных datetime: timedelta.days округляет вниз (см.
+    # _gap_days выше) — на границе окна округление молчало бы про RATE_HIGH.
+    days_covered = (_parse(rows[-1]["measured_at"]).date() - _parse(rows[0]["measured_at"]).date()).days
     if days_covered < 10:
         return None  # темп неизвестен на коротком покрытии
 
@@ -413,7 +420,7 @@ def check_weight_regain(conn: sqlite3.Connection, user_id: int):
     pct_delta = kg_delta / first_med * 100
     threshold = cfg["regain_pct"]
     if pct_delta > threshold:
-        days_covered = (_parse(rows[-1]["measured_at"]) - _parse(rows[0]["measured_at"])).days
+        days_covered = (_parse(rows[-1]["measured_at"]).date() - _parse(rows[0]["measured_at"]).date()).days
         return _alert(
             "WEIGHT_REGAIN", "warning",
             f"Вес вырос на {kg_delta:.1f} кг ({pct_delta:.1f}%) за {days_covered} дн.",
