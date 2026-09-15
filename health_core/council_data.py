@@ -14,6 +14,7 @@ from health_core.report import whr, trends
 from health_core.nutrition import day_macros
 from health_core.meds import stock_runs_out
 from health_core import glp1
+from health_core import heart_rate as _heart_rate
 
 
 def _since(days: int) -> str:
@@ -182,6 +183,7 @@ def build(conn: sqlite3.Connection, user_id: int) -> dict:
         "sleep_activity_28d": _sleep_activity_28d(conn, user_id),
         "refeed_sick_days_28d": _refeed_sick_days_28d(conn, user_id),
         "recent_alerts_28d": _recent_alerts_28d(conn, user_id),
+        "daily_hr_28d": _heart_rate.trend_block(conn, user_id),
     }
 
 
@@ -238,8 +240,9 @@ if __name__ == "__main__":
         assert set(empty) == {
             "weight_trend", "body_composition", "waist_12w", "nutrition_vs_target_28d",
             "kcal_floor", "meds", "side_effects_12w", "sleep_activity_28d",
-            "refeed_sick_days_28d", "recent_alerts_28d",
+            "refeed_sick_days_28d", "recent_alerts_28d", "daily_hr_28d",
         }
+        assert empty["daily_hr_28d"] is None, "нет данных пульса -> блок None, а не выдуманные числа"
         assert empty["weight_trend"]["4w"]["weight_delta_kg"] is None
         assert empty["body_composition"]["fat_mass_kg"] is None
         assert empty["waist_12w"] == []

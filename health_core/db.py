@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -451,6 +451,21 @@ CREATE TABLE IF NOT EXISTS my_products (
     created_at TEXT NOT NULL,
     UNIQUE(user_id, name_key)
 );
+
+-- v25: дневной пульс с часов (CONTEXT.md «Дневной пульс») — один набор
+-- min/avg/max на календарный день, повторная запись дня заменяет прежнюю
+-- (UNIQUE(user_id, date) + upsert в health_core/heart_rate.py).
+CREATE TABLE IF NOT EXISTS daily_heart_rate (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    date TEXT NOT NULL,
+    hr_min INTEGER,
+    hr_avg INTEGER,
+    hr_max INTEGER,
+    source TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(user_id, date)
+);
 """
 
 
@@ -626,6 +641,19 @@ def _migrate_v23_to_v24(conn: sqlite3.Connection) -> None:
     _add_column(conn, "users", "hr_max_source", "TEXT CHECK(hr_max_source IN ('test','watch'))")
 
 
+def _migrate_v24_to_v25(conn: sqlite3.Connection) -> None:
+    """v24->v25: daily_heart_rate — новая таблица, CREATE TABLE IF NOT EXISTS в
+    DDL уже создаёт её идемпотентно (тот же приём, что в _migrate_v19_to_v20
+    для side_effects). Отдельный шаг — чтобы номер версии не перепрыгивал
+    молча мимо неё на базах со старой версией."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS daily_heart_rate ("
+        "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), "
+        "date TEXT NOT NULL, hr_min INTEGER, hr_avg INTEGER, hr_max INTEGER, "
+        "source TEXT, created_at TEXT NOT NULL, UNIQUE(user_id, date))"
+    )
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
     row = conn.execute("SELECT version FROM schema_version").fetchone()
@@ -670,6 +698,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v22_to_v23(conn)
         if row["version"] < 24:
             _migrate_v23_to_v24(conn)
+        if row["version"] < 25:
+            _migrate_v24_to_v25(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 

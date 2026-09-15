@@ -921,6 +921,48 @@ log_labs_schema = {
     "required": []
 }
 
+log_heart_rate_schema = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["add", "list", "delete"],
+            "description": "add (умолчание) — записать дневной пульс за один или несколько дней; delete — удалить день (date, без него — последнюю запись); list — список"
+        },
+        "days": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "Дата YYYY-MM-DD — ровно один календарный день, не диапазон"},
+                    "hr_min": {"type": "integer", "description": "Минимальный пульс за день, уд/мин (30-150)"},
+                    "hr_avg": {"type": "integer", "description": "Средний пульс за день, уд/мин (35-200)"},
+                    "hr_max": {"type": "integer", "description": "Максимальный пульс за день, уд/мин (50-240)"}
+                },
+                "required": ["date"]
+            },
+            "description": "Для action=add: по одному набору значений на КОНКРЕТНЫЙ день из данных часов (скриншот или текст суточной карточки), можно сразу несколько дней за раз (например, за месяц скриншотов). Сводки за неделю/месяц и значения, снятые на глаз с общего графика, НЕ записывать — только то, что часы показали как значение одного дня. В каждом дне нужно хотя бы одно из hr_min/hr_avg/hr_max; повторная запись того же дня заменяет прежнюю"
+        },
+        "date": {
+            "type": "string",
+            "description": "Для action=delete: дата YYYY-MM-DD; без параметра удаляется последняя запись"
+        },
+        "since_days": {
+            "type": "integer",
+            "description": "Для action=list: только записи не старше стольких дней"
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Для action=list: сколько последних записей вернуть (по умолчанию 30)"
+        },
+        "user_id": {
+            "type": "integer",
+            "description": "ID пользователя"
+        }
+    },
+    "required": []
+}
+
 sick_schema = {
     "type": "object",
     "properties": {

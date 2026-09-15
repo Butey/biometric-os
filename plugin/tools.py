@@ -1188,6 +1188,59 @@ def handle_log_side_effect(params: dict) -> str:
 
 
 @_handler_wrapper
+def handle_log_heart_rate(params: dict) -> str:
+    """Дневной пульс с часов (CONTEXT.md «Дневной пульс»): min/avg/max за
+    КОНКРЕТНЫЙ календарный день, action=add|list|delete. Только один день за
+    раз в каждом элементе days — сводки за неделю/месяц не пишем, их
+    правдоподобие код проверить не может. Батч days принимает сразу несколько
+    дней (например, скриншоты за месяц)."""
+    conn = connect()
+    migrate(conn)
+    user_id = _get_user_id(params, conn)
+
+    action = (params.get("action") or "add").lower()
+    from health_core import heart_rate as _hr
+
+    # ── Просмотр записей ──
+    if action == "list":
+        try:
+            limit = min(int(params.get("limit") or 30), 100)
+        except (TypeError, ValueError):
+            limit = 30
+        since_days = params.get("since_days")
+        try:
+            since_days = int(since_days) if since_days is not None else None
+        except (TypeError, ValueError):
+            since_days = None
+        entries = _hr.list_days(conn, user_id, limit=limit, since_days=since_days)
+        conn.close()
+        return json.dumps({"entries": entries, "count": len(entries)}, ensure_ascii=False)
+
+    # ── Удаление ошибочной записи ──
+    if action == "delete":
+        date = params.get("date")
+        deleted = _hr.delete_day(conn, user_id, date)
+        conn.close()
+        if deleted is None:
+            msg = "Записей дневного пульса нет" if date is None else f"Записи за {date} нет"
+            return json.dumps({"error": msg}, ensure_ascii=False)
+        return json.dumps({"deleted": {"date": deleted}}, ensure_ascii=False)
+
+    # ── Добавление (по умолчанию) ──
+    days = params.get("days")
+    if not days:
+        conn.close()
+        return json.dumps(
+            {"error": "Нужен days: [{date, hr_min, hr_avg, hr_max}] — хотя бы один день"},
+            ensure_ascii=False,
+        )
+
+    result = _hr.save_days(conn, user_id, days)
+    conn.close()
+    return json.dumps(result, ensure_ascii=False)
+
+
+@_handler_wrapper
 def handle_council(params: dict) -> str:
     """Консилиум (docs/adr/0003-консилиум.md): честный разбор всех данных
     человека несколькими независимыми моделями в фоне. action=request с
@@ -2404,6 +2457,10 @@ def handle_get_trends(params: dict) -> str:
         t["hr_zones"] = _hz.zones(conn, user_id)
     except Exception:
         pass
+
+    # Дневной пульс (CONTEXT.md «Дневной пульс»): медиана за 28д против прошлых 28д
+    from health_core import heart_rate as _hr
+    t["daily_hr"] = _hr.trend_block(conn, user_id)
 
     conn.close()
 
@@ -5190,6 +5247,7 @@ def register(ctx):
         ("log_water", handle_log_water, schemas.log_water_schema),
         ("log_glucose", handle_log_glucose, schemas.log_glucose_schema),
         ("log_side_effect", handle_log_side_effect, schemas.log_side_effect_schema),
+        ("log_heart_rate", handle_log_heart_rate, schemas.log_heart_rate_schema),
         ("council", handle_council, schemas.council_schema),
         ("log_labs", handle_log_labs, schemas.log_labs_schema),
         ("log_sleep", handle_log_sleep, schemas.log_sleep_schema),
@@ -5314,7 +5372,7 @@ if __name__ == "__main__":
         register(ctx)
 
         expected_tools = {
-            "log_food", "food_lookup", "log_water", "log_glucose", "log_side_effect", "log_labs", "log_sleep", "log_weight",
+            "log_food", "food_lookup", "log_water", "log_glucose", "log_side_effect", "log_heart_rate", "log_labs", "log_sleep", "log_weight",
             "equipment", "plan_day", "log_workout", "refeed", "sick", "forecast",
             "log_anthropometry", "log_med", "pharma", "drug_card_draft", "plans", "import_scale_export",
             "get_day_summary", "get_trends", "get_status_bar",
@@ -6592,6 +6650,9 @@ if __name__ == "__main__":
             "log_water": {"ml": 250},
             "log_glucose": {"mmol_l": 5.5},
             "log_side_effect": {"symptom": "тошнота"},
+            # days не required схемой (add() валидный без него был бы ошибкой
+            # контракта в другую сторону), дата — заведомо прошлая.
+            "log_heart_rate": {"days": [{"date": "2020-01-01", "hr_avg": 65}]},
             "log_labs": {"markers": {"glucose": 5.0, "insulin": 10}},
             "log_sleep": {"duration_min": 480},
             "log_weight": {"weight_kg": 80.0},

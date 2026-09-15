@@ -63,7 +63,7 @@ def test_tool_specs():
     _tools._set_mode("111222", "user")
     specs = main.tool_specs()
     names = [s["function"]["name"] for s in specs]
-    assert len(names) == 36, f"35 инструментов плагина (без admin_cmd) + knowledge, получено {len(names)}"
+    assert len(names) == 37, f"36 инструментов плагина (без admin_cmd) + knowledge, получено {len(names)}"
     assert "knowledge" in names, "инструмент знаний не подключён"
     assert "log_food" in names and "get_status_bar" in names
     assert "admin_cmd" not in names, "admin_cmd не должен быть виден не-админу"
@@ -74,7 +74,7 @@ def test_tool_specs():
 
     _tools._set_mode("111222", "admin")
     admin_names = [s["function"]["name"] for s in main.tool_specs()]
-    assert len(admin_names) == 37, f"36 инструментов плагина + knowledge для админа, получено {len(admin_names)}"
+    assert len(admin_names) == 38, f"37 инструментов плагина + knowledge для админа, получено {len(admin_names)}"
     assert "admin_cmd" in admin_names, "admin_cmd должен быть виден админу"
     _tools._set_mode("111222", "user")
 
@@ -739,6 +739,84 @@ def test_log_side_effect_add_list_delete():
         result_list2 = json.loads(main.dispatch("log_side_effect", {"action": "list", "limit": 10}))
         found2 = any(e["side_effect_id"] == side_effect_id for e in result_list2["entries"])
         assert not found2, f"side_effect_id {side_effect_id} всё ещё есть в list после удаления"
+    finally:
+        conn.close()
+
+
+def test_log_heart_rate_upsert_validate_autoraise_trends():
+    """Дневной пульс (CONTEXT.md «Дневной пульс», «Максимальный пульс»):
+    upsert дня, отказы на неправдоподобных значениях, авто-поднятие личного
+    максимума (два дня подряд выше текущего, тест не перебивается, вниз не
+    снижается), и наличие блока в get_trends.
+
+    log_heart_rate и get_trends несут секции в tool_rules.md — main.dispatch
+    приклеивает их текстом после JSON, поэтому здесь снимаем блок правил
+    strip_tool_rules перед json.loads (как test_log_weight_with_id_list_delete)."""
+    def _dispatch_json(name, args):
+        return json.loads(main.strip_tool_rules(main.dispatch(name, args)))
+
+    registry.set_caller("996")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM users WHERE id=996")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(996,'996',180,'1990-01-01',"
+            "'male','UTC',75,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+
+        # --- upsert: повторная запись дня заменяет прежнюю, не плодит вторую строку ---
+        r1 = _dispatch_json("log_heart_rate", {
+            "days": [{"date": "2026-08-20", "hr_min": 55, "hr_avg": 70, "hr_max": 120}]})
+        assert r1["days"][0]["action"] == "added", r1
+        r2 = _dispatch_json("log_heart_rate", {
+            "days": [{"date": "2026-08-20", "hr_min": 50, "hr_avg": 68, "hr_max": 118}]})
+        assert r2["days"][0]["action"] == "replaced", r2
+        n = conn.execute("SELECT COUNT(*) c FROM daily_heart_rate WHERE user_id=996 AND date='2026-08-20'").fetchone()["c"]
+        assert n == 1, f"upsert должен оставить одну строку, получили {n}"
+
+        # --- валидация: min>max и дата из будущего отклоняются с понятной причиной ---
+        r3 = _dispatch_json("log_heart_rate", {
+            "days": [{"date": "2026-08-21", "hr_min": 100, "hr_max": 90}]})
+        assert "error" in r3["days"][0], r3
+
+        from datetime import date as _date, timedelta as _td
+        future = (_date.today() + _td(days=30)).isoformat()
+        r4 = _dispatch_json("log_heart_rate", {"days": [{"date": future, "hr_avg": 70}]})
+        assert "error" in r4["days"][0] and "будущ" in r4["days"][0]["error"], r4
+
+        # --- авто-поднятие максимума: один день выше формулы ничего не делает ---
+        r5 = _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-22", "hr_max": 230}]})
+        assert r5["max_hr_update"] is None, "один всплеск не должен поднимать личный максимум"
+
+        # --- второй день выше текущего — поднимает, source='watch' ---
+        r6 = _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-23", "hr_max": 225}]})
+        assert r6["max_hr_update"] is not None and r6["max_hr_update"]["new"] == 225, r6
+        urow = conn.execute("SELECT hr_max_bpm, hr_max_source FROM users WHERE id=996").fetchone()
+        assert urow["hr_max_bpm"] == 225 and urow["hr_max_source"] == "watch", dict(urow)
+
+        # --- источник 'test' часами не перебивается, даже двумя днями выше ---
+        conn.execute("UPDATE users SET hr_max_bpm=210, hr_max_source='test' WHERE id=996")
+        conn.commit()
+        _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-24", "hr_max": 235}]})
+        _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-25", "hr_max": 236}]})
+        urow2 = conn.execute("SELECT hr_max_bpm, hr_max_source FROM users WHERE id=996").fetchone()
+        assert urow2["hr_max_bpm"] == 210 and urow2["hr_max_source"] == "test", "тест не должен перебиваться часами"
+
+        # --- вниз автоматически не снижается (чистая история без старых высоких дней) ---
+        conn.execute("DELETE FROM daily_heart_rate WHERE user_id=996")
+        conn.execute("UPDATE users SET hr_max_bpm=210, hr_max_source='watch' WHERE id=996")
+        conn.commit()
+        _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-26", "hr_min": 55, "hr_avg": 65, "hr_max": 100}]})
+        _dispatch_json("log_heart_rate", {"days": [{"date": "2026-08-27", "hr_min": 56, "hr_avg": 66, "hr_max": 101}]})
+        urow3 = conn.execute("SELECT hr_max_bpm FROM users WHERE id=996").fetchone()
+        assert urow3["hr_max_bpm"] == 210, "максимум не должен снижаться от низких дней"
+
+        # --- get_trends содержит блок дневного пульса ---
+        trends = _dispatch_json("get_trends", {})
+        assert "daily_hr" in trends, f"нет поля daily_hr в get_trends: {trends}"
+        assert trends["daily_hr"] is not None and trends["daily_hr"]["coverage_days"] == 2, trends["daily_hr"]
     finally:
         conn.close()
 
