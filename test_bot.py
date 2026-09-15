@@ -552,6 +552,17 @@ def test_food_lookup_remember_match_and_log_food_per_100g():
         assert abs(row["kcal"] - 166.4) < 1e-6, dict(row)
         assert abs(row["protein_g"] - 6.8 * 0.8) < 1e-6, dict(row)
         assert row["source"] == "my_product", dict(row)
+
+        # GPT заполняет необязательные поля нулями: kcal модели не затирается.
+        result = json.loads(main.dispatch("log_food", {
+            "items": [{
+                "name": "Перец болгарский", "grams": 0, "kcal": 39,
+                "protein_g": 1.3, "fat_g": 0.4, "carbs_g": 7.5, "source": "estimate",
+                "per_100g": {"kcal": 0, "protein_g": 0, "fat_g": 0, "carbs_g": 0},
+            }],
+        }))
+        assert "error" not in result, result
+        assert result["items"][0]["kcal"] == 39, result
     finally:
         conn.execute("DELETE FROM alerts WHERE user_id=881")
         conn.execute("DELETE FROM food_log WHERE user_id=881")

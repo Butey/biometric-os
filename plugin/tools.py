@@ -471,6 +471,10 @@ def handle_log_food(params: dict) -> str:
             return json.dumps(
                 {"error": f"{i['name']}: source должен быть одним из {_ITEM_SOURCES}, получено {src!r}"},
                 ensure_ascii=False)
+        # Модель (GPT) заполняет необязательные поля нулями: per_100g из нулей
+        # или grams=0 затирали присланный kcal нулём.
+        if isinstance(per100, dict) and (not i.get("grams") or not per100.get("kcal")):
+            per100 = None
         if per100 is None:
             continue
         if not isinstance(per100, dict):
