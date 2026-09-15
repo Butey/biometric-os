@@ -57,15 +57,26 @@ os.environ["FAKE_KEY"] = "test"
 # ---------------------------------------------------------------- сборка контекста
 
 def test_tool_specs():
+    from bot.registry import _tools
+
+    registry.set_caller("111222")
+    _tools._set_mode("111222", "user")
     specs = main.tool_specs()
     names = [s["function"]["name"] for s in specs]
-    assert len(names) == 37, f"36 инструментов плагина + knowledge, получено {len(names)}"
+    assert len(names) == 36, f"35 инструментов плагина (без admin_cmd) + knowledge, получено {len(names)}"
     assert "knowledge" in names, "инструмент знаний не подключён"
     assert "log_food" in names and "get_status_bar" in names
+    assert "admin_cmd" not in names, "admin_cmd не должен быть виден не-админу"
     for s in specs:
         f = s["function"]
         assert f.get("description"), f"пустое описание у {f['name']}"
         assert isinstance(f.get("parameters"), dict), f"нет схемы у {f['name']}"
+
+    _tools._set_mode("111222", "admin")
+    admin_names = [s["function"]["name"] for s in main.tool_specs()]
+    assert len(admin_names) == 37, f"36 инструментов плагина + knowledge для админа, получено {len(admin_names)}"
+    assert "admin_cmd" in admin_names, "admin_cmd должен быть виден админу"
+    _tools._set_mode("111222", "user")
 
 
 def test_system_prompt_has_knowledge_index():

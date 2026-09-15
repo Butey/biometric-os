@@ -105,9 +105,12 @@ def system_prompt() -> str:
 
 
 def tool_specs() -> list[dict]:
-    """24 инструмента плагина + knowledge. Собирается на каждый ход: состав тем
-    знаний зависит от каталога и от режима звонящего."""
-    return registry.openai_tools() + [{
+    """Инструменты плагина + knowledge. Собирается на каждый ход: состав тем
+    знаний зависит от каталога, admin_cmd виден только в режиме admin."""
+    tools = registry.openai_tools()
+    if not knowledge._is_admin():
+        tools = [t for t in tools if t["function"]["name"] != "admin_cmd"]
+    return tools + [{
         "type": "function",
         "function": {
             "name": "knowledge",

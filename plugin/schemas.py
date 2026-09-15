@@ -26,16 +26,16 @@ log_food_schema = {
         "action": {
             "type": "string",
             "enum": ["add", "delete"],
-            "description": "add (умолчание) — записать приём; delete — удалить ошибочно записанное. Для delete нужен food_log_id"
+            "description": "add (умолчание) — записать приём; delete — удалить, нужен food_log_id"
         },
         "food_log_id": {
             "type": "integer",
-            "description": "Для action=delete: номер приёма. Показан в журнале как #N (get_day_summary format=journal)"
+            "description": "Для action=delete: номер приёма (#N из журнала)"
         },
         "names": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Для action=delete: убрать только эти продукты из приёма (подстрока названия, регистр не важен). Не задан — удаляется приём целиком"
+            "description": "Для action=delete: убрать только эти продукты (подстрока названия). Не задан — удаляется приём целиком"
         },
         "items": {
             "type": "array",
@@ -43,12 +43,12 @@ log_food_schema = {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Название блюда"},
-                    "grams": {"type": "number", "description": "Вес в граммах. Обязателен, если передан per_100g — код умножает состав на граммы сам"},
-                    "kcal": {"type": "number", "description": "Калорийность, ккал. Обязательно, если не передан per_100g. Незнакомое блюдо — дайте оценку"},
-                    "protein_g": {"type": "number", "description": "Белки, г. Обязательно, если не передан per_100g"},
-                    "fat_g": {"type": "number", "description": "Жиры, г. Обязательно (если не передан per_100g), влияет на LIPID_GUARD"},
-                    "carbs_g": {"type": "number", "description": "Углеводы, г. Обязательно, если не передан per_100g"},
-                    "fiber_g": {"type": "number", "description": "Клетчатка, г. Не входит в carbs_g и почти не даёт калорий — считается отдельно. Не знаешь и не передан per_100g.fiber_g — не передавай"},
+                    "grams": {"type": "number", "description": "Вес в граммах; обязателен вместе с per_100g"},
+                    "kcal": {"type": "number", "description": "Ккал; обязательно без per_100g"},
+                    "protein_g": {"type": "number", "description": "Белки, г; обязательно без per_100g"},
+                    "fat_g": {"type": "number", "description": "Жиры, г; обязательно без per_100g, влияет на LIPID_GUARD"},
+                    "carbs_g": {"type": "number", "description": "Углеводы, г; обязательно без per_100g"},
+                    "fiber_g": {"type": "number", "description": "Клетчатка, г, отдельно от carbs_g; неизвестна — не передавайте"},
                     "per_100g": {
                         "type": "object",
                         "properties": {
@@ -59,23 +59,23 @@ log_food_schema = {
                             "fiber_g": {"type": "number"}
                         },
                         "required": ["kcal", "protein_g", "fat_g", "carbs_g"],
-                        "description": "Состав на 100 г (из food_lookup: match — свой продукт, search — Open Food Facts; или с этикетки). Передан вместе с grams — код сам считает kcal/protein_g/fat_g/carbs_g позиции, свои значения этих полей не нужны"
+                        "description": "Состав на 100 г из food_lookup/этикетки; с grams код сам считает КБЖУ позиции"
                     },
                     "source": {
                         "type": "string",
                         "enum": ["off", "my_product", "label", "estimate"],
-                        "description": "Откуда состав: off — Open Food Facts (после food_lookup search+remember), my_product — свой сохранённый продукт (food_lookup match), label — с этикетки от человека (после food_lookup remember), estimate — оценка модели без базы"
+                        "description": "Откуда состав: off/my_product/label — через food_lookup, estimate — оценка модели"
                     },
                     "plate_category": {"type": "string", "description": "Категория тарелки"}
                 },
                 "required": ["name"]
             },
-            "description": "Массив блюд, один item — один приём пищи. Не агрегируйте день целиком: у позиции есть потолок ккал, разбивайте на отдельные блюда"
+            "description": "Один item — одно блюдо; items одного вызова образуют один приём пищи"
         },
         "meal_slot": {
             "type": "string",
             "enum": ["breakfast", "lunch", "dinner", "snack"],
-            "description": "Передавайте ТОЛЬКО если человек прямо назвал приём: «завтрак ...» → breakfast, «обед ...» → lunch, «ужин ...» → dinner, «перекус ...» → snack. Слово не названо — не передавайте вовсе, код определит приём сам по окнам приёма пищи и времени еды. По часам не угадывать"
+            "description": "Только по прямому слову человека (завтрак/обед/ужин/перекус); не названо — не передавайте"
         },
         "eaten_at": {
             "type": "string",
@@ -95,10 +95,10 @@ food_lookup_schema = {
         "action": {
             "type": "string",
             "enum": ["match", "search", "remember", "list", "forget"],
-            "description": "match (умолчание) — найти СВОЙ сохранённый продукт по названию, в любой формулировке; search — до 5 кандидатов из Open Food Facts по названию; remember — сохранить/обновить свой продукт под этим названием; list — список своих продуктов; forget — убрать сохранённый продукт по названию"
+            "description": "match (умолчание) — найти свой сохранённый продукт; search — до 5 кандидатов из Open Food Facts; remember — сохранить/обновить свой продукт; list — список своих продуктов; forget — убрать"
         },
         "name": {"type": "string", "description": "Название продукта. Нужно для match/search/remember/forget"},
-        "off_code": {"type": "string", "description": "Для remember: код продукта Open Food Facts из результата search (candidate.off_code). Без явных чисел код сам подтянет состав по этому коду"},
+        "off_code": {"type": "string", "description": "Для remember: код из результата search (candidate.off_code) — код сам подтянет состав по нему"},
         "kcal_100g": {"type": "number", "description": "Для remember: калории на 100 г — либо это, либо off_code"},
         "protein_100g": {"type": "number", "description": "Для remember: белки на 100 г"},
         "fat_100g": {"type": "number", "description": "Для remember: жиры на 100 г"},
@@ -120,11 +120,11 @@ log_water_schema = {
         "action": {
             "type": "string",
             "enum": ["add", "delete", "list"],
-            "description": "add (умолчание) — записать воду; delete — удалить запись воды (по water_id или всю за день с clear_day=true); list — список записей воды за дату"
+            "description": "add (умолчание) — записать воду; delete — удалить (water_id или clear_day=true за день); list — список за дату"
         },
         "water_id": {
             "type": "integer",
-            "description": "Для action=delete: номер конкретной записи воды (показан в журнале или list как #N)"
+            "description": "Для action=delete: номер записи из list"
         },
         "clear_day": {
             "type": "boolean",
@@ -156,11 +156,11 @@ log_sleep_schema = {
         "action": {
             "type": "string",
             "enum": ["add", "delete", "list"],
-            "description": "add (умолчание) — записать сон; delete — удалить ошибочную запись или последнюю ночь (без sleep_id); list — список записей сна"
+            "description": "add (умолчание) — записать сон; delete — удалить (sleep_id, без него — последняя ночь); list — список"
         },
         "sleep_id": {
             "type": "integer",
-            "description": "Для action=delete: номер записи сна"
+            "description": "Для action=delete: номер записи"
         },
         "night_date": {
             "type": "string",
@@ -176,9 +176,9 @@ log_sleep_schema = {
             "type": "integer",
             "description": "Субъективная оценка 1-5, где 5 — выспался. Спроси человека, если не сказал"
         },
-        "deep_min": {"type": "integer", "description": "Глубокий сон, мин. Только если прибор дал число"},
-        "rem_min": {"type": "integer", "description": "REM, мин. Только если прибор дал число"},
-        "awake_min": {"type": "integer", "description": "Пробуждения, мин. Только если прибор дал число"},
+        "deep_min": {"type": "integer", "description": "Глубокий сон, мин, только с прибора"},
+        "rem_min": {"type": "integer", "description": "REM, мин, только с прибора"},
+        "awake_min": {"type": "integer", "description": "Пробуждения, мин, только с прибора"},
         "source": {"type": "string", "description": "Откуда данные: scale_app, часы, вручную"},
         "notes": {"type": "string", "description": "Свободный комментарий"},
         "limit": {
@@ -210,11 +210,11 @@ log_workout_schema = {
         "action": {
             "type": "string",
             "enum": ["add", "delete", "list"],
-            "description": "add (по умолчанию) — записать тренировку/активность; delete — удалить запись по workout_id; list — посмотреть историю тренировок"
+            "description": "add (по умолчанию) — записать тренировку/активность; delete — удалить по workout_id; list — история"
         },
         "workout_id": {
             "type": "integer",
-            "description": "Для action=delete: ID тренировки в базе"
+            "description": "Для action=delete: ID тренировки"
         },
         "sport": {
             "type": "string",
@@ -290,11 +290,11 @@ log_glucose_schema = {
         "action": {
             "type": "string",
             "enum": ["add", "delete", "list"],
-            "description": "add (умолчание) — записать замер; delete — удалить ошибочную запись или последний замер (без glucose_id); list — список записей глюкозы"
+            "description": "add (умолчание) — записать замер; delete — удалить (glucose_id, без него — последний); list — список"
         },
         "glucose_id": {
             "type": "integer",
-            "description": "Для action=delete: номер записи глюкозы"
+            "description": "Для action=delete: номер записи"
         },
         "mmol_l": {
             "type": "number",
@@ -330,11 +330,11 @@ log_side_effect_schema = {
         "action": {
             "type": "string",
             "enum": ["add", "delete", "list"],
-            "description": "add (умолчание) — записать побочный эффект; delete — удалить ошибочную запись или последнюю (без side_effect_id); list — список записей"
+            "description": "add (умолчание) — записать побочный эффект; delete — удалить (side_effect_id, без него — последняя); list — список"
         },
         "side_effect_id": {
             "type": "integer",
-            "description": "Для action=delete: номер записи побочного эффекта"
+            "description": "Для action=delete: номер записи"
         },
         "symptom": {
             "type": "string",
@@ -375,11 +375,11 @@ log_weight_schema = {
         "action": {
             "type": "string",
             "enum": ["add", "delete", "list"],
-            "description": "add (умолчание) — записать вес; delete — удалить ошибочную запись или последний вес (без weight_id); list — список записей веса"
+            "description": "add (умолчание) — записать вес; delete — удалить (weight_id, без него — последний); list — список"
         },
         "weight_id": {
             "type": "integer",
-            "description": "Для action=delete: номер записи веса"
+            "description": "Для action=delete: номер записи"
         },
         "weight_kg": {
             "type": "number",
@@ -420,11 +420,11 @@ log_anthropometry_schema = {
         "action": {
             "type": "string",
             "enum": ["add", "delete", "list"],
-            "description": "add (умолчание) — записать замер; delete — удалить ошибочную запись или последний замер (без anthropometry_id); list — список записей замеров"
+            "description": "add (умолчание) — записать замер; delete — удалить (anthropometry_id, без него — последний); list — список"
         },
         "anthropometry_id": {
             "type": "integer",
-            "description": "Для action=delete: номер записи замера"
+            "description": "Для action=delete: номер записи"
         },
         "site": {
             "type": "string",
@@ -457,11 +457,11 @@ log_med_schema = {
         "action": {
             "type": "string",
             "enum": ["add", "delete", "list"],
-            "description": "add (умолчание) — записать приём; delete — удалить ошибочную запись или последний приём (без med_id); list — список записей препаратов"
+            "description": "add (умолчание) — записать приём; delete — удалить (med_id, без него — последний); list — список"
         },
         "med_id": {
             "type": "integer",
-            "description": "Для action=delete: номер записи препарата"
+            "description": "Для action=delete: номер записи"
         },
         "drug": {
             "type": "string",
@@ -534,7 +534,7 @@ get_day_summary_schema = {
         "format": {
             "type": "string",
             "enum": ["bar", "dashboard", "journal", "console"],
-            "description": "bar — исходный JSON-payload. dashboard (по умолчанию) — сводка КБЖУ дня. journal — детальный журнал питания по приёмам пищи (для «покажи еду»/«что я съел»/«журнал»). console — единый метаболический пульт (для «общий дашборд»/«полная сводка»/«пульт»): тело, тренд веса, бюджет КБЖУ/вода, лог еды, гарды и фарма одним блоком."
+            "description": "bar — исходный JSON-payload; dashboard (по умолчанию) — сводка КБЖУ дня; journal — журнал питания по приёмам; console — единый метаболический пульт (тело, вес, КБЖУ/вода, еда, гарды, фарма)"
         }
     }
 }
@@ -545,16 +545,16 @@ pharma_schema = {
         "action": {
             "type": "string",
             "enum": ["status", "schedule", "restock", "remove"],
-            "description": "status — расписание, следующая доза и остаток («фарма»/«когда колоть»). schedule — задать/обновить препарат, дозу (её рекомендуешь ты), каденцию, следующую дозу, остаток. restock — пополнить остаток доз. remove — убрать препарат из расписания."
+            "description": "status — расписание и остаток; schedule — задать/обновить препарат и дозу; restock — пополнить остаток; remove — убрать из расписания"
         },
         "substance": {"type": "string", "description": "Название препарата; обязательно для schedule/restock/remove"},
         "dose": {
             "type": "number",
-            "description": "Разовая доза (число). Рекомендуешь ты, но schedule держит рамки лестницы титрации из карты препарата: доза — её ступень, не выше максимума, повышение только на соседнюю ступень не раньше минимального срока на ступени, а после перерыва в терапии (>14 дней без приёма) — не выше прежней дозы. Выход за рамки — только с by_doctor=true. Без карты/лестницы у препарата — без проверок."
+            "description": "Разовая доза. schedule держит рамки лестницы титрации из карты препарата; вне рамок — только с by_doctor=true (иначе явная ошибка со ступенями)"
         },
         "by_doctor": {
             "type": "boolean",
-            "description": "Доза по назначению врача (человек сказал, что её назначил врач) — снимает рамки лестницы для этой дозы. Без этого флага код отклонит дозу вне рамок явной ошибкой со списком ступеней."
+            "description": "Доза назначена врачом (со слов человека) — снимает рамки лестницы для этой дозы"
         },
         "unit": {"type": "string", "enum": ["mg", "ml", "IU", "mcg"], "description": "Единица дозы"},
         "route": {"type": "string", "enum": ["injection", "oral", "topical"], "description": "Путь введения"},
@@ -574,7 +574,7 @@ plans_schema = {
         "action": {
             "type": "string",
             "enum": ["show", "set_meal", "set_workout", "vs_actual", "remove_meal", "remove_workout", "clear"],
-            "description": "show — недельный план питания и тренировок; set_meal — задать блюдо в шаблон дня; set_workout — задать тренировку в шаблон дня; vs_actual — сравнить план с фактом за дату; remove_meal — удалить блюдо/приём пищи из шаблона; remove_workout — удалить тренировку из шаблона; clear — очистить шаблон (день или всю неделю)."
+            "description": "show — недельный план; set_meal/set_workout — задать позицию в шаблон дня; vs_actual — план vs факт за дату; remove_meal/remove_workout — удалить позицию; clear — очистить шаблон"
         },
         "day_of_week": {"type": "integer", "description": "День недели 0=Пн..6=Вс (для set_*/опц. show)"},
         "meal_slot": {"type": "string", "enum": ["breakfast", "lunch", "dinner", "snack"], "description": "Приём пищи (для set_meal)"},
@@ -598,12 +598,12 @@ pantry_schema = {
         "action": {
             "type": "string",
             "enum": ["list", "add", "remove"],
-            "description": "list — показать запасы по категориям («холодильник»/«что в холодильнике»); add — добавить/пополнить продукт; remove — списать."
+            "description": "list — показать запасы по категориям; add — добавить/пополнить продукт; remove — списать"
         },
         "name": {"type": "string", "description": "Название продукта (для add/remove)"},
         "qty": {"type": "number", "description": "Количество или вес. Для remove без qty — списать позицию целиком."},
         "unit": {"type": "string", "description": "Единица: г, шт, мл и т.п."},
-        "category": {"type": "string", "enum": ["Белковые", "Молочка/Сыры", "Овощи/Фрукты", "Сложные углеводы", "Прочее"], "description": "Категория: Белковые, Молочка/Сыры, Овощи/Фрукты, Сложные углеводы, Прочее"},
+        "category": {"type": "string", "enum": ["Белковые", "Молочка/Сыры", "Овощи/Фрукты", "Сложные углеводы", "Прочее"], "description": "Категория продукта"},
         "user_id": {"type": "integer", "description": "ID пользователя"}
     },
     "required": ["action"]
@@ -821,7 +821,7 @@ register_user_schema = {
         },
         "health_notes": {
             "type": "string",
-            "description": "Личные ограничения по здоровью: травмы, противопоказания, диагнозы — только со слов самого человека"
+            "description": "Ограничения по здоровью со слов человека (см. [ОГРАНИЧЕНИЯ ПО ЗДОРОВЬЮ])"
         },
         "meal_windows": {
             "type": "object",
@@ -830,11 +830,11 @@ register_user_schema = {
                 "lunch": {"type": "object", "properties": {"start": {"type": "string"}, "end": {"type": "string"}}},
                 "dinner": {"type": "object", "properties": {"start": {"type": "string"}, "end": {"type": "string"}}}
             },
-            "description": "Личные окна приёмов пищи (HH:MM), переопределяют умолчание из config.yaml. Задавайте только по прямой просьбе человека («у меня завтрак с 6 до 9») — можно частично, один приём, остальные останутся умолчанием"
+            "description": "Личные окна приёмов пищи (HH:MM), только по прямой просьбе («завтрак с 6 до 9») — можно частично, остальное останется умолчанием"
         },
         "hr_max_bpm": {
             "type": "integer",
-            "description": "Личный максимальный пульс, уд/мин (100–230) — из нагрузочного теста или с часов, заменяет формулу по возрасту. Требует hr_max_source в этом же вызове"
+            "description": "Личный максимальный пульс, уд/мин (100–230). Требует hr_max_source в этом же вызове"
         },
         "hr_max_source": {
             "type": "string",
@@ -955,11 +955,11 @@ drug_card_draft_schema = {
         "action": {
             "type": "string",
             "enum": ["fetch", "save"],
-            "description": "fetch — получить официальные тексты по МНН (openFDA, а если там пусто — ClinicalTrials.gov); save — создать черновик карты из ПОЛУЧЕННЫХ fetch текстов и поставить его на одобрение админу. Ни одно из действий не меняет карту препарата сразу — до одобрения в панели действует только учёт приёма"
+            "description": "fetch — официальные тексты по МНН (openFDA/ClinicalTrials.gov); save — черновик из этих текстов на одобрение админу"
         },
         "inn": {
             "type": "string",
-            "description": "Для action=fetch: международное непатентованное название препарата ЛАТИНИЦЕЙ (например tirzepatide)"
+            "description": "Для action=fetch: МНН препарата латиницей (например tirzepatide)"
         },
         "substance": {
             "type": "string",
@@ -976,12 +976,12 @@ drug_card_draft_schema = {
                 "tmax_h": {"type": "string", "description": "Пик концентрации, например '48 ч'"},
                 "synonyms": {"type": "string", "description": "Прочие названия того же препарата через ' / ', если встретились в источниках"}
             },
-            "description": "Поля карты, составленные ТОЛЬКО из текстов, которые вернул action=fetch — не из памяти. Отсутствующее в источнике поле не передавай"
+            "description": "Только из текстов action=fetch. Отсутствующее в источнике поле не передавай"
         },
         "sources": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Ссылки на источники (url из fetch, plus https://clinicaltrials.gov/study/<NCTId> для протоколов) — попадают в поле 'Источник' карты после одобрения"
+            "description": "Ссылки на источники (url из fetch, plus https://clinicaltrials.gov/study/<NCTId>)"
         },
         "user_id": {
             "type": "integer",
