@@ -178,19 +178,11 @@ def build_release(with_metrics=False):
                 file_count += 1
 
             # 3. Добавить готовый env.template
-            scratchpad = Path(
-                r"C:\Users\kingsaad\AppData\Local\Temp\claude\C--personal-Health-agent-system"
-                r"\a669b268-4b4b-40cf-b23d-de1fae804005\scratchpad\env.template"
-            )
-            if copy_file_to_archive(tar, scratchpad, "data/env.template"):
+            if copy_file_to_archive(tar, root.parent / "data" / "env.template", "data/env.template"):
                 file_count += 1
 
             # 4. Добавить готовый RESTORE.md
-            restore_md = Path(
-                r"C:\Users\kingsaad\AppData\Local\Temp\claude\C--personal-Health-agent-system"
-                r"\a669b268-4b4b-40cf-b23d-de1fae804005\scratchpad\RESTORE.md"
-            )
-            if copy_file_to_archive(tar, restore_md, "RESTORE.md"):
+            if copy_file_to_archive(tar, root.parent / "RESTORE.md", "RESTORE.md"):
                 file_count += 1
 
         # Вычислить статистику
@@ -220,6 +212,8 @@ def verify_archive(archive_path, with_metrics=False):
     has_health_db = False
     has_install_sh = False
     has_env_file = False
+    has_env_template = False
+    has_restore_md = False
 
     try:
         with tarfile.open(str(archive_path), "r:gz") as tar:
@@ -243,6 +237,10 @@ def verify_archive(archive_path, with_metrics=False):
                     has_health_db = True
                 if name == "health_agent_system/install.sh":
                     has_install_sh = True
+                if name == "data/env.template":
+                    has_env_template = True
+                if name == "RESTORE.md":
+                    has_restore_md = True
                 if name.endswith(".env"):
                     has_env_file = True
 
@@ -253,6 +251,16 @@ def verify_archive(archive_path, with_metrics=False):
 
         # Проверка 3: install.sh должен быть
         assert has_install_sh, "health_agent_system/install.sh не найден в архиве"
+
+        # env.template/RESTORE.md — только если реально лежат на сервере
+        # (copy_file_to_archive молча пропускает отсутствующий файл, не
+        # ошибку — без этой проверки установочный архив может выйти без
+        # инструкции по восстановлению, никак об этом не сообщив).
+        root = get_project_root()
+        if (root.parent / "data" / "env.template").exists():
+            assert has_env_template, "data/env.template не найден в архиве"
+        if (root.parent / "RESTORE.md").exists():
+            assert has_restore_md, "RESTORE.md не найден в архиве"
 
         # Проверка: нет .env файлов вообще
         assert not has_env_file, "В архиве найдены .env файлы"
