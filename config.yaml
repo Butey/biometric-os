@@ -291,7 +291,7 @@ bot:
       model: gemini-3.8-flash
 council:
   # Аналитики — две разные модели Gemini, вызываются по очереди (bot/council.py)
-  # для экономии общей бесплатной квоты Google (~40 k запросов/мин на проект).
+  # чтобы не выбивать общую бесплатную квоту Google, на которой работает чат.
   analysts: [gemini-3.8-flash, gemini-3.7-flash]
   # Судья — третья модель Gemini; при недоступности — Flash-Lite.
   judge: gemini-3.6-flash
