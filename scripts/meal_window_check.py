@@ -25,6 +25,8 @@ from health_core.config import load, user_now, user_today
 from health_core.chrono import meal_windows
 from health_core.db import connect, migrate
 from health_core import sick
+from health_core.watch import steps_on, step_goal
+from math import ceil
 
 _MEAL_NAMES = ("breakfast", "lunch", "dinner")
 _LABELS = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин"}
@@ -41,6 +43,32 @@ def _just_ended_window(conn, user_id: int) -> str | None:
         end_dt = local.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
         if 0 <= (local - end_dt).total_seconds() / 60 < grace:
             return name
+    return None
+
+
+def steps_prompt(steps: int | None, goal: int | None) -> str | None:
+    """Returns a prompt for logging steps, or None if steps are on goal or unknown.
+
+    Args:
+        steps: number of steps today, or None
+        goal: step goal, or None
+
+    Returns:
+        Prompt string or None
+    """
+    if steps is None:
+        # No steps logged yet
+        msg = "Пришли скриншот шагов за сегодня — посмотрю, сколько добрать до цели."
+        if goal is not None:
+            msg += f" Цель: {goal}."
+        return msg
+
+    if goal is not None and steps < goal:
+        # Steps below goal
+        minutes = ceil((goal - steps) / 100)
+        return f"Шагов пока {steps} из {goal} — прогулка ~{minutes} мин добирает."
+
+    # Steps >= goal, or no goal but steps known
     return None
 
 
@@ -77,6 +105,18 @@ def main() -> int:
         ).fetchone()["c"]
         if n == 0:
             lines.append(f"{_LABELS[name]} не записан.")
+        # Steps prompt for lunch window
+        if name == "lunch":
+            steps = steps_on(conn, u["id"], today)
+            goal = step_goal(conn, u["id"], today)
+            prompt = steps_prompt(steps, goal)
+            if prompt:
+                if n == 0:
+                    # Combine with meal reminder into one message
+                    lines[-1] = lines[-1] + " " + prompt
+                else:
+                    # Meal is logged, send steps text alone
+                    lines.append(prompt)
     conn.close()
 
     if lines:

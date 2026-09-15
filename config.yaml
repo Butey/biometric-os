@@ -251,8 +251,6 @@ schedule:
     - {script: meal_window_check, at: "16:00"}
     - {script: meal_window_check, at: "22:00"}
     - {script: evening_report, at: "21:30"}
-    # ежедневно: скрипт сам молчит у тех, у кого инъекции сегодня нет
-    - {script: injection_reminder, at: "09:00"}
     - {script: weekly_recalc, at: "08:00", days: [mon]}
 
 # Пайплайны ввода и миграция истории (§08, §12) — health_core/ingest/.

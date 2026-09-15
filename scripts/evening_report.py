@@ -10,15 +10,22 @@
 Вернуть просто: прогнать вывод через bot.llm.run_loop без инструментов.
 """
 import argparse
+import asyncio
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # для импорта соседних скриптов
 sys.stdout.reconfigure(encoding="utf-8")  # VPS-локаль не гарантирована, тут кириллица
 
 from health_core.config import user_today
 from health_core.db import connect, migrate
 from health_core.report import evening_report
+from health_core import council_data
+from bot import council as bot_council
+from admin.auth import load_env_file
+import notify  # рядом лежащий скрипт (scripts/), тот же способ доставки, что и у него
 
 
 def main() -> int:
@@ -43,6 +50,23 @@ def main() -> int:
         try:
             today = user_today(conn, u["id"])
             blocks.append(evening_report(conn, u["id"], today))
+            # Плато 3+ недели (CONTEXT.md «Консилиум», docs/adr/0003) — созываем
+            # консилиум, если по этой причине он не собирался последние 21 день
+            # (council.reserve сам держит частоту и лок). Итог — ОТДЕЛЬНОЕ
+            # сообщение, тем же способом (notify.send), каким доставляется и
+            # обычный вывод этого скрипта.
+            if council_data.plateau_3w(conn, u["id"]):
+                try:
+                    result = asyncio.run(bot_council.run(conn, u["id"], "plateau"))
+                    tg_row = conn.execute(
+                        "SELECT telegram_user_id FROM users WHERE id=?", (u["id"],)
+                    ).fetchone()
+                    load_env_file()
+                    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+                    if tg_row and tg_row["telegram_user_id"] and token:
+                        notify.send(token, str(tg_row["telegram_user_id"]), result["text"])
+                except ValueError:
+                    pass  # уже собирался за последние 21 день или уже идёт — не спамим
         except Exception as e:
             # Отчёт одного человека не должен отменять отчёт остальных.
             blocks.append(f"user_id={u['id']}: отчёт не собрался: {e}")

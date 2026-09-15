@@ -1088,6 +1088,84 @@ def test_daily_target_source_is_blend():
         conn.close()
 
 
+def test_steps_line():
+    """steps_line: None input → None; with goal, below/at/above → formatted string; no goal → steps only."""
+    from scripts.morning_checkin import steps_line
+
+    # None steps
+    assert steps_line(None, 8000) is None, "None steps should return None"
+    assert steps_line(None, None) is None, "None steps should return None even without goal"
+
+    # With goal, below
+    result = steps_line(7000, 8000)
+    assert result == "Шаги вчера: 7000 из 8000", result
+
+    # With goal, at goal
+    result = steps_line(8000, 8000)
+    assert result == "Шаги вчера: 8000 из 8000 ✓", result
+
+    # With goal, above
+    result = steps_line(9000, 8000)
+    assert result == "Шаги вчера: 9000 из 8000 ✓", result
+
+    # Without goal
+    result = steps_line(7500, None)
+    assert result == "Шаги вчера: 7500", result
+
+
+def test_steps_prompt():
+    """steps_prompt: None → ask for screenshot; below goal → estimate walk time; at/above → None."""
+    from scripts.meal_window_check import steps_prompt
+
+    # None steps, no goal
+    result = steps_prompt(None, None)
+    assert result == "Пришли скриншот шагов за сегодня — посмотрю, сколько добрать до цели.", result
+
+    # None steps, with goal
+    result = steps_prompt(None, 8000)
+    assert result == "Пришли скриншот шагов за сегодня — посмотрю, сколько добрать до цели. Цель: 8000.", result
+
+    # Below goal: 6200 of 8000 → 18 мин (1800 steps / 100)
+    result = steps_prompt(6200, 8000)
+    assert result == "Шагов пока 6200 из 8000 — прогулка ~18 мин добирает.", result
+
+    # At goal
+    result = steps_prompt(8000, 8000)
+    assert result is None, "At goal should return None"
+
+    # Above goal
+    result = steps_prompt(9000, 8000)
+    assert result is None, "Above goal should return None"
+
+    # Steps known, no goal
+    result = steps_prompt(7500, None)
+    assert result is None, "Known steps without goal should return None"
+
+
+def test_injection_block():
+    """injection_block: returns None for user with no scheduled injections."""
+    from scripts.morning_checkin import injection_block
+
+    registry.set_caller("991")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM users WHERE id=991")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(991,'991',170,'1990-01-01',"
+            "'f','UTC',65,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+
+        user_row = conn.execute("SELECT * FROM users WHERE id=991").fetchone()
+        result = injection_block(conn, user_row, "2026-01-01")
+        assert result is None, f"User without schedule should return None, got: {result}"
+    finally:
+        conn.execute("DELETE FROM users WHERE id=991")
+        conn.commit()
+        conn.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
