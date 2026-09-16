@@ -494,7 +494,10 @@ def handle_log_food(params: dict) -> str:
             i["protein_g"] = _as_float("per_100g.protein_g", per100.get("protein_g")) * factor
             i["fat_g"] = _as_float("per_100g.fat_g", per100.get("fat_g")) * factor
             i["carbs_g"] = _as_float("per_100g.carbs_g", per100.get("carbs_g")) * factor
-            if per100.get("fiber_g") is not None and i.get("fiber_g") is None:
+            # Тот же нулевой автозаполнитель модели, что и у per_100g выше: она
+            # шлёт fiber_g=0 рядом с per_100g.fiber_g=5, и «is None» этот ноль
+            # пропускал — клетчатка дня выходила 0 при заполненной этикетке.
+            if per100.get("fiber_g") is not None and not i.get("fiber_g"):
                 i["fiber_g"] = _as_float("per_100g.fiber_g", per100["fiber_g"]) * factor
         except ValueError as e:
             conn.close()

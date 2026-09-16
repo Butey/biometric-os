@@ -575,6 +575,21 @@ def test_food_lookup_remember_match_and_log_food_per_100g():
         assert "error" not in result, result
         assert result["items"][0]["kcal"] == 0, result
 
+        # Модель шлёт fiber_g=0 рядом с per_100g.fiber_g — этикетка побеждает ноль.
+        result = json.loads(main.dispatch("log_food", {
+            "items": [{
+                "name": "Хлеб Дарницкий", "grams": 100, "fiber_g": 0, "source": "label",
+                "per_100g": {"kcal": 216, "protein_g": 7, "fat_g": 1, "carbs_g": 46,
+                             "fiber_g": 5},
+            }],
+        }))
+        assert "error" not in result, result
+        fib = conn.execute(
+            "SELECT fiber_g FROM food_items fi JOIN food_log fl ON fl.id=fi.food_log_id "
+            "WHERE fl.user_id=881 ORDER BY fi.id DESC LIMIT 1"
+        ).fetchone()["fiber_g"]
+        assert abs(fib - 5.0) < 1e-6, f"клетчатка из per_100g затёрта нулём модели: {fib}"
+
         # Отрицательные grams через per_100g не должны дать отрицательные kcal/БЖУ.
         result = json.loads(main.dispatch("log_food", {
             "items": [{
@@ -590,6 +605,16 @@ def test_food_lookup_remember_match_and_log_food_per_100g():
         conn.execute("DELETE FROM users WHERE id=881")
         conn.commit()
         conn.close()
+
+
+def test_panels_not_kept_in_history():
+    """Готовый блок в ``` не должен оставаться в истории: модель копировала
+    оттуда старый пульт вместо нового вызова get_day_summary."""
+    panel = "```\n📊 МЕТАБОЛ. ПУЛЬТ — 16.09 10:23\nКлетч 0/25\n```"
+    out = main.strip_panels(f"Вот пульт:\n{panel}\nВопросы?")
+    assert "ПУЛЬТ" not in out and "Клетч" not in out, out
+    assert out.startswith("Вот пульт:") and out.endswith("Вопросы?"), out
+    assert main.strip_panels("обычный ответ без блока") == "обычный ответ без блока"
 
 
 def test_long_answer_split():

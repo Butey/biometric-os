@@ -76,7 +76,8 @@ import statistics
 from datetime import date, timedelta
 
 from health_core.config import latest_ffm, load, local_now, user_now
-from health_core.energy import adaptive_tdee, bmr_mifflin, _age_years
+from health_core.energy import (MIN_LOG_STREAK_DAYS, adaptive_tdee, bmr_mifflin,
+                                logged_streak, _age_years)
 
 # Энергетическая плотность тканей, ккал/кг (Hall, Lancet 2011).
 KCAL_PER_KG_FAT = 9441
@@ -155,10 +156,14 @@ def smoothed_weight(conn: sqlite3.Connection, user_id: int, days: int = 7) -> tu
 def _observed_intake(conn: sqlite3.Connection, user_id: int, window_days: int = 14) -> float | None:
     """Средний залогированный приход за окно. None — еды записано слишком мало.
 
-    Порог тот же, что у adaptive_tdee (11 дней из 14): ниже него среднее
-    считается по огрызку и занижено пропущенными днями.
+    Порог тот же, что у adaptive_tdee: MIN_LOG_STREAK_DAYS дней подряд, окно
+    сужается до серии. Считать по огрызку с пропусками нельзя — среднее
+    занижено пропущенными днями.
     """
-    end = user_now(conn, user_id).date()
+    streak, end = logged_streak(conn, user_id, user_now(conn, user_id).date())
+    if streak < MIN_LOG_STREAK_DAYS:
+        return None
+    window_days = min(window_days, streak)
     start = end - timedelta(days=window_days - 1)
     rows = conn.execute(
         "SELECT date(fl.eaten_at) d, SUM(fi.kcal) kcal FROM food_log fl "
@@ -167,7 +172,7 @@ def _observed_intake(conn: sqlite3.Connection, user_id: int, window_days: int = 
         (user_id, start.isoformat(), end.isoformat()),
     ).fetchall()
     values = [r["kcal"] for r in rows if r["kcal"] is not None]
-    if len(values) < -(-window_days * 11 // 14):
+    if not values:
         return None
     return statistics.fmean(values)
 
@@ -282,9 +287,9 @@ def project(conn: sqlite3.Connection, user_id: int, horizon_days: int = 84,
                          f"модель не считает"}
     if intake_kcal is None:
         intake_kcal = _observed_intake(conn, user_id)
-        assumed = "фактический лог за 14 дней"
+        assumed = "фактический лог, последние дни подряд"
     if intake_kcal is None:
-        return {"error": "Еды записано меньше 11 дней из 14 — среднего прихода нет. "
+        return {"error": f"Еды записано меньше {MIN_LOG_STREAK_DAYS} дней подряд — среднего прихода нет. "
                          "Либо логируй полнее, либо задай intake_kcal вручную сценарием"}
 
     cfg = _forecast_cfg()

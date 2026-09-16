@@ -283,8 +283,8 @@ def _adaptive_tdee_core(
     conn: sqlite3.Connection, user_id: int, window_days: int, for_date: str | None, min_days: int
 ) -> tuple[float | None, int]:
     """Общее тело adaptive_tdee() и адаптивной части daily_expenditure() (ADR
-    0004) — отличаются только порогом полноты лога (min_days: 11/14 у
-    adaptive_tdee, policy.blend_min_logged_days у блендера). Возвращает (TDEE
+    0004) — отличаются только порогом полноты лога (min_days: MIN_LOG_STREAK_DAYS
+    подряд у adaptive_tdee, policy.blend_min_logged_days у блендера). Возвращает (TDEE
     или None, число залогированных дней в окне) — logged_days нужен блендеру
     для доли адаптивной части независимо от того, прошла ли она сама порог.
 
@@ -331,17 +331,60 @@ def _adaptive_tdee_core(
     return tdee, logged_days
 
 
+# Порог достоверности лога — не «11 любых дней из 14», а непрерывная серия
+# последних дней. Прежний порог отвергал 8 плотных дней подряд из-за дыры в
+# начале окна, хотя считать по ним было ровно так же корректно: окно просто
+# сужается до серии. Страховка от недописанных дней остаётся прежней — TDEE
+# ниже BMR отбрасывается в _adaptive_tdee_core.
+MIN_LOG_STREAK_DAYS = 7
+
+
+_MAX_STREAK_LOOKBACK = 120  # дальше серию не ищем: окна расчёта всё равно короче
+# Хвост серии может отставать от end: утром сегодняшний день ещё не записан, и
+# требовать его — значит терять калибровку каждое утро.
+_MAX_STREAK_STALE_DAYS = 2
+
+
+def logged_streak(conn: sqlite3.Connection, user_id: int, end: date) -> tuple[int, date | None]:
+    """(длина непрерывной серии залогированных дней, её последний день).
+
+    Серия ищется от самого свежего залогированного дня не старше
+    _MAX_STREAK_STALE_DAYS от end. Ничего не нашлось — (0, None)."""
+    days = {
+        r["d"] for r in conn.execute(
+            "SELECT DISTINCT date(eaten_at) d FROM food_log WHERE user_id=? "
+            "AND date(eaten_at) BETWEEN ? AND ?",
+            (user_id, (end - timedelta(days=_MAX_STREAK_LOOKBACK)).isoformat(), end.isoformat()),
+        )
+    }
+    anchor = next(
+        (end - timedelta(days=i) for i in range(_MAX_STREAK_STALE_DAYS + 1)
+         if (end - timedelta(days=i)).isoformat() in days),
+        None,
+    )
+    if anchor is None:
+        return 0, None
+    n = 0
+    while (anchor - timedelta(days=n)).isoformat() in days:
+        n += 1
+    return n, anchor
+
+
 def adaptive_tdee(
     conn: sqlite3.Connection, user_id: int, window_days: int = 14, for_date: str | None = None
 ) -> float | None:
     """TDEE_факт = средний_intake_Nд + (Δвес_Nд · 7700 / N).
 
-    Достоверность требует еду залогированной минимум 11 из 14 дней (порог
-    масштабируется пропорционально для нестандартного окна). Иначе — None,
-    калибровка замораживается, а не подгоняется. См. _adaptive_tdee_core —
-    тот же расчёт с более низким порогом идёт в daily_expenditure() (ADR 0004)."""
-    min_days = -(-window_days * 11 // 14)  # ceil, воспроизводит порог 11/14 по умолчанию
-    tdee, _logged_days = _adaptive_tdee_core(conn, user_id, window_days, for_date, min_days)
+    Достоверность требует MIN_LOG_STREAK_DAYS дней лога подряд, а окно сужается
+    до этой серии (но не шире window_days). Серия короче — None, калибровка
+    замораживается, а не подгоняется. См. _adaptive_tdee_core — тот же расчёт с
+    более низким порогом идёт в daily_expenditure() (ADR 0004)."""
+    end = date.fromisoformat(for_date[:10]) if for_date else user_now(conn, user_id).date()
+    streak, anchor = logged_streak(conn, user_id, end)
+    if streak < MIN_LOG_STREAK_DAYS:
+        return None
+    window = min(window_days, streak)
+    tdee, _logged_days = _adaptive_tdee_core(conn, user_id, window, anchor.isoformat(), window)
     return tdee
 
 
@@ -471,7 +514,7 @@ def deadline_verdict(conn: sqlite3.Connection, user_id: int, date_: str | None =
                                план ниже пола, но факт всё же успевает (или
                                план в пол укладывается вовсе — тогда вопрос о
                                недостижимости не встаёт). None — прогноза нет
-                               (еды залогировано меньше 11 дней из 14 и т.п.):
+                               (еды залогировано меньше MIN_LOG_STREAK_DAYS дней подряд и т.п.):
                                подтвердить или опровергнуть срок нечем.
       forecast_note           — причина отсутствия прогноза, только когда
                                unreachable is None.
@@ -1091,7 +1134,7 @@ if __name__ == "__main__":
         print(f"OK: план ниже пола, прогноз к {v_bad['deadline']} не успевает "
               f"(earliest={v_bad['forecast_reach']['earliest']}) -> unreachable True")
 
-        # тот же план и срок, но еды залогировано меньше 11/14 дней -> прогноза нет
+        # тот же план и срок, но еды залогировано меньше MIN_LOG_STREAK_DAYS дней подряд -> прогноза нет
         conn.execute("DELETE FROM food_log WHERE user_id=?", (uid,))
         conn.commit()
         v_none = deadline_verdict(conn, uid, today.isoformat())

@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -163,6 +164,20 @@ def strip_tool_rules(text: str) -> str:
     токенами в каждом последующем ходе, а не только в том, где был нужен."""
     idx = text.find(_TOOL_RULES_MARK)
     return text[:idx] if idx != -1 else text
+
+
+# Пульт/отчёт уходят человеку готовым блоком в ``` — и остаются такими же в
+# истории. Модель их оттуда копирует дословно вместо нового вызова инструмента:
+# наблюдалось на проде (в ответе на «пульт» пришёл пульт четырёхчасовой
+# давности, со старым временем в шапке и нулевой клетчаткой). В историю кладём
+# заглушку: скопировать нечего, придётся звать инструмент.
+_PANEL_RE = re.compile(r"```.*?```", re.DOTALL)
+_PANEL_STUB = ("[готовый блок показан человеку; его числа устарели — "
+               "вызови инструмент заново, из истории не копируй]")
+
+
+def strip_panels(text: str) -> str:
+    return _PANEL_RE.sub(_PANEL_STUB, text)
 
 
 def dispatch(name: str, args: dict) -> str:
@@ -677,6 +692,8 @@ def _close_turn(uid: str, new_messages: list[dict]) -> None:
         for m in new_messages:
             if m.get("role") == "tool" and isinstance(m.get("content"), str):
                 m = {**m, "content": strip_tool_rules(m["content"])}
+            elif m.get("role") == "assistant" and isinstance(m.get("content"), str):
+                m = {**m, "content": strip_panels(m["content"])}
             history.append(conn, uid, m)
     finally:
         conn.close()
