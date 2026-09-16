@@ -3900,6 +3900,19 @@ def handle_forecast(params: dict) -> str:
                 res["weekly"].append(traj[-1])
         return json.dumps(res, ensure_ascii=False)
 
+    if action == "calibrate":
+        target = params.get("target_kg")
+        target = float(target) if target is not None else None
+        deadline = params.get("deadline")
+        target_kcal = params.get("target_kcal") if params.get("target_kcal") is not None else intake
+        apply = bool(params.get("apply", False))
+        res = _fc.calibrate(
+            conn, user_id, target_kg=target, deadline=deadline,
+            target_kcal=target_kcal, apply=apply
+        )
+        conn.close()
+        return json.dumps(res, ensure_ascii=False)
+
     conn.close()
     return json.dumps({"error": f"Неизвестное действие {action!r}"}, ensure_ascii=False)
 

@@ -1262,6 +1262,57 @@ def test_injection_block():
         conn.close()
 
 
+def test_forecast_calibrate():
+    """forecast action=calibrate: подбор калорийности и согласование вехи."""
+    from datetime import date, timedelta
+    registry.set_caller("992")
+    conn = connect()
+    migrate(conn)
+    today = date.today()
+    try:
+        conn.execute("DELETE FROM users WHERE id=992")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(992,'992',185,'1992-08-09',"
+            "'m','UTC',125,'2026-01-01','2026-01-01 00:00:00')")
+        for i in range(7):
+            d = today - timedelta(days=6 - i)
+            conn.execute(
+                "INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg,ffm_kg,fat_pct) "
+                "VALUES(992, ?, ?, 120.0, 80.0, 33.3)", (f"k{i}", f"{d.isoformat()} 08:00:00"))
+        conn.execute(
+            "INSERT INTO milestones(user_id,name,metric,threshold,deadline) "
+            "VALUES(992,'115 кг','weight_kg',115.0, ?)", ((today + timedelta(days=40)).isoformat(),))
+        conn.commit()
+
+        # Режим 1: принудительная калорийность 1750 (ниже пола 1799 -> safe=False с предупреждением)
+        raw = main.dispatch("forecast", {"action": "calibrate", "target_kcal": 1750, "user_id": 992})
+        out = json.loads(main.strip_tool_rules(raw))
+        assert out.get("mode") == "force_kcal", out
+        assert out.get("safe") is False, out
+        assert "ниже безопасного пола" in out.get("safety_warnings", [""])[0], out
+
+        # Режим 2: безопасная калорийность 1900 (выше пола 1799) + согласование и применение (apply=True)
+        raw_app = main.dispatch("forecast", {"action": "calibrate", "target_kcal": 1900, "apply": True, "user_id": 992})
+        out_app = json.loads(main.strip_tool_rules(raw_app))
+        assert out_app.get("safe") is True, out_app
+        assert out_app.get("applied") is True, out_app
+        m_row = conn.execute("SELECT deadline FROM milestones WHERE user_id=992 AND name='115 кг'").fetchone()
+        assert m_row["deadline"] == out_app.get("aligned_deadline"), (m_row["deadline"], out_app.get("aligned_deadline"))
+
+        # Режим 3: подбор вариантов без калоража и дедлайна
+        raw_opt = main.dispatch("forecast", {"action": "calibrate", "target_kg": 115.0, "user_id": 992})
+        out_opt = json.loads(main.strip_tool_rules(raw_opt))
+        assert out_opt.get("mode") == "options", out_opt
+        assert len(out_opt.get("options", [])) == 3, out_opt
+    finally:
+        conn.execute("DELETE FROM body_metrics WHERE user_id=992")
+        conn.execute("DELETE FROM milestones WHERE user_id=992")
+        conn.execute("DELETE FROM users WHERE id=992")
+        conn.commit()
+        conn.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -766,8 +766,8 @@ forecast_schema = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["project", "reach"],
-            "description": "project — траектория на горизонт; reach — когда будет заданный вес"
+            "enum": ["project", "reach", "calibrate"],
+            "description": "project — траектория на горизонт; reach — когда будет заданный вес; calibrate — интерактивный подбор калорийности и согласование срока вехи"
         },
         "horizon_days": {
             "type": "integer",
@@ -775,11 +775,23 @@ forecast_schema = {
         },
         "target_kg": {
             "type": "number",
-            "description": "Для action=reach: до какой массы считать"
+            "description": "Для reach/calibrate: целевая масса в кг. В calibrate по умолчанию берётся из активной вехи"
+        },
+        "deadline": {
+            "type": "string",
+            "description": "Для calibrate: желаемый срок YYYY-MM-DD"
         },
         "intake_kcal": {
             "type": "number",
-            "description": "Сценарий «что если есть ровно столько». Не задан — берётся фактический лог за 14 дней"
+            "description": "Сценарий «что если есть ровно столько» (для project/reach) или желаемая калорийность (для calibrate)"
+        },
+        "target_kcal": {
+            "type": "number",
+            "description": "Для calibrate: желаемая целевая калорийность принудительно (синоним intake_kcal)"
+        },
+        "apply": {
+            "type": "boolean",
+            "description": "Для calibrate: согласовать и зафиксировать пересчитанный срок вехи в БД (по умолчанию false)"
         }
     },
     "required": ["action"]

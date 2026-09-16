@@ -382,6 +382,305 @@ def reach(conn: sqlite3.Connection, user_id: int, target_kg: float,
     }
 
 
+def calibrate(
+    conn: sqlite3.Connection,
+    user_id: int,
+    target_kg: float | None = None,
+    deadline: str | None = None,
+    target_kcal: float | None = None,
+    apply: bool = False,
+) -> dict:
+    """Интерактивный подбор оптимальной калорийности и согласование вехи.
+
+    Режимы:
+    1. target_kcal задан (принудительное изменение калорийности):
+       - проверка безопасности (пол калорий kcal_floor, темп сброса <= 1.5 кг/нед);
+       - пересчет срока достижения target_kg и веса к текущему дедлайну;
+       - расчет выровненного срока вехи (aligned_deadline) под требуемый калораж;
+       - при apply=True — сохранение нового срока в milestones.
+    2. deadline задан (цель и желаемый срок):
+       - расчет необходимого калоража под срок;
+       - проверка безопасности (если ниже пола — расчет безопасной альтернативы и даты);
+       - при apply=True — фиксация вехи.
+    3. Только target_kg (подбор без дедлайна):
+       - генерация 3 вариантов темпа (комфортный, оптимальный, интенсивный) с БЖУ и сроками.
+    """
+    from health_core.energy import daily_expenditure, kcal_floor, _active_milestone
+    from health_core.config import targets_for
+
+    today = user_now(conn, user_id).date()
+    sw = smoothed_weight(conn, user_id)
+    if sw is None:
+        return {"error": "Нет свежих замеров массы тела за последние 7 дней для расчета"}
+    start_weight, _ = sw
+
+    active_ms = _active_milestone(conn, user_id)
+    if target_kg is None:
+        if active_ms and active_ms["metric"] == "weight_kg" and active_ms["threshold"]:
+            target_kg = float(active_ms["threshold"])
+            if deadline is None and active_ms["deadline"]:
+                deadline = active_ms["deadline"][:10]
+        else:
+            return {"error": "Не указан целевой вес target_kg и нет активной вехи по весу"}
+    else:
+        target_kg = float(target_kg)
+
+    if target_kg >= start_weight:
+        return {"error": f"Целевой вес {target_kg} кг должен быть ниже текущего ({start_weight:.1f} кг)"}
+
+    exp_dict = daily_expenditure(conn, user_id, today.isoformat())
+    full_tdee = exp_dict["kcal"]
+    floor, floor_reason = kcal_floor(conn, user_id, full_tdee)
+    targets = targets_for(conn, user_id)
+
+    g_cfg = load().get("guards", {})
+    max_rate_kg = g_cfg.get("weight_rate_kg_week_max", 1.5)
+    max_rate_pct = g_cfg.get("weight_rate_pct_week_max", 1.5)
+    safe_rate_kg_week = min(max_rate_kg, start_weight * (max_rate_pct / 100.0))
+    max_safe_daily_deficit = (safe_rate_kg_week / 7.0) * 7700.0
+
+    def _calc_macros(kcal_val: float) -> dict:
+        protein = targets.get("protein_g")
+        fat_pct = targets.get("fat_pct_min") if floor_reason == "macro_minimum" else targets.get("fat_pct", 0.25)
+        fat = round(kcal_val * (fat_pct or 0.25) / 9.0, 1) if fat_pct else None
+        carbs = None
+        if protein is not None and fat is not None:
+            carbs = round(max(0.0, kcal_val - protein * 4.0 - fat * 9.0) / 4.0, 1)
+        return {"protein_g": protein, "fat_g": fat, "carbs_g": carbs}
+
+    # Режим 1: принудительно заданная калорийность
+    if target_kcal is not None:
+        target_kcal = float(target_kcal)
+        if target_kcal < MIN_SCENARIO_KCAL or target_kcal > MAX_SCENARIO_KCAL:
+            return {"error": f"Калорийность {target_kcal} вне допустимого диапазона ({MIN_SCENARIO_KCAL}–{MAX_SCENARIO_KCAL} ккал)"}
+
+        deficit = full_tdee - target_kcal
+        is_below_floor = target_kcal < floor
+        is_excessive_deficit = deficit > max_safe_daily_deficit
+        is_safe = (not is_below_floor) and (not is_excessive_deficit)
+
+        safety_warnings = []
+        if is_below_floor:
+            safety_warnings.append(
+                f"Калорийность {target_kcal:.0f} ккал ниже безопасного пола {floor:.0f} ккал ({floor_reason}). "
+                f"Дефицит глубже пола сжигает мышечную ткань. Безопасный минимум: {floor:.0f} ккал."
+            )
+        if is_excessive_deficit:
+            safety_warnings.append(
+                f"Дефицит {deficit:.0f} ккал/сут даёт темп сброса быстрее безопасных {safe_rate_kg_week:.2f} кг/нед "
+                f"(риск желчнокаменной болезни)."
+            )
+
+        fr = reach(conn, user_id, target_kg, intake_kcal=target_kcal)
+
+        cur_deadline = deadline or (active_ms["deadline"][:10] if active_ms and active_ms["deadline"] else None)
+        weight_at_cur_deadline = None
+        days_to_cur_deadline = None
+        if cur_deadline:
+            days_to_cur_deadline = (date.fromisoformat(cur_deadline) - today).days
+            if 0 < days_to_cur_deadline <= MAX_HORIZON_DAYS:
+                proj = project(conn, user_id, days_to_cur_deadline, intake_kcal=target_kcal)
+                if "error" not in proj:
+                    weight_at_cur_deadline = proj["end"]
+
+        kg_diff = start_weight - target_kg
+        if deficit > 0 and kg_diff > 0:
+            aligned_days = max(1, round(kg_diff * 7700.0 / deficit))
+            aligned_deadline = (today + timedelta(days=aligned_days)).isoformat()
+        else:
+            aligned_deadline = fr.get("expected")
+
+        applied = False
+        applied_message = None
+        if apply:
+            if not is_safe:
+                return {
+                    "error": f"Нельзя зафиксировать калорийность {target_kcal:.0f} ккал: " + " ".join(safety_warnings)
+                }
+            if active_ms:
+                conn.execute(
+                    "UPDATE milestones SET threshold=?, deadline=? WHERE id=?",
+                    (target_kg, aligned_deadline, active_ms["id"])
+                )
+                conn.commit()
+                applied = True
+                applied_message = (
+                    f"Веха «{active_ms['name']}» обновлена: цель {target_kg} кг, срок {aligned_deadline}. "
+                    f"Суточная цель зафиксирована на уровне {target_kcal:.0f} ккал."
+                )
+            else:
+                ms_name = f"{target_kg:.0f} кг"
+                conn.execute(
+                    "INSERT INTO milestones(user_id, name, metric, threshold, deadline) VALUES (?, ?, 'weight_kg', ?, ?)",
+                    (user_id, ms_name, target_kg, aligned_deadline)
+                )
+                conn.commit()
+                applied = True
+                applied_message = (
+                    f"Создана веха «{ms_name}» со сроком {aligned_deadline}. "
+                    f"Суточная цель зафиксирована на уровне {target_kcal:.0f} ккал."
+                )
+
+        return {
+            "mode": "force_kcal",
+            "start_weight_kg": round(start_weight, 1),
+            "target_kg": target_kg,
+            "target_kcal": round(target_kcal),
+            "daily_expenditure_kcal": round(full_tdee),
+            "deficit_kcal": round(deficit),
+            "kcal_floor": round(floor),
+            "floor_reason": floor_reason,
+            "safe": is_safe,
+            "safety_warnings": safety_warnings,
+            "macros": _calc_macros(target_kcal),
+            "forecast_reach": fr,
+            "current_milestone": {
+                "name": active_ms["name"] if active_ms else None,
+                "deadline": cur_deadline,
+                "days_remaining": days_to_cur_deadline,
+                "weight_at_deadline": weight_at_cur_deadline,
+            } if cur_deadline else None,
+            "aligned_deadline": aligned_deadline,
+            "suggested_action": (
+                f"Согласовать срок {aligned_deadline} для вехи {target_kg} кг "
+                f"(удерживает цель {target_kcal:.0f} ккал/сут)"
+            ) if is_safe else "Скорректировать калорийность до безопасного диапазона",
+            "applied": applied,
+            "applied_message": applied_message,
+        }
+
+    # Режим 2: задан желаемый срок
+    if deadline is not None:
+        deadline_date = date.fromisoformat(deadline[:10])
+        days = (deadline_date - today).days
+        if days <= 0:
+            return {"error": f"Срок {deadline} уже наступил или в прошлом"}
+        if days > MAX_HORIZON_DAYS:
+            return {"error": f"Срок {deadline} за горизонтом модели ({MAX_HORIZON_DAYS} дней)"}
+
+        kg_diff = start_weight - target_kg
+        required_linear_deficit = (kg_diff * 7700.0) / days
+        required_intake = full_tdee - required_linear_deficit
+
+        is_below_floor = required_intake < floor
+        is_excessive_deficit = required_linear_deficit > max_safe_daily_deficit
+        deadline_safe = (not is_below_floor) and (not is_excessive_deficit)
+
+        fr = reach(conn, user_id, target_kg, intake_kcal=max(MIN_SCENARIO_KCAL, required_intake))
+
+        optimal_safe_intake = max(floor, full_tdee - min(required_linear_deficit, max_safe_daily_deficit))
+        if required_intake < floor:
+            optimal_safe_intake = max(floor, full_tdee - 750.0)
+            if optimal_safe_intake < floor:
+                optimal_safe_intake = floor
+
+        opt_fr = reach(conn, user_id, target_kg, intake_kcal=optimal_safe_intake)
+
+        applied = False
+        applied_message = None
+        if apply:
+            chosen_deadline = deadline if deadline_safe else opt_fr.get("expected", deadline)
+            if active_ms:
+                conn.execute(
+                    "UPDATE milestones SET threshold=?, deadline=? WHERE id=?",
+                    (target_kg, chosen_deadline, active_ms["id"])
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO milestones(user_id, name, metric, threshold, deadline) VALUES (?, ?, 'weight_kg', ?, ?)",
+                    (user_id, f"{target_kg:.0f} кг", target_kg, chosen_deadline)
+                )
+            conn.commit()
+            applied = True
+            applied_message = f"Веха установлена на {chosen_deadline}."
+
+        return {
+            "mode": "target_and_deadline",
+            "start_weight_kg": round(start_weight, 1),
+            "target_kg": target_kg,
+            "deadline": deadline,
+            "days_remaining": days,
+            "daily_expenditure_kcal": round(full_tdee),
+            "required_intake_kcal": round(required_intake),
+            "required_deficit_kcal": round(required_linear_deficit),
+            "kcal_floor": round(floor),
+            "floor_reason": floor_reason,
+            "deadline_safe": deadline_safe,
+            "unreachable_reason": (
+                f"Срок требует дефицита {required_linear_deficit:.0f} ккал/сут (калораж {required_intake:.0f} ниже пола {floor:.0f} ккал — сжигание мышц)"
+                if is_below_floor else (
+                    f"Темп сброса выше безопасного максимума {safe_rate_kg_week:.1f} кг/нед"
+                    if is_excessive_deficit else None
+                )
+            ),
+            "forecast_reach": fr,
+            "optimal_recommendation": {
+                "safe_intake_kcal": round(optimal_safe_intake),
+                "macros": _calc_macros(optimal_safe_intake),
+                "realistic_earliest": opt_fr.get("earliest"),
+                "realistic_expected": opt_fr.get("expected"),
+                "realistic_latest": opt_fr.get("latest"),
+            },
+            "applied": applied,
+            "applied_message": applied_message,
+        }
+
+    # Режим 3: подбор вариантов без конкретного дедлайна
+    options = []
+    # 1. Комфортный (дефицит ~500 ккал/сут)
+    comfort_kcal = max(floor, full_tdee - 500.0)
+    fr_comfort = reach(conn, user_id, target_kg, intake_kcal=comfort_kcal)
+    options.append({
+        "name": "comfort",
+        "label": "Комфортный",
+        "intake_kcal": round(comfort_kcal),
+        "deficit_kcal": round(full_tdee - comfort_kcal),
+        "weekly_rate_kg": round((full_tdee - comfort_kcal) * 7.0 / 7700.0, 2),
+        "expected_date": fr_comfort.get("expected"),
+        "earliest_date": fr_comfort.get("earliest"),
+        "macros": _calc_macros(comfort_kcal),
+    })
+
+    # 2. Оптимальный (дефицит ~750-800 ккал/сут)
+    optimal_kcal = max(floor, full_tdee - 800.0)
+    fr_opt = reach(conn, user_id, target_kg, intake_kcal=optimal_kcal)
+    options.append({
+        "name": "optimal",
+        "label": "Оптимальный",
+        "intake_kcal": round(optimal_kcal),
+        "deficit_kcal": round(full_tdee - optimal_kcal),
+        "weekly_rate_kg": round((full_tdee - optimal_kcal) * 7.0 / 7700.0, 2),
+        "expected_date": fr_opt.get("expected"),
+        "earliest_date": fr_opt.get("earliest"),
+        "macros": _calc_macros(optimal_kcal),
+    })
+
+    # 3. Максимальный безопасный (пол калорий)
+    max_safe_kcal = floor
+    fr_max = reach(conn, user_id, target_kg, intake_kcal=max_safe_kcal)
+    options.append({
+        "name": "max_safe",
+        "label": "Интенсивный (пол калорий)",
+        "intake_kcal": round(max_safe_kcal),
+        "deficit_kcal": round(full_tdee - max_safe_kcal),
+        "weekly_rate_kg": round((full_tdee - max_safe_kcal) * 7.0 / 7700.0, 2),
+        "expected_date": fr_max.get("expected"),
+        "earliest_date": fr_max.get("earliest"),
+        "macros": _calc_macros(max_safe_kcal),
+    })
+
+    return {
+        "mode": "options",
+        "start_weight_kg": round(start_weight, 1),
+        "target_kg": target_kg,
+        "daily_expenditure_kcal": round(full_tdee),
+        "kcal_floor": round(floor),
+        "floor_reason": floor_reason,
+        "options": options,
+        "recommendation": "Выбери подходящий темп или назови желаемую калорийность, и система выставит срок вехи.",
+    }
+
+
 # ---------------------------------------------------------------- ПРОВЕРКА
 
 if __name__ == "__main__":
