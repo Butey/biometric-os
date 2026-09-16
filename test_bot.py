@@ -1313,6 +1313,129 @@ def test_forecast_calibrate():
         conn.close()
 
 
+def test_forecast_plateau():
+    """forecast action=plateau: прогноз и статус плато массы тела."""
+    from datetime import date, timedelta
+    registry.set_caller("993")
+    conn = connect()
+    migrate(conn)
+    today = date.today()
+    try:
+        conn.execute("DELETE FROM users WHERE id=993")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(993,'993',180,'1990-01-01',"
+            "'m','UTC',120,'2026-01-01','2026-01-01 00:00:00')")
+        for i in range(7):
+            d = today - timedelta(days=6 - i)
+            conn.execute(
+                "INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg,ffm_kg,fat_pct) "
+                "VALUES(993, ?, ?, 110.0, 75.0, 31.8)", (f"pk{i}", f"{d.isoformat()} 08:00:00"))
+        conn.execute(
+            "INSERT INTO anthropometry(user_id, measured_on, site, value_cm) VALUES(993, ?, 'талия', 102.0)",
+            ((today - timedelta(days=20)).isoformat(),))
+        conn.execute(
+            "INSERT INTO anthropometry(user_id, measured_on, site, value_cm) VALUES(993, ?, 'талия', 100.0)",
+            (today.isoformat(),))
+        conn.commit()
+
+        raw = main.dispatch("forecast", {"action": "plateau", "user_id": 993})
+        out = json.loads(main.strip_tool_rules(raw))
+        assert "pharmacological_plateau" in out, out
+        ph = out["pharmacological_plateau"]
+        assert ph.get("phase") in ("активное снижение", "приближение к плато", "в фазе плато"), ph
+        assert ph.get("median_plateau_weeks") is not None
+        assert ph.get("weeks_on_program") is not None
+
+        assert "metabolic_equilibrium" in out, out
+        eq = out["metabolic_equilibrium"]
+        assert eq.get("equilibrium_weight_kg") is not None
+        assert eq.get("intake_kcal") is not None
+
+        assert "current_stagnation" in out, out
+        st = out["current_stagnation"]
+        assert "verdict" in st
+        assert len(out.get("recommendations", [])) > 0
+    finally:
+        conn.execute("DELETE FROM anthropometry WHERE user_id=993")
+        conn.execute("DELETE FROM body_metrics WHERE user_id=993")
+        conn.execute("DELETE FROM users WHERE id=993")
+        conn.commit()
+        conn.close()
+
+
+def test_interactive_commands_target_plateau_forecast():
+    """Интерактивные команды /target, /plateau, /forecast и форматирование с клавиатурами."""
+    from datetime import date, timedelta
+    registry.set_caller("988")
+    conn = connect()
+    migrate(conn)
+    today = date.today()
+    try:
+        conn.execute("DELETE FROM body_metrics WHERE user_id=988")
+        conn.execute("DELETE FROM milestones WHERE user_id=988")
+        conn.execute("DELETE FROM users WHERE id=988")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(988,'988',185,'1992-08-09',"
+            "'m','UTC',125,'2026-01-01','2026-01-01 00:00:00')")
+        for i in range(7):
+            d = today - timedelta(days=6 - i)
+            conn.execute(
+                "INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg,ffm_kg,fat_pct) "
+                "VALUES(988, ?, ?, 120.0, 80.0, 33.3)", (f"k988_{i}", f"{d.isoformat()} 08:00:00"))
+        conn.execute(
+            "INSERT INTO milestones(user_id,name,metric,threshold,deadline) "
+            "VALUES(988,'115 кг','weight_kg',115.0, ?)", ((today + timedelta(days=40)).isoformat(),))
+        conn.commit()
+
+        # 1. /target interactive
+        msg, kb = main._format_target_interactive("988", "")
+        assert "Подбор оптимальной" in msg
+        assert kb is not None and len(kb.inline_keyboard) >= 2
+        assert any(b.callback_data == "target_opt:optimal" for row in kb.inline_keyboard for b in row)
+
+        # 2. Preview option
+        prev_msg, prev_kb = main._format_target_option_preview("988", "optimal")
+        assert "Оптимальный" in prev_msg
+        assert "БЖУ" in prev_msg or "Белки" in prev_msg
+        assert prev_kb is not None
+        assert any(b.callback_data.startswith("target_apply:") for row in prev_kb.inline_keyboard for b in row)
+
+        # 3. Apply target
+        app_msg, app_kb = main._apply_target("988", 1850)
+        assert "зафиксирована" in app_msg
+        assert "1850" in app_msg
+
+        # 4. /plateau interactive
+        plat_msg, plat_kb = main._format_plateau_interactive("988", "")
+        assert "плато" in plat_msg.lower()
+        assert "SURMOUNT" in plat_msg
+        assert plat_kb is not None
+        assert any(b.callback_data == "plateau_refeed" for row in plat_kb.inline_keyboard for b in row)
+        assert any(b.callback_data == "plateau_council" for row in plat_kb.inline_keyboard for b in row)
+
+        # 5. /forecast interactive
+        fc_msg, fc_kb = main._format_forecast_interactive("988", "")
+        assert "Прогноз динамики" in fc_msg
+        assert "Через 4 нед" in fc_msg
+        assert fc_kb is not None
+
+        # 6. run_command plain text fallbacks
+        cmd_t = main.run_command("988", "/target")
+        assert cmd_t and "Подбор" in cmd_t
+        cmd_p = main.run_command("988", "/plateau")
+        assert cmd_p and "плато" in cmd_p.lower()
+        cmd_f = main.run_command("988", "/forecast")
+        assert cmd_f and "Прогноз" in cmd_f
+    finally:
+        conn.execute("DELETE FROM body_metrics WHERE user_id=988")
+        conn.execute("DELETE FROM milestones WHERE user_id=988")
+        conn.execute("DELETE FROM users WHERE id=988")
+        conn.commit()
+        conn.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

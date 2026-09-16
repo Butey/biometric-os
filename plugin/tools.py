@@ -3913,6 +3913,11 @@ def handle_forecast(params: dict) -> str:
         conn.close()
         return json.dumps(res, ensure_ascii=False)
 
+    if action == "plateau":
+        res = _fc.plateau_forecast(conn, user_id, intake_kcal=intake)
+        conn.close()
+        return json.dumps(res, ensure_ascii=False)
+
     conn.close()
     return json.dumps({"error": f"Неизвестное действие {action!r}"}, ensure_ascii=False)
 

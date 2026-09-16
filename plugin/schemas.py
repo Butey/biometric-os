@@ -766,8 +766,8 @@ forecast_schema = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["project", "reach", "calibrate"],
-            "description": "project — траектория на горизонт; reach — когда будет заданный вес; calibrate — интерактивный подбор калорийности и согласование срока вехи"
+            "enum": ["project", "reach", "calibrate", "plateau"],
+            "description": "project — траектория на горизонт; reach — когда будет заданный вес; calibrate — интерактивный подбор калорийности и согласование срока вехи; plateau — комплексный прогноз и статус плато массы тела"
         },
         "horizon_days": {
             "type": "integer",

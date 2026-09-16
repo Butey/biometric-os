@@ -64,6 +64,9 @@ BUILTIN_COMMANDS = {
     "new": "Забыть контекст разговора",
     "help": "Что я умею",
     "status": "Статус-бар: вес, калории, гарды",
+    "target": "Интерактивный подбор калорийности и вехи",
+    "plateau": "Прогноз и разбор плато массы тела",
+    "forecast": "Прогноз динамики веса",
 }
 
 # Видны в меню только в чатах администраторов (BotCommandScopeChat); у остальных
@@ -391,6 +394,430 @@ def switch_model_cmd(args: str) -> str:
     )
 
 
+def _resolve_uid_to_user_id(conn, uid: str) -> int:
+    row = conn.execute("SELECT id FROM users WHERE telegram_user_id=?", (uid,)).fetchone()
+    return row["id"] if row else 1
+
+
+def _format_target_interactive(uid: str, args: str = "") -> tuple[str, InlineKeyboardMarkup | None]:
+    from health_core import forecast as _fc
+    conn = connect()
+    try:
+        migrate(conn)
+        user_id = _resolve_uid_to_user_id(conn, uid)
+
+        args = args.strip()
+        target_kcal = None
+        target_kg = None
+        deadline = None
+
+        if args:
+            parts = args.split()
+            if len(parts) == 1:
+                try:
+                    val = float(parts[0])
+                    if val >= 500:
+                        target_kcal = val
+                    else:
+                        target_kg = val
+                except ValueError:
+                    if "-" in parts[0]:
+                        deadline = parts[0]
+            elif len(parts) >= 2:
+                try:
+                    target_kg = float(parts[0])
+                except ValueError:
+                    target_kg = None
+                if parts[1].replace(".", "", 1).isdigit():
+                    target_kcal = float(parts[1])
+                else:
+                    deadline = parts[1]
+
+        res = _fc.calibrate(
+            conn, user_id, target_kg=target_kg, deadline=deadline,
+            target_kcal=target_kcal, apply=False
+        )
+
+        if "error" in res:
+            err = res["error"]
+            if "нет активной вехи" in err.lower():
+                msg = (
+                    "🎯 **Интерактивный подбор калорийности**\n\n"
+                    "У вас пока нет активной вехи по весу.\n"
+                    "Задайте целевой вес командой:\n"
+                    "`/target <целевой вес в кг>` (например, `/target 80`)\n"
+                    "или с желаемой датой: `/target 80 2026-12-31`."
+                )
+                return msg, None
+            return f"ℹ️ {err}", None
+
+        mode = res.get("mode")
+
+        if mode == "force_kcal":
+            is_safe = res.get("safe", False)
+            sw = res.get("start_weight_kg")
+            t_kg = res.get("target_kg")
+            t_kcal = res.get("target_kcal")
+            def_kcal = res.get("deficit_kcal")
+            floor = res.get("kcal_floor")
+            floor_r = res.get("floor_reason")
+            aligned = res.get("aligned_deadline")
+            macros = res.get("macros") or {}
+            p = macros.get("protein_g", "-")
+            f = macros.get("fat_g", "-")
+            c = macros.get("carbs_g", "-")
+
+            if not is_safe:
+                warns = "\n".join(f"• ⚠️ {w}" for w in res.get("safety_warnings", []))
+                msg = (
+                    f"🎯 **Проверка безопасности калорийности**\n\n"
+                    f"Запрошено: **{t_kcal} ккал/сут** (дефицит {def_kcal} ккал)\n"
+                    f"Текущий вес: **{sw} кг** ➔ Цель: **{t_kg} кг**\n"
+                    f"Безопасный минимум (пол): **{floor} ккал** ({floor_r})\n\n"
+                    f"{warns}\n\n"
+                    f"Снижение ниже {floor} ккал сопряжено с рисками сжигания мышц. "
+                    f"Выберите безопасную цель или воспользуйтесь подбором."
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="◀️ Выбрать безопасный вариант", callback_data="target_back")],
+                ])
+                return msg, kb
+
+            cur_ms = res.get("current_milestone") or {}
+            cur_dl = cur_ms.get("deadline")
+            dl_info = f" (текущий срок: {cur_dl})" if cur_dl else ""
+            msg = (
+                f"🎯 **Согласование калорийности и вехи**\n\n"
+                f"• Калорийность: **{t_kcal} ккал/сут** (дефицит {def_kcal} ккал)\n"
+                f"• Безопасность: ✅ в безопасном коридоре (пол {floor} ккал)\n"
+                f"• Расчётный срок достижения цели **{t_kg} кг**: **{aligned}**{dl_info}\n"
+                f"• Макронутриенты: 🥩 Б **{p} г** | 🥑 Ж **{f} г** | 🍞 У **{c} г**\n\n"
+                f"Зафиксировать суточную цель и обновить срок вехи?"
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"✅ Зафиксировать {t_kcal} ккал и срок {aligned}", callback_data=f"target_apply:{t_kcal}")],
+                [InlineKeyboardButton(text="◀️ Назад к вариантам", callback_data="target_back")],
+            ])
+            return msg, kb
+
+        sw = res.get("start_weight_kg")
+        t_kg = res.get("target_kg")
+        tdee = res.get("daily_expenditure_kcal")
+        floor = res.get("kcal_floor")
+        floor_r = res.get("floor_reason")
+        options = res.get("options") or []
+
+        lines = [
+            "🎯 **Подбор оптимальной целевой калорийности**\n",
+            f"Текущий вес: **{sw} кг** ➔ Цель (веха): **{t_kg} кг**",
+            f"Расход (TDEE): **{tdee} ккал/сут** | Безопасный пол: **{floor} ккал** ({floor_r})\n",
+        ]
+
+        buttons = []
+
+        if mode == "target_and_deadline":
+            dl = res.get("deadline")
+            rem = res.get("days_remaining")
+            req_kcal = res.get("required_intake_kcal")
+            req_def = res.get("required_deficit_kcal")
+            dl_safe = res.get("deadline_safe")
+            unreach = res.get("unreachable_reason")
+            opt_rec = res.get("optimal_recommendation") or {}
+            exp_date = opt_rec.get("realistic_expected")
+
+            lines.append("📅 **Анализ срока текущей вехи:**")
+            lines.append(f"• Срок: **{dl}** (осталось {rem} дн.)")
+            lines.append(f"• Требуемый калораж: **{req_kcal} ккал/сут** (дефицит {req_def} ккал)")
+            if dl_safe:
+                lines.append("• Статус: ✅ **Реалистичен и безопасен**")
+                buttons.append([InlineKeyboardButton(text=f"✅ Зафиксировать цель вехи ({req_kcal} ккал)", callback_data=f"target_apply:{req_kcal}")])
+            else:
+                lines.append(f"• Статус: ⚠️ **Недостижим безопасно** ({unreach})")
+                if exp_date:
+                    lines.append(f"• Реалистичный срок при безопасном дефиците: **{exp_date}**")
+            lines.append("")
+
+        lines.append("⚡ **Варианты темпа:**")
+        opt_btns = []
+        for opt in options:
+            name = opt.get("name")
+            lbl = opt.get("label")
+            kcal = opt.get("intake_kcal")
+            def_k = opt.get("deficit_kcal")
+            rate = opt.get("weekly_rate_kg")
+            exp_d = opt.get("expected_date")
+            lines.append(f"• **{lbl}**: **{kcal} ккал/сут** (дефицит {def_k} ккал, ~{rate} кг/нед) 📅 Срок: **{exp_d}**")
+
+            if name == "optimal":
+                buttons.insert(0 if not buttons else 1, [InlineKeyboardButton(text=f"🟢 Оптимальный ({kcal} ккал)", callback_data=f"target_opt:{name}")])
+            else:
+                emoji = "🛋" if name == "comfort" else "⚡"
+                opt_btns.append(InlineKeyboardButton(text=f"{emoji} {lbl.split()[0]} ({kcal})", callback_data=f"target_opt:{name}"))
+
+        if opt_btns:
+            buttons.append(opt_btns)
+
+        buttons.append([
+            InlineKeyboardButton(text="📊 Прогноз плато", callback_data="nav_plateau"),
+            InlineKeyboardButton(text="📈 Траектория", callback_data="nav_forecast"),
+        ])
+
+        lines.append("\n*Нажмите кнопку для выбора варианта или введите `/target <ккал>`.*")
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+    finally:
+        conn.close()
+
+
+def _format_target_option_preview(uid: str, opt_name: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    from health_core import forecast as _fc
+    conn = connect()
+    try:
+        migrate(conn)
+        user_id = _resolve_uid_to_user_id(conn, uid)
+        res = _fc.calibrate(conn, user_id)
+        if "error" in res:
+            return f"ℹ️ {res['error']}", None
+
+        target_kg = res.get("target_kg")
+        options = res.get("options") or []
+        chosen = next((o for o in options if o.get("name") == opt_name), None)
+        if not chosen:
+            return "Вариант не найден.", None
+
+        lbl = chosen.get("label")
+        kcal = chosen.get("intake_kcal")
+        def_k = chosen.get("deficit_kcal")
+        rate = chosen.get("weekly_rate_kg")
+        exp_d = chosen.get("expected_date")
+        earliest_d = chosen.get("earliest_date")
+        macros = chosen.get("macros") or {}
+        p = macros.get("protein_g", "-")
+        f = macros.get("fat_g", "-")
+        c = macros.get("carbs_g", "-")
+
+        earliest_info = f" (самый ранний: {earliest_d})" if earliest_d else ""
+
+        msg = (
+            f"🎯 **Вариант «{lbl}»**\n\n"
+            f"• Целевая калорийность: **{kcal} ккал/сут** (дефицит {def_k} ккал)\n"
+            f"• Ожидаемый темп сброса: **~{rate} кг в неделю**\n"
+            f"• Расчётный срок вехи ({target_kg} кг): **{exp_d}**{earliest_info}\n"
+            f"• Рекомендуемые макросы:\n"
+            f"  🥩 Белки: **{p} г** | 🥑 Жиры: **{f} г** | 🍞 Углеводы: **{c} г**\n\n"
+            f"Зафиксировать суточную цель и обновить срок активной вехи?"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ Зафиксировать {kcal} ккал и срок {exp_d}", callback_data=f"target_apply:{kcal}")],
+            [InlineKeyboardButton(text="◀️ Назад к вариантам", callback_data="target_back")],
+        ])
+        return msg, kb
+    finally:
+        conn.close()
+
+
+def _apply_target(uid: str, kcal: float) -> tuple[str, InlineKeyboardMarkup | None]:
+    from health_core import forecast as _fc
+    conn = connect()
+    try:
+        migrate(conn)
+        user_id = _resolve_uid_to_user_id(conn, uid)
+        res = _fc.calibrate(conn, user_id, target_kcal=kcal, apply=True)
+        if "error" in res:
+            return f"❌ {res['error']}", None
+
+        t_kcal = res.get("target_kcal")
+        def_k = res.get("deficit_kcal")
+        t_kg = res.get("target_kg")
+        dl = res.get("aligned_deadline")
+        macros = res.get("macros") or {}
+        p = macros.get("protein_g", "-")
+        f = macros.get("fat_g", "-")
+        c = macros.get("carbs_g", "-")
+
+        msg = (
+            f"✅ **Целевая калорийность зафиксирована!**\n\n"
+            f"• Суточная норма: **{t_kcal} ккал/сут** (дефицит {def_k} ккал)\n"
+            f"• Веха ({t_kg} кг): согласованный срок **{dl}**\n"
+            f"• БЖУ: 🥩 **{p} г** | 🥑 **{f} г** | 🍞 **{c} г**\n\n"
+            f"Дневная норма в журнале питания синхронизирована с графиком вехи."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎯 Изменить калораж", callback_data="target_back")],
+            [
+                InlineKeyboardButton(text="📊 Прогноз плато", callback_data="nav_plateau"),
+                InlineKeyboardButton(text="📈 Траектория", callback_data="nav_forecast"),
+            ],
+        ])
+        return msg, kb
+    finally:
+        conn.close()
+
+
+def _format_plateau_interactive(uid: str, args: str = "") -> tuple[str, InlineKeyboardMarkup | None]:
+    from health_core import forecast as _fc
+    conn = connect()
+    try:
+        migrate(conn)
+        user_id = _resolve_uid_to_user_id(conn, uid)
+        res = _fc.plateau_forecast(conn, user_id)
+        if "error" in res:
+            return f"ℹ️ {res['error']}", None
+
+        stagnation = res.get("current_stagnation") or {}
+        pharma = res.get("pharmacological_plateau") or {}
+        eq = res.get("metabolic_equilibrium") or {}
+        recs = res.get("recommendations") or []
+
+        st_verdict = stagnation.get("verdict", "нормальная динамика")
+        st_details = stagnation.get("details", "")
+        spread = stagnation.get("weight_spread_10d_kg")
+        waist = stagnation.get("waist_change_21d_cm")
+
+        ph_phase = pharma.get("phase", "")
+        weeks_on = pharma.get("weeks_on_program", 0)
+        med_weeks = pharma.get("median_plateau_weeks", 0)
+        weeks_rem = pharma.get("weeks_remaining", 0)
+        exp_date = pharma.get("expected_date", "")
+        ph_desc = pharma.get("description", "")
+
+        intake = eq.get("intake_kcal", 0)
+        w_eq = eq.get("equilibrium_weight_kg", 0)
+        slow_date = eq.get("slowdown_date")
+        slow_w = eq.get("slowdown_weight_kg")
+
+        lines = [
+            "⏳ **Прогноз и клинический анализ плато массы тела**\n",
+            "📊 **Текущий статус (динамика за 2–3 недели):**",
+            f"• Статус: **{st_verdict}**",
+            f"• {st_details}",
+        ]
+        if spread is not None:
+            lines.append(f"• Колебания веса за 10 дней: **{spread} кг**")
+        if waist is not None:
+            lines.append(f"• Изменение талии за 3 недели: **{waist:+.1f} см**")
+        lines.append("")
+
+        lines.extend([
+            "💊 **Фармакологическое плато (SURMOUNT timeline):**",
+            f"• Фаза: **{ph_phase}**",
+            f"• Неделя программы: **{weeks_on:.0f} из {med_weeks:.0f} нед** (осталось ~{weeks_rem:.0f} нед)",
+            f"• Ожидаемая дата плато на текущей дозе: **{exp_date}**",
+            f"• {ph_desc}\n",
+        ])
+
+        lines.extend([
+            "⚖️ **Метаболическое равновесие (модель Hall):**",
+            f"• Приход: **{intake} ккал/сут**",
+            f"• Равновесная масса W_eq: **{w_eq} кг** *(вес, на котором расход сравняется с приходом)*",
+        ])
+        if slow_date and slow_w:
+            lines.append(f"• Замедление потери (<100 г/нед): ориентировочно **{slow_date}** (при весе **{slow_w} кг**)")
+        lines.append("")
+
+        if recs:
+            lines.append("💡 **Клинические рекомендации:**")
+            for r in recs:
+                lines.append(f"• {r}")
+
+        buttons = [
+            [InlineKeyboardButton(text="🍽 Назначить рефид MATADOR (2 нед)", callback_data="plateau_refeed")],
+            [InlineKeyboardButton(text="🩺 Созвать консилиум (/council)", callback_data="plateau_council")],
+            [
+                InlineKeyboardButton(text="🎯 Подобрать калораж", callback_data="nav_target"),
+                InlineKeyboardButton(text="📈 Траектория веса", callback_data="nav_forecast"),
+            ],
+        ]
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+    finally:
+        conn.close()
+
+
+def _format_forecast_interactive(uid: str, args: str = "") -> tuple[str, InlineKeyboardMarkup | None]:
+    from health_core import forecast as _fc
+    conn = connect()
+    try:
+        migrate(conn)
+        user_id = _resolve_uid_to_user_id(conn, uid)
+        intake = None
+        args = args.strip()
+        if args and args.replace(".", "", 1).isdigit():
+            intake = float(args)
+
+        proj = _fc.project(conn, user_id, 84, intake_kcal=intake)
+        if "error" in proj and "меньше 7 дней" in proj.get("error", ""):
+            today = config.user_now(conn, user_id).date()
+            t_row = conn.execute(
+                "SELECT kcal_target FROM daily_targets WHERE user_id=? AND date=?",
+                (user_id, today.isoformat()),
+            ).fetchone()
+            if t_row and t_row["kcal_target"]:
+                fallback_intake = float(t_row["kcal_target"])
+            else:
+                from health_core.energy import daily_expenditure, kcal_floor
+                exp_dict = daily_expenditure(conn, user_id, today.isoformat())
+                floor, _ = kcal_floor(conn, user_id, exp_dict["kcal"])
+                fallback_intake = max(floor, exp_dict["kcal"] - 500.0)
+            proj = _fc.project(conn, user_id, 84, intake_kcal=fallback_intake)
+
+        if "error" in proj:
+            return f"ℹ️ {proj['error']}", None
+
+        start_w = proj.get("start_weight_kg")
+        intake = proj.get("intake_kcal")
+        tdee = proj.get("measured_tdee")
+        traj = proj.get("trajectory") or []
+
+        def _get_point(days: int) -> dict | None:
+            if len(traj) > days:
+                return traj[days]
+            return traj[-1] if traj else None
+
+        p_4w = _get_point(28)
+        p_8w = _get_point(56)
+        p_12w = _get_point(84)
+
+        lines = [
+            "📈 **Прогноз динамики массы тела (модель Hall)**\n",
+            f"Исходный вес: **{start_w} кг** | Приход: **{intake} ккал/сут** | TDEE: **{tdee} ккал**\n",
+            "📅 **Динамика по неделям (оценка с доверительным коридором):**",
+        ]
+        if p_4w:
+            lines.append(f"• Через 4 нед ({p_4w['date']}): **{p_4w['mid']} кг** ({p_4w['lo']}–{p_4w['hi']} кг)")
+        if p_8w:
+            lines.append(f"• Через 8 нед ({p_8w['date']}): **{p_8w['mid']} кг** ({p_8w['lo']}–{p_8w['hi']} кг)")
+        if p_12w:
+            lines.append(f"• Через 12 нед ({p_12w['date']}): **{p_12w['mid']} кг** ({p_12w['lo']}–{p_12w['hi']} кг)")
+        lines.append("")
+
+        from health_core.energy import _active_milestone
+        active_ms = _active_milestone(conn, user_id)
+        if active_ms and active_ms["threshold"]:
+            t_kg = float(active_ms["threshold"])
+            reach_res = _fc.reach(conn, user_id, t_kg, intake_kcal=intake)
+            ms_name = active_ms["name"]
+            ms_dl = active_ms["deadline"] if active_ms["deadline"] else "не задан"
+            lines.append("🎯 **Активная веха:**")
+            lines.append(f"• «{ms_name}»: цель **{t_kg} кг** (дедлайн: {ms_dl})")
+            if reach_res.get("reached"):
+                lines.append(f"• Ожидаемая дата достижения: **{reach_res.get('expected')}** (коридор {reach_res.get('earliest')}–{reach_res.get('latest')})")
+            else:
+                lines.append("• Достижение за пределами 6-месячного горизонта при текущем приходе.")
+        else:
+            lines.append("🎯 **Активная веха:** не установлена. Задайте через /target.")
+
+        lines.append("\n*Модель учитывает метаболическую адаптацию и замедление снижения массы.*")
+
+        buttons = [
+            [
+                InlineKeyboardButton(text="🎯 Подобрать калораж", callback_data="nav_target"),
+                InlineKeyboardButton(text="⏳ Прогноз плато", callback_data="nav_plateau"),
+            ],
+        ]
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+    finally:
+        conn.close()
+
+
 async def _notify_admins_of_request(bot: Bot, uid: str, from_user) -> None:
     text = (
         f"🆕 Заявка на доступ: tg {uid} {_display_name(from_user)}. "
@@ -610,6 +1037,15 @@ def run_command(uid: str, text: str) -> str | None:
         return _cmd_revoke(uid, args)
     if name == "access":
         return _cmd_access_list(uid)
+    if name in ("target", "calibrate"):
+        msg, _ = _format_target_interactive(uid, args)
+        return msg
+    if name == "plateau":
+        msg, _ = _format_plateau_interactive(uid, args)
+        return msg
+    if name == "forecast":
+        msg, _ = _format_forecast_interactive(uid, args)
+        return msg
 
     for cmd_name, handler, _desc in registry.SLASH_COMMANDS:
         if cmd_name == name:
@@ -876,6 +1312,24 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
                 await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
                 return
 
+        if cmd_name in ("target", "calibrate"):
+            cmd_args = text[1:].partition(" ")[2].strip()
+            msg_text, kb = await asyncio.to_thread(_format_target_interactive, uid, cmd_args)
+            await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            return
+
+        if cmd_name == "plateau":
+            cmd_args = text[1:].partition(" ")[2].strip()
+            msg_text, kb = await asyncio.to_thread(_format_plateau_interactive, uid, cmd_args)
+            await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            return
+
+        if cmd_name == "forecast":
+            cmd_args = text[1:].partition(" ")[2].strip()
+            msg_text, kb = await asyncio.to_thread(_format_forecast_interactive, uid, cmd_args)
+            await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            return
+
         # Хендлеры команд синхронные и лезут в sqlite — в поток, чтобы не
         # блокировать polling. to_thread копирует контекст, ContextVar доедет.
         answer = await asyncio.to_thread(run_command, uid, text)
@@ -1095,6 +1549,142 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
                     pass
             except Exception:
                 pass
+
+        @dp.callback_query(lambda c: bool(c.data and c.data.startswith("target_opt:")))
+        async def _on_target_opt(callback: CallbackQuery) -> None:
+            cb_uid = str(callback.from_user.id)
+            opt_name = (callback.data or "").split(":", 1)[1]
+            await callback.answer()
+            msg_text, kb = await asyncio.to_thread(_format_target_option_preview, cb_uid, opt_name)
+            try:
+                if callback.message:
+                    await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            except TelegramBadRequest:
+                try:
+                    if callback.message:
+                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        @dp.callback_query(lambda c: bool(c.data and c.data.startswith("target_apply:")))
+        async def _on_target_apply(callback: CallbackQuery) -> None:
+            cb_uid = str(callback.from_user.id)
+            try:
+                kcal_val = float((callback.data or "").split(":", 1)[1])
+            except (IndexError, ValueError):
+                await callback.answer("Неверное значение калорий.")
+                return
+            msg_text, kb = await asyncio.to_thread(_apply_target, cb_uid, kcal_val)
+            await callback.answer(f"✅ Цель {kcal_val:.0f} ккал зафиксирована!")
+            try:
+                if callback.message:
+                    await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            except TelegramBadRequest:
+                try:
+                    if callback.message:
+                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        @dp.callback_query(lambda c: bool(c.data in ("target_back", "nav_target")))
+        async def _on_nav_target(callback: CallbackQuery) -> None:
+            cb_uid = str(callback.from_user.id)
+            await callback.answer()
+            msg_text, kb = await asyncio.to_thread(_format_target_interactive, cb_uid, "")
+            try:
+                if callback.message:
+                    await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            except TelegramBadRequest:
+                try:
+                    if callback.message:
+                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        @dp.callback_query(lambda c: bool(c.data == "nav_plateau"))
+        async def _on_nav_plateau(callback: CallbackQuery) -> None:
+            cb_uid = str(callback.from_user.id)
+            await callback.answer()
+            msg_text, kb = await asyncio.to_thread(_format_plateau_interactive, cb_uid, "")
+            try:
+                if callback.message:
+                    await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            except TelegramBadRequest:
+                try:
+                    if callback.message:
+                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        @dp.callback_query(lambda c: bool(c.data == "nav_forecast"))
+        async def _on_nav_forecast(callback: CallbackQuery) -> None:
+            cb_uid = str(callback.from_user.id)
+            await callback.answer()
+            msg_text, kb = await asyncio.to_thread(_format_forecast_interactive, cb_uid, "")
+            try:
+                if callback.message:
+                    await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            except TelegramBadRequest:
+                try:
+                    if callback.message:
+                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        @dp.callback_query(lambda c: bool(c.data == "plateau_refeed"))
+        async def _on_plateau_refeed(callback: CallbackQuery) -> None:
+            cb_uid = str(callback.from_user.id)
+            from health_core import refeed as _refeed
+            conn = connect()
+            try:
+                migrate(conn)
+                user_id = _resolve_uid_to_user_id(conn, cb_uid)
+                today = config.user_now(conn, user_id).date()
+                res = _refeed.schedule(conn, user_id, today, horizon_weeks=4)
+            finally:
+                conn.close()
+            await callback.answer("✅ Рефид MATADOR запланирован!", show_alert=True)
+            msg_text, kb = await asyncio.to_thread(_format_plateau_interactive, cb_uid, "")
+            msg_text += f"\n\n🍽 **Рефид MATADOR запланирован** ({res['scheduled']} дней поддержания на уровне TDEE для нормализации лептина)."
+            try:
+                if callback.message:
+                    await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            except TelegramBadRequest:
+                try:
+                    if callback.message:
+                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        @dp.callback_query(lambda c: bool(c.data == "plateau_council"))
+        async def _on_plateau_council(callback: CallbackQuery) -> None:
+            cb_uid = str(callback.from_user.id)
+            conn = connect()
+            try:
+                migrate(conn)
+                user_id = _resolve_uid_to_user_id(conn, cb_uid)
+                try:
+                    run_id = council.reserve(conn, user_id, "plateau")
+                except ValueError as e:
+                    await callback.answer(f"ℹ️ {e}", show_alert=True)
+                    return
+            finally:
+                conn.close()
+
+            asyncio.create_task(_run_council_task(callback.bot, cb_uid, user_id, run_id, "plateau"))
+            await callback.answer("🩺 Консилиум запущен в фоне. Результат придёт в чат по готовности.", show_alert=True)
 
         log.info("бот запущен, разрешено пользователей: %d", len(allowed_users()))
 
