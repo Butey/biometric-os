@@ -939,9 +939,9 @@ log_watch_day_schema = {
                     "hr_min": {"type": "integer", "description": "Минимальный пульс за день, уд/мин (30-150)"},
                     "hr_avg": {"type": "integer", "description": "Средний пульс за день, уд/мин (35-200)"},
                     "hr_max": {"type": "integer", "description": "Максимальный пульс за день, уд/мин (50-240)"},
-                    "steps": {"type": "integer", "description": "Шаги за день (0-100000)"},
-                    "active_kcal": {"type": "integer", "description": "Калории активности за день (0-5000)"},
-                    "stress_avg": {"type": "integer", "description": "Средний стресс за день по шкале часов (0-100)"},
+                    "steps": {"type": "integer", "description": "Шаги за день (1-100000); нет на скриншоте — поле не передавать"},
+                    "active_kcal": {"type": "integer", "description": "Калории активности за день (1-5000); нет на скриншоте — поле не передавать"},
+                    "stress_avg": {"type": "integer", "description": "Средний стресс за день по шкале часов (1-100); нет на скриншоте — поле не передавать"},
                     "hrv_ms": {"type": "integer", "description": "Вариабельность пульса (HRV) за день, мс (5-300)"}
                 },
                 "required": ["date"]
