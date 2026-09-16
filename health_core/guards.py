@@ -9,7 +9,7 @@ import sqlite3
 import statistics
 from datetime import datetime, timedelta
 
-from health_core.config import load, local_now
+from health_core.config import load, local_now, user_now, user_today
 from health_core.db import connect, migrate
 
 
@@ -17,9 +17,11 @@ def _cfg() -> dict:
     return load()["guards"]
 
 
-def _now() -> datetime:
+def _now(conn: sqlite3.Connection | None = None, user_id: int | None = None) -> datetime:
     """Время человека, а не сервера: гардрейлы считают «дней подряд» и «за
     неделю», и смещённая граница суток даёт ложные срабатывания."""
+    if conn is not None and user_id is not None:
+        return user_now(conn, user_id)
     return local_now()
 
 
@@ -76,7 +78,7 @@ def _lean_loss_ratio(conn: sqlite3.Connection, user_id: int, since: str | None):
 
 def check_lbm_ratio(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
-    since = (_now() - timedelta(days=cfg["lbm_ratio_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
+    since = (_now(conn, user_id) - timedelta(days=cfg["lbm_ratio_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
     res = _lean_loss_ratio(conn, user_id, since)
     if res is None:
         return None
@@ -171,7 +173,7 @@ def check_ffmi_floor(conn: sqlite3.Connection, user_id: int):
 def check_undereating(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
     days, ratio = cfg["undereating_days"], cfg["undereating_ratio"]
-    today = _now().date()
+    today = _now(conn, user_id).date()
     for i in range(1, days + 1):
         d = (today - timedelta(days=i)).isoformat()
         target = conn.execute(
@@ -196,7 +198,7 @@ def check_undereating(conn: sqlite3.Connection, user_id: int):
 
 def check_plateau(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
-    since = (_now() - timedelta(days=cfg["plateau_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
+    since = (_now(conn, user_id) - timedelta(days=cfg["plateau_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute(
         "SELECT weight_kg FROM body_metrics WHERE user_id=? AND measured_at>=?", (user_id, since)
     ).fetchall()
@@ -217,7 +219,7 @@ def check_plateau(conn: sqlite3.Connection, user_id: int):
 # ---------------------------------------------------------------- BMR_FLOOR
 
 def check_bmr_floor(conn: sqlite3.Connection, user_id: int):
-    today = _now().date().isoformat()
+    today = _now(conn, user_id).date().isoformat()
     row = conn.execute(
         "SELECT kcal_target FROM daily_targets WHERE user_id=? AND date=?", (user_id, today)
     ).fetchone()
@@ -250,7 +252,7 @@ def check_bmr_floor(conn: sqlite3.Connection, user_id: int):
 
 # ---------------------------------------------------------------- NO_MEASURE
 
-def _gap_days(ts: str) -> int:
+def _gap_days(ts: str, conn: sqlite3.Connection | None = None, user_id: int | None = None) -> int:
     """Разрыв в КАЛЕНДАРНЫХ днях, а не в полных сутках.
 
     timedelta.days округляет вниз: замер, сделанный в 07:00 пять дней назад,
@@ -262,7 +264,7 @@ def _gap_days(ts: str) -> int:
     на сравнении soon_days <= gap < no_measure_days, и разъехавшиеся единицы
     открыли бы щель, в которой не звучит ни один.
     """
-    return (_now().date() - _parse(ts).date()).days
+    return (_now(conn, user_id).date() - _parse(ts).date()).days
 
 
 def check_no_measure(conn: sqlite3.Connection, user_id: int):
@@ -271,12 +273,12 @@ def check_no_measure(conn: sqlite3.Connection, user_id: int):
         "SELECT measured_at FROM body_metrics WHERE user_id=? ORDER BY measured_at DESC LIMIT 1", (user_id,)
     ).fetchone()
     if last is not None:
-        gap = _gap_days(last["measured_at"])
+        gap = _gap_days(last["measured_at"], conn, user_id)
         if gap < days:
             return None
         return _alert("NO_MEASURE", "warning", f"Нет замеров {gap} дней, порог {days}.", gap, days)
     urow = conn.execute("SELECT created_at FROM users WHERE id=?", (user_id,)).fetchone()
-    if urow is None or _gap_days(urow["created_at"]) < days:
+    if urow is None or _gap_days(urow["created_at"], conn, user_id) < days:
         return None
     return _alert("NO_MEASURE", "warning", f"Ни одного замера за {days} дней с регистрации.", 0, days)
 
@@ -289,7 +291,7 @@ def check_lipid_guard(conn: sqlite3.Connection, user_id: int):
     # route IS NULL (строки до миграции v3) в фильтр не попадает — гардрейл молчит
     # на неизвестном пути введения, а не угадывает по подстроке.
     threshold = _cfg()["lipid_guard_fat_g"]
-    today = _now().date().isoformat()
+    today = _now(conn, user_id).date().isoformat()
     doses = conn.execute(
         "SELECT at, substance, dose FROM med_log WHERE user_id=? AND date(at)=? AND route='oral'",
         (user_id, today),
@@ -347,7 +349,7 @@ def check_rate_high(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
     window_days = cfg["weight_rate_window_days"]
     min_points = cfg["weight_rate_min_points"]
-    since = (_now() - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    since = (_now(conn, user_id) - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute(
         "SELECT measured_at, weight_kg FROM body_metrics WHERE user_id=? AND measured_at>=? ORDER BY measured_at",
         (user_id, since),
@@ -398,7 +400,7 @@ def check_weight_regain(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
     window_days = cfg["regain_window_days"]
     min_points = cfg["regain_min_points"]
-    since = (_now() - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    since = (_now(conn, user_id) - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute(
         "SELECT measured_at, weight_kg FROM body_metrics WHERE user_id=? AND measured_at>=? ORDER BY measured_at",
         (user_id, since),
@@ -435,9 +437,9 @@ def check_stale_calib(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
     window, min_days = cfg["stale_calib_window_days"], cfg["stale_calib_min_days"]
     urow = conn.execute("SELECT created_at FROM users WHERE id=?", (user_id,)).fetchone()
-    if urow is None or (_now() - _parse(urow["created_at"])).days < window:
+    if urow is None or (_now(conn, user_id) - _parse(urow["created_at"])).days < window:
         return None
-    since = (_now() - timedelta(days=window)).strftime("%Y-%m-%d %H:%M:%S")
+    since = (_now(conn, user_id) - timedelta(days=window)).strftime("%Y-%m-%d %H:%M:%S")
     n = conn.execute(
         "SELECT COUNT(DISTINCT date(eaten_at)) n FROM food_log WHERE user_id=? AND eaten_at>=?",
         (user_id, since),
@@ -477,7 +479,7 @@ def _protein_target(conn: sqlite3.Connection, user_id: int, today: str) -> float
 
 def check_protein_skew(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
-    today = _now().date().isoformat()
+    today = _now(conn, user_id).date().isoformat()
     rows = conn.execute(
         "SELECT fl.id log_id, fl.meal_slot, fi.protein_g FROM food_log fl "
         "JOIN food_items fi ON fi.food_log_id=fl.id "
@@ -538,7 +540,7 @@ def check_protein_skew(conn: sqlite3.Connection, user_id: int):
 
 def check_glucose_volatility(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
-    since = (_now() - timedelta(days=cfg["glucose_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
+    since = (_now(conn, user_id) - timedelta(days=cfg["glucose_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute(
         "SELECT at, mmol_l FROM glucose_log WHERE user_id=? AND at>=? ORDER BY at", (user_id, since)
     ).fetchall()
@@ -590,12 +592,12 @@ def check_measure_soon(conn: sqlite3.Connection, user_id: int):
         "SELECT measured_at FROM body_metrics WHERE user_id=? ORDER BY measured_at DESC LIMIT 1", (user_id,)
     ).fetchone()
     if last is not None:
-        gap = _gap_days(last["measured_at"])
+        gap = _gap_days(last["measured_at"], conn, user_id)
     else:
         urow = conn.execute("SELECT created_at FROM users WHERE id=?", (user_id,)).fetchone()
         if urow is None:
             return None
-        gap = _gap_days(urow["created_at"])
+        gap = _gap_days(urow["created_at"], conn, user_id)
     # Верхняя граница — no_measure_days САМОГО check_no_measure, а не отдельная
     # константа: если бы пороги могли разойтись, оба гардрейла оказались бы в
     # check_all одновременно на одном и том же разрыве — ровно то, что правило
@@ -621,7 +623,7 @@ def check_binge_risk(conn: sqlite3.Connection, user_id: int):
     from health_core import energy
 
     cfg = _cfg()
-    now = _now()
+    now = _now(conn, user_id)
     today = now.date()
     yesterday = today - timedelta(days=1)
     window_days = cfg["binge_window_days"]
@@ -717,7 +719,7 @@ def check_recovery_low(conn: sqlite3.Connection, user_id: int):
     повод облегчить тренировку, не диагноз. Молчит без данных, без медиан
     (нужно >=10 дней на метрику в окне медианы) и если любой из 3 дней болен/рефид."""
     cfg = _cfg()
-    today = _now().date()
+    today = _now(conn, user_id).date()
 
     end_day = None
     for offset in (0, 1):
@@ -821,7 +823,7 @@ def check_all(conn: sqlite3.Connection, user_id: int) -> list[dict]:
             continue
         out.extend(res) if isinstance(res, list) else out.append(res)
     from health_core import sick  # локальный импорт — на случай, если sick.py когда-нибудь импортирует guards
-    if sick.quiet(conn, user_id, _now().date().isoformat()):
+    if sick.quiet(conn, user_id, _now(conn, user_id).date().isoformat()):
         out = [a for a in out if a["code"] not in SICK_QUIET_CODES]
     return out
 
@@ -829,7 +831,7 @@ def check_all(conn: sqlite3.Connection, user_id: int) -> list[dict]:
 def record(conn: sqlite3.Connection, user_id: int, alerts: list[dict]) -> None:
     if not alerts:
         return
-    now = _now()
+    now = _now(conn, user_id)
     today = now.strftime("%Y-%m-%d")
     ts = now.strftime("%Y-%m-%d %H:%M:%S")
     # Один и тот же гард срабатывает на КАЖДОМ логировании за день (каждый вызов
@@ -1036,7 +1038,7 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
     alerts = check_all(conn, user_id)
     fired_map = {a["code"]: a for a in alerts}
     cfg = _cfg()
-    now = _now()
+    now = _now(conn, user_id)
     results = []
 
     user = conn.execute("SELECT height_cm, sex FROM users WHERE id=?", (user_id,)).fetchone()
@@ -1047,7 +1049,7 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
         "SELECT measured_at, weight_kg, ffm_kg FROM body_metrics WHERE user_id=? ORDER BY measured_at DESC LIMIT 1",
         (user_id,)
     ).fetchone()
-    gap_days = _gap_days(last_bm["measured_at"]) if last_bm else None
+    gap_days = _gap_days(last_bm["measured_at"], conn, user_id) if last_bm else None
 
     since_14d = (now - timedelta(days=cfg["lbm_ratio_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
     res_14d = _lean_loss_ratio(conn, user_id, since_14d)
@@ -1278,6 +1280,12 @@ if __name__ == "__main__":
         conn = connect()
         migrate(conn)
 
+        # Фикстуры засевают данные по local_now(), гарды считают окна по
+        # поясу пользователя (user_now). Без общего пояса даты разъезжаются
+        # на часы, и окна ловят не те точки — выставляем пояс по умолчанию.
+        from health_core.config import set_tz
+        set_tz((load().get('schedule') or {}).get('default_timezone'))
+
         try:
             def make_user(tg_id, height_cm=185, created_days_ago=30):
                 created = (_now() - timedelta(days=created_days_ago)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1328,7 +1336,7 @@ if __name__ == "__main__":
             # тест запущен до семи утра — тогда опоры нет и тренд пуст.
             add_metric(u4, 8, 123.0, None, hour=7)
             add_metric(u4, 0, 121.8, None, hour=7)
-            today = _now().date().isoformat()
+            today = user_today(conn, u4)
             conn.execute("INSERT INTO daily_targets(user_id, date, kcal_target) VALUES (?,?,?)", (u4, today, 2209))
             conn.execute("INSERT INTO user_targets(user_id, valid_from, water_ml) VALUES (?,?,?)", (u4, today, 3000))
             conn.execute("INSERT INTO food_log(user_id, eaten_at) VALUES (?, ?)", (u4, f"{today} 08:00:00"))
@@ -1389,7 +1397,7 @@ if __name__ == "__main__":
             u8 = make_user(108, height_cm=185, created_days_ago=60)
             add_metric(u8, 7, 123.0, 78.0)
             add_metric(u8, 0, 115.0, 76.5)
-            today = _now().date().isoformat()
+            today = user_today(conn, u8)
             conn.execute("INSERT INTO daily_targets(user_id, date, kcal_target) VALUES (?,?,?)", (u8, today, 2200))
             conn.execute("INSERT INTO user_targets(user_id, valid_from, water_ml) VALUES (?,?,?)", (u8, today, 3000))
             conn.execute("INSERT INTO food_log(user_id, eaten_at) VALUES (?, ?)", (u8, f"{today} 08:00:00"))
@@ -1848,7 +1856,7 @@ if __name__ == "__main__":
             # Сценарий E: завтрак пропущен после 12:00 при активном логировании + короткий
             # сон -> 2 фактора (дефицит неизвестен, tdee=None), warning
             u44 = make_user(144, height_cm=185, created_days_ago=30)
-            _now = lambda: _now_real().replace(hour=13, minute=0, second=0, microsecond=0)
+            _now = lambda conn=None, user_id=None: _now_real().replace(hour=13, minute=0, second=0, microsecond=0)
             _add_binge_food(u44, 0, 500, protein_g=15.0, meal_slot="lunch", hour=13)  # еда сегодня, не завтрак
             _add_binge_sleep(u44, today_iso, 300)
             conn.commit()

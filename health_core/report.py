@@ -4,17 +4,23 @@ import sqlite3
 import statistics
 from datetime import datetime, timedelta
 
-from health_core.config import load, local_now, targets_for
+from health_core.config import load, local_now, targets_for, user_now
 from health_core.guards import check_all
 from health_core.chrono import eating_window, late_load, meal_windows
 
 MINUS = "−"  # настоящий минус, не дефис — так в §07
 
 
-def _now() -> datetime:
+def _now(conn: sqlite3.Connection | None = None, user_id: int | None = None) -> datetime:
     """Время того, кого обслуживаем, а не сервера: граница суток у них разная.
-    Машина в UTC−7, VPS обычно в UTC, человек в Europe/Moscow — до девяти часов
-    разрыва, и запись, сделанная им утром, попадала во вчерашний день сервера."""
+    Машина в UTC−7, VPS обычно в UTC, человек в Asia/Yekaterinburg — до
+    двенадцати часов разрыва, и запись, сделанная им утром, попадала во
+    вчерашний день сервера.
+
+    conn и user_id переданы — пояс берём из профиля (config.user_now); без них
+    остаётся пояс по умолчанию из config.yaml, так зовут только самотесты."""
+    if conn is not None and user_id is not None:
+        return user_now(conn, user_id)
     return local_now()
 
 
@@ -76,7 +82,7 @@ def _weight_trend(conn: sqlite3.Connection, user_id: int, window_days: int, late
     МЕДИАНА ИСПОЛЬЗУЕТСЯ, ЧТОБЫ одна шумная точка на границе окна не решила сама по себе,
     какой тренд показывать. Биоимпеданс носит шум гидрации в килограмм в день;
     эндпоинт-дельта ловит одиночный всплеск как знаковый сдвиг."""
-    since = (_now() - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    since = (_now(conn, user_id) - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
     # Оригинал: ищет ТОЧКУ <= граница окна (якорь), затем использует latest.
     # Для медианы: берём все точки, начиная хотя бы от границы окна.
     # Дополнительный запрос: найти последнюю точку ВНЕ окна (если есть), чтобы включить якорь.
@@ -196,7 +202,7 @@ def day_summary(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
 
 def status_bar(conn: sqlite3.Connection, user_id: int) -> str:
     """Готовая строка §07. Модель дописывает её как есть, не перефразируя."""
-    now = _now()
+    now = _now(conn, user_id)
     date = now.date().isoformat()
     policy = load()["policy"]
 
@@ -336,7 +342,7 @@ def whr(conn: sqlite3.Connection, user_id: int) -> float | None:
 
 def trends(conn: sqlite3.Connection, user_id: int, window_days: int = 30) -> dict:
     """Вес, LBM, талия, WHR, фактический TDEE за окно (§07 query_metrics/get_progress)."""
-    since = (_now() - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    since = (_now(conn, user_id) - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
     weight_rows = conn.execute(
         "SELECT weight_kg, ffm_kg FROM body_metrics WHERE user_id=? AND measured_at>=? ORDER BY measured_at",
         (user_id, since),
@@ -418,7 +424,7 @@ def weight_series(conn: sqlite3.Connection, user_id: int, days: int = 90) -> lis
     спарклайн должен рисовать тренд, а не шум разницы между утренним и вечерним
     взвешиванием. Отрисовка блоками — дело tools.py (presentation), здесь только
     выборка. Восходящий порядок по дате, пусто — если замеров нет."""
-    since = (_now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    since = (_now(conn, user_id) - timedelta(days=days)).strftime("%Y-%m-%d")
     rows = conn.execute(
         "SELECT date(measured_at) AS d, weight_kg FROM body_metrics "
         "WHERE user_id=? AND weight_kg IS NOT NULL AND date(measured_at)>=? "
@@ -467,7 +473,7 @@ def mark_achieved_milestones(conn: sqlite3.Connection, user_id: int) -> list[dic
     идут вниз, сухая масса — вверх. Сравнение «текущее <= порога» для всех
     закрыло бы веху по сухой массе в момент её постановки.
     """
-    now = _now().strftime("%Y-%m-%d %H:%M:%S")
+    now = _now(conn, user_id).strftime("%Y-%m-%d %H:%M:%S")
     achieved = []
     for m in conn.execute(
         "SELECT id, name, metric, threshold FROM milestones "
@@ -514,7 +520,7 @@ def training_efficiency(conn: sqlite3.Connection, user_id: int, window_days: int
     только начинает, поэтому top-level excluded_reasons даёт понять «данных
     просто нет» отдельно от «данные есть, но кривые» — это разные проблемы.
     """
-    since = (_now() - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    since = (_now(conn, user_id) - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute(
         "SELECT started_at, duration_min, kcal, avg_hr, sport FROM activity "
         "WHERE user_id=? AND started_at>=? ORDER BY started_at",
@@ -609,7 +615,7 @@ def weekly_summary(conn: sqlite3.Connection, user_id: int, end_date: str | None 
     Каждое число — из БД; где данных нет — «нет данных», никогда 0 вместо
     измерения и никакой экстраполяции («при таком темпе к дате X будет Y» —
     явно отвергнуто продактом)."""
-    end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else _now().date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else _now(conn, user_id).date()
     start = end - timedelta(days=6)
     start_ts, end_ts = f"{start.isoformat()} 00:00:00", f"{end.isoformat()} 23:59:59"
 
