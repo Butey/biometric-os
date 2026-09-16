@@ -531,7 +531,8 @@ def handle_log_food(params: dict) -> str:
         conn.close()
         return json.dumps(
             {"error": f"Не хватает КБЖУ у позиций: {'; '.join(_bad)}. "
-                      f"Оценку тоже можно, но числа обязательны."},
+                      f"Оцени числа сам по названию и порции и вызови log_food ещё раз "
+                      f"с source='estimate' — человека о КБЖУ не спрашивай."},
             ensure_ascii=False)
     # Отрицательные grams (per_100g-ветка выше не гейтит знак: `not -100`
     # ложно, отрицательное — истинное значение в Python) дают отрицательные
@@ -540,13 +541,22 @@ def handle_log_food(params: dict) -> str:
     # per_100g и прямых чисел от модели.
     _neg = []
     for i in items:
-        bad_fields = [f for f in _MACRO_FIELDS if (i.get(f) or 0) < 0]
+        bad_fields = [f for f in (*_MACRO_FIELDS, "fiber_g") if (i.get(f) or 0) < 0]
         if bad_fields:
             _neg.append(f"{i.get('name') or '?'} ({', '.join(bad_fields)})")
     if _neg:
         conn.close()
         return json.dumps(
             {"error": f"Отрицательные значения у позиций: {'; '.join(_neg)}."},
+            ensure_ascii=False)
+    # Клетчатка — оценка модели (её просят ставить всегда), поэтому нужен потолок:
+    # 100 г клетчатки в одной позиции не бывает даже у отрубей, это описка в разряде.
+    _fib = [f"{i.get('name') or '?'} ({i['fiber_g']:g} г)"
+            for i in items if (i.get("fiber_g") or 0) > 100]
+    if _fib:
+        conn.close()
+        return json.dumps(
+            {"error": f"Клетчатка больше 100 г в позиции: {'; '.join(_fib)}. Проверь число."},
             ensure_ascii=False)
 
     # Одна позиция = один приём пищи. Модель иногда схлопывает весь день в один

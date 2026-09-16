@@ -44,11 +44,11 @@ log_food_schema = {
                 "properties": {
                     "name": {"type": "string", "description": "Название блюда"},
                     "grams": {"type": "number", "description": "Вес в граммах; обязателен вместе с per_100g"},
-                    "kcal": {"type": "number", "description": "Ккал; обязательно без per_100g"},
-                    "protein_g": {"type": "number", "description": "Белки, г; обязательно без per_100g"},
-                    "fat_g": {"type": "number", "description": "Жиры, г; обязательно без per_100g, влияет на LIPID_GUARD"},
-                    "carbs_g": {"type": "number", "description": "Углеводы, г; обязательно без per_100g"},
-                    "fiber_g": {"type": "number", "description": "Клетчатка, г, отдельно от carbs_g; неизвестна — не передавайте"},
+                    "kcal": {"type": "number", "description": "Ккал; обязательно без per_100g. Не знаешь точно — оцени сам, человека не переспрашивай"},
+                    "protein_g": {"type": "number", "description": "Белки, г; обязательно без per_100g — при незнании оценка"},
+                    "fat_g": {"type": "number", "description": "Жиры, г; обязательно без per_100g — при незнании оценка, влияет на LIPID_GUARD"},
+                    "carbs_g": {"type": "number", "description": "Углеводы, г; обязательно без per_100g — при незнании оценка"},
+                    "fiber_g": {"type": "number", "description": "Клетчатка, г, отдельно от carbs_g; оценивай всегда: мясо, рыба, яйца, масло, сахар — 0; овощи, фрукты, крупы, хлеб, бобовые, орехи — число"},
                     "per_100g": {
                         "type": "object",
                         "properties": {
