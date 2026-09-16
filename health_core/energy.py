@@ -25,7 +25,7 @@ import sqlite3
 import statistics
 from datetime import date, datetime, timedelta
 
-from health_core.config import latest_ffm, load, targets_for, local_now
+from health_core.config import latest_ffm, load, targets_for, local_now, user_now
 
 _KCAL_PER_KG = 7700  # тот же коэффициент, что и в "Адаптивном TDEE" §09
 
@@ -114,7 +114,7 @@ def lean_share(conn: sqlite3.Connection, user_id: int) -> float | None:
     min_loss = policy["lean_share_min_loss_kg"]
     no_measure_days = load()["guards"]["no_measure_days"]
 
-    since = (local_now() - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    since = (user_now(conn, user_id) - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute(
         "SELECT measured_at, weight_kg, ffm_kg FROM body_metrics WHERE user_id=? "
         "AND ffm_kg IS NOT NULL AND measured_at >= ? ORDER BY measured_at ASC",
@@ -122,7 +122,7 @@ def lean_share(conn: sqlite3.Connection, user_id: int) -> float | None:
     ).fetchall()
     if len(rows) < min_points:
         return None
-    gap = (local_now().date() - date.fromisoformat(rows[-1]["measured_at"][:10])).days
+    gap = (user_now(conn, user_id).date() - date.fromisoformat(rows[-1]["measured_at"][:10])).days
     if gap > no_measure_days:
         return None
 
@@ -294,8 +294,8 @@ def _adaptive_tdee_core(
     нужен именно текущий TDEE). daily_target() пересчитывает цель задним числом
     и обязан передавать свою же дату через for_date, иначе повторный вызов на
     одну и ту же историческую дату даёт разный результат в зависимости от того,
-    когда он был выполнен — окно "плывёт" вместе с local_now()."""
-    end = datetime.fromisoformat(for_date[:10]).date() if for_date else local_now().date()
+    когда он был выполнен — окно "плывёт" вместе с user_now(conn, user_id)."""
+    end = datetime.fromisoformat(for_date[:10]).date() if for_date else user_now(conn, user_id).date()
     start = end.fromordinal(end.toordinal() - window_days + 1)
     start_s, end_s = start.isoformat(), end.isoformat()
 
@@ -477,7 +477,7 @@ def deadline_verdict(conn: sqlite3.Connection, user_id: int, date_: str | None =
                                unreachable is None.
     """
     if date_ is None:
-        date_ = local_now().date().isoformat()
+        date_ = user_now(conn, user_id).date().isoformat()
     milestone = _active_milestone(conn, user_id)
     if milestone is None:
         return None
@@ -736,6 +736,12 @@ if __name__ == "__main__":
         db.DB_PATH = Path(os.environ["HEALTH_DB"])
         conn = db.connect()
         db.migrate(conn)
+
+        # Фикстуры засевают замеры по local_now(), рабочий код считает окна
+        # по поясу пользователя (user_now) — без общего пояса даты разъезжаются
+        # на часы и окна ловят не те точки.
+        from health_core.config import set_tz
+        set_tz((load().get('schedule') or {}).get('default_timezone'))
 
         conn.execute(
             "INSERT INTO users(telegram_user_id, height_cm, birth_date, sex, created_at) "

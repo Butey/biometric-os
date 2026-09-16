@@ -8,7 +8,7 @@
 
 from datetime import datetime
 
-from health_core.config import load, local_now
+from health_core.config import load, local_now, user_now
 
 
 def hr_max(age: int) -> float:
@@ -37,7 +37,7 @@ def zones(conn, user_id, on_date: str | None = None) -> dict | None:
         hr_max_source — "test"/"watch" при личном максимуме, иначе "formula".
     """
     if on_date is None:
-        on_date = local_now().date().isoformat()
+        on_date = user_now(conn, user_id).date().isoformat()
 
     user = conn.execute(
         "SELECT birth_date, hr_max_bpm, hr_max_source FROM users WHERE id=?", (user_id,)

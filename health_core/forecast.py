@@ -75,7 +75,7 @@ import sqlite3
 import statistics
 from datetime import date, timedelta
 
-from health_core.config import latest_ffm, load, local_now
+from health_core.config import latest_ffm, load, local_now, user_now
 from health_core.energy import adaptive_tdee, bmr_mifflin, _age_years
 
 # Энергетическая плотность тканей, ккал/кг (Hall, Lancet 2011).
@@ -158,7 +158,7 @@ def _observed_intake(conn: sqlite3.Connection, user_id: int, window_days: int = 
     Порог тот же, что у adaptive_tdee (11 дней из 14): ниже него среднее
     считается по огрызку и занижено пропущенными днями.
     """
-    end = local_now().date()
+    end = user_now(conn, user_id).date()
     start = end - timedelta(days=window_days - 1)
     rows = conn.execute(
         "SELECT date(fl.eaten_at) d, SUM(fi.kcal) kcal FROM food_log fl "
@@ -184,7 +184,7 @@ def _plateau_note(conn: sqlite3.Connection, user_id: int, weight_kg: float,
     if row is None or not row["base_weight_date"]:
         return None
     started = date.fromisoformat(row["base_weight_date"])
-    weeks = (local_now().date() - started).days / 7.0
+    weeks = (user_now(conn, user_id).date() - started).days / 7.0
     if weeks < 0:
         return None
     bmi = weight_kg / (height_cm / 100) ** 2
@@ -261,7 +261,7 @@ def project(conn: sqlite3.Connection, user_id: int, horizon_days: int = 84,
         return {"error": "Нет ни одного замера массы"}
     weight_kg, last_date = sw
 
-    today = local_now().date()
+    today = user_now(conn, user_id).date()
     age_days = (today - date.fromisoformat(last_date)).days
     if age_days > MAX_WEIGHT_AGE_DAYS:
         return {"error": f"Последний замер массы {age_days} дней назад — "

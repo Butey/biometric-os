@@ -8,7 +8,7 @@ import sqlite3
 import statistics
 from datetime import timedelta
 
-from health_core.config import load, local_now, latest_ffm
+from health_core.config import load, local_now, latest_ffm, user_now
 from health_core.energy import bmr_floor, adaptive_tdee, kcal_floor, fat_mass_kg, lean_share, _tcx_net
 from health_core.report import whr, trends
 from health_core.nutrition import day_macros
@@ -18,8 +18,10 @@ from health_core import watch as _watch
 from health_core.guards import check_recovery_low
 
 
-def _since(days: int) -> str:
-    return (local_now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+def _since(days: int, conn: sqlite3.Connection | None = None, user_id: int | None = None) -> str:
+    """Граница окна глазами человека: без conn/user_id (самотесты) — часы сервера."""
+    now = user_now(conn, user_id) if conn is not None and user_id is not None else local_now()
+    return (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _body_composition(conn: sqlite3.Connection, user_id: int) -> dict:
@@ -42,7 +44,7 @@ def _waist_12w(conn: sqlite3.Connection, user_id: int) -> list[dict]:
     rows = conn.execute(
         "SELECT measured_on, value_cm FROM anthropometry WHERE user_id=? AND site='талия' "
         "AND measured_on>=? ORDER BY measured_on",
-        (user_id, (local_now() - timedelta(weeks=12)).date().isoformat()),
+        (user_id, (user_now(conn, user_id) - timedelta(weeks=12)).date().isoformat()),
     ).fetchall()
     return [{"date": r["measured_on"], "cm": r["value_cm"]} for r in rows]
 
@@ -51,7 +53,7 @@ def _nutrition_vs_target_28d(conn: sqlite3.Connection, user_id: int) -> list[dic
     """Питание против цели по дням: day_macros() (факт) против сохранённой
     daily_targets (цель того дня) — читаем уже посчитанную цель, не
     пересчитываем её заново (energy.daily_target пишет в БД, сюда не годится)."""
-    start = (local_now() - timedelta(days=28)).date()
+    start = (user_now(conn, user_id) - timedelta(days=28)).date()
     out = []
     for i in range(28):
         d = (start + timedelta(days=i)).isoformat()
@@ -79,7 +81,7 @@ def _kcal_floor_now(conn: sqlite3.Connection, user_id: int) -> dict:
 
     Неполный профиль (нет body_metrics/роста/даты рождения) -> bmr_floor()
     бросает ValueError — тогда пол консилиуму неизвестен, а не падение пакета."""
-    today = local_now().date().isoformat()
+    today = user_now(conn, user_id).date().isoformat()
     try:
         bmr = bmr_floor(conn, user_id)
     except ValueError:
@@ -109,7 +111,7 @@ def _kcal_floor_now(conn: sqlite3.Connection, user_id: int) -> dict:
 def _meds_12w(conn: sqlite3.Connection, user_id: int) -> dict:
     doses = conn.execute(
         "SELECT at, substance, dose, unit, route FROM med_log WHERE user_id=? AND at>=? ORDER BY at",
-        (user_id, _since(84)),
+        (user_id, _since(84, conn, user_id)),
     ).fetchall()
     schedule = conn.execute(
         "SELECT substance, dose, unit, route, every_days, next_at, stock_doses, dose_by_doctor "
@@ -127,13 +129,13 @@ def _meds_12w(conn: sqlite3.Connection, user_id: int) -> dict:
 def _side_effects_12w(conn: sqlite3.Connection, user_id: int) -> list[dict]:
     rows = conn.execute(
         "SELECT at, symptom, severity, notes FROM side_effects WHERE user_id=? AND at>=? ORDER BY at",
-        (user_id, _since(84)),
+        (user_id, _since(84, conn, user_id)),
     ).fetchall()
     return [dict(r) for r in rows]
 
 
 def _sleep_activity_28d(conn: sqlite3.Connection, user_id: int) -> dict:
-    since = _since(28)
+    since = _since(28, conn, user_id)
     sleep = conn.execute(
         "SELECT night_date, duration_min, quality FROM sleep_log WHERE user_id=? AND night_date>=? "
         "ORDER BY night_date",
@@ -148,7 +150,7 @@ def _sleep_activity_28d(conn: sqlite3.Connection, user_id: int) -> dict:
 
 
 def _refeed_sick_days_28d(conn: sqlite3.Connection, user_id: int) -> dict:
-    since = _since(28)[:10]
+    since = _since(28, conn, user_id)[:10]
     refeed = [r["date"] for r in conn.execute(
         "SELECT date FROM refeed_days WHERE user_id=? AND date>=? ORDER BY date", (user_id, since)
     ).fetchall()]
@@ -161,7 +163,7 @@ def _refeed_sick_days_28d(conn: sqlite3.Connection, user_id: int) -> dict:
 def _recent_alerts_28d(conn: sqlite3.Connection, user_id: int) -> list[dict]:
     rows = conn.execute(
         "SELECT created_at, rule, message FROM alerts WHERE user_id=? AND created_at>=? ORDER BY created_at",
-        (user_id, _since(28)),
+        (user_id, _since(28, conn, user_id)),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -195,7 +197,7 @@ def plateau_3w(conn: sqlite3.Connection, user_id: int) -> bool:
     последние 7 дней отличается от медианы 21-28 дней назад меньше чем на
     0.5 кг, И талия за 21 день не уменьшилась (нужно >=2 замера в окне,
     последний не меньше первого)."""
-    now = local_now()
+    now = user_now(conn, user_id)
     recent = [r["weight_kg"] for r in conn.execute(
         "SELECT weight_kg FROM body_metrics WHERE user_id=? AND weight_kg IS NOT NULL AND measured_at>=?",
         (user_id, (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")),
