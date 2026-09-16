@@ -4661,20 +4661,31 @@ def handle_set_milestone(params: dict) -> str:
         (user_id, name),
     ).fetchone()
 
+    result = {
+        "id": m["id"],
+        "user_id": m["user_id"],
+        "name": m["name"],
+        "metric": m["metric"],
+        "threshold": m["threshold"],
+        "deadline": m["deadline"],
+        "achieved_at": m["achieved_at"],
+    }
+
+    # Если есть срок — сразу проверить достижимость, чтобы модель могла
+    # честно сказать человеку и предложить скорректировать.
+    # Вердикту нужны замеры и лог еды — на свежем профиле их нет, и это не ошибка.
+    if deadline:
+        try:
+            from health_core.energy import deadline_verdict
+            verdict = deadline_verdict(conn, user_id)
+            if verdict:
+                result["deadline_verdict"] = verdict
+        except Exception:
+            pass
+
     conn.close()
 
-    return json.dumps(
-        {
-            "id": m["id"],
-            "user_id": m["user_id"],
-            "name": m["name"],
-            "metric": m["metric"],
-            "threshold": m["threshold"],
-            "deadline": m["deadline"],
-            "achieved_at": m["achieved_at"],
-        },
-        ensure_ascii=False,
-    )
+    return json.dumps(result, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------- ADMIN TOOLS
