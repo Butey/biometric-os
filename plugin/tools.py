@@ -6756,6 +6756,10 @@ if __name__ == "__main__":
             "log_sleep": {"duration_min": 480},
             "log_weight": {"weight_kg": 80.0},
             "log_anthropometry": {"site": "талия", "value_cm": 85.0},
+            # Рост/вес/пол схема объявляет required, но дамми 1 см обработчик
+            # справедливо отклоняет (гард нуля, коммит 4716b05): контракт полей
+            # проверяем правдоподобными числами, а не заведомо невозможными.
+            "register_user": {"height_cm": 180.0, "birth_date": "1990-01-01", "sex": "m"},
             "log_med": {"drug": "Тест", "dose": "1", "route": "oral"},
             "log_workout": {"sport": "Бег", "duration_min": 30, "kcal": 250},
             # action=fetch бьёт в сеть (openFDA/ClinicalTrials.gov) — самотесты сеть
