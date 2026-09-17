@@ -1284,7 +1284,7 @@ def handle_log_watch_day(params: dict) -> str:
     if not days:
         conn.close()
         return json.dumps(
-            {"error": "Нужен days: [{date, hr_min/hr_avg/hr_max/steps/active_kcal/stress_avg/hrv_ms}] — хотя бы один день"},
+            {"error": "Нужен days: [{date, hr_min/hr_avg/hr_max/steps/active_kcal/stress_avg/hrv_ms/spo2_avg}] — хотя бы один день"},
             ensure_ascii=False,
         )
 
@@ -2105,6 +2105,7 @@ def handle_import_scale_export(params: dict) -> str:
             "skipped": result.get("skipped", 0),
             "bursts": result.get("bursts", 0),
             "alerts": alerts,
+            "activity": result.get("activity"),
         },
         ensure_ascii=False,
     )
@@ -2856,6 +2857,27 @@ def _render_dashboard(conn, user_id: int) -> str:
             (user_id,),
         )
     }
+    # Для веса гарантируем логику "ближайшей следующей вехи",
+    # чтобы совпадало с логикой status_bar() из health_core/report.py
+    if metric is not None and metric.get("weight_kg"):
+        next_w = conn.execute(
+            "SELECT threshold FROM milestones WHERE user_id=? AND metric='weight_kg' "
+            "AND achieved_at IS NULL AND threshold<=? ORDER BY threshold DESC LIMIT 1",
+            (user_id, metric["weight_kg"]),
+        ).fetchone()
+        if next_w:
+            goals["weight_kg"] = next_w["threshold"]
+        else:
+            min_w = conn.execute(
+                "SELECT threshold FROM milestones WHERE user_id=? AND metric='weight_kg' "
+                "AND achieved_at IS NULL ORDER BY threshold ASC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if min_w:
+                goals["weight_kg"] = min_w["threshold"]
+            else:
+                goals.pop("weight_kg", None)
+
 
     def _goal_baseline(metric_key: str):
         """Точка отсчёта метрики: для веса — стартовый (профиль или первое

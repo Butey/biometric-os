@@ -175,12 +175,13 @@ def strip_tool_rules(text: str) -> str:
 # давности, со старым временем в шапке и нулевой клетчаткой). В историю кладём
 # заглушку: скопировать нечего, придётся звать инструмент.
 _PANEL_RE = re.compile(r"```.*?```", re.DOTALL)
-_PANEL_STUB = ("[готовый блок показан человеку; его числа устарели — "
-               "вызови инструмент заново, из истории не копируй]")
+_PANEL_STUB = ("<!-- METABOLIC_PANEL_SHOWN: блок пульта передан человеку. "
+               "Числа устарели — вызови инструмент заново, из истории не копируй -->")
 
 
 def strip_panels(text: str) -> str:
     return _PANEL_RE.sub(_PANEL_STUB, text)
+
 
 
 def dispatch(name: str, args: dict) -> str:
@@ -283,6 +284,12 @@ async def send_long(message: Message, text: str) -> None:
     """Разметка приходит от модели и бывает битой (незакрытая звёздочка). Когда
     телеграм отказывается её разбирать, шлём тот же кусок без разметки:
     молчание в ответ на вопрос хуже сырого текста."""
+    if "METABOLIC_PANEL_SHOWN" in text or "готовый блок показан человеку" in text:
+        text = text.replace(_PANEL_STUB, "").replace(
+            "[готовый блок показан человеку; его числа устарели — вызови инструмент заново, из истории не копируй]", ""
+        ).strip()
+        if not text:
+            text = "Сводку обновил в базе данных. Чтобы посмотреть свежий пульт, напиши «пульт» или «статус»."
     if not text.strip():
         # Пустой ответ телеграм отвергает, и вместо ошибки человек видит тишину.
         # Молчание — худший из возможных ответов: непонятно, дошло ли вообще.
@@ -1196,8 +1203,24 @@ async def _handle_document(message: Message, uid: str) -> None:
             else:
                 added = data.get("added", 0)
                 skipped = data.get("skipped", 0)
+                act = data.get("activity")
                 if added > 0:
-                    await message.answer(f"✅ Файл `{filename}` успешно импортирован! (добавлено: {added}, пропущено дублей: {skipped})", parse_mode=ParseMode.MARKDOWN)
+                    details_str = ""
+                    if act and isinstance(act, dict):
+                        sport = act.get("sport") or "Тренировка"
+                        parts = []
+                        if act.get("duration_min"):
+                            parts.append(f"{act['duration_min']:.0f} мин")
+                        if act.get("kcal"):
+                            parts.append(f"{act['kcal']:.0f} ккал")
+                        if act.get("avg_hr"):
+                            parts.append(f"пульс {act['avg_hr']} уд/мин")
+                        summary_act = ", ".join(parts)
+                        details_str = f"\n\n🏃 **{sport}**: {summary_act}\nКалории учтены в дневном расходе (TDEE)."
+                    await message.answer(
+                        f"✅ Файл `{filename}` успешно импортирован! (добавлено: {added}, пропущено дублей: {skipped}){details_str}",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
                 elif skipped > 0:
                     await message.answer(f"ℹ️ Данные из файла `{filename}` уже есть в базе (пропущено существующих записей: {skipped}).", parse_mode=ParseMode.MARKDOWN)
                 else:
@@ -1223,7 +1246,23 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
 
     # Build multimodal content for OpenAI vision format
     caption = (message.caption or "").strip()
-    text_part = caption if caption else "Что на этом фото? Если это еда — оцени КБЖУ. Если глюкометр — назови показание. Если этикетка — разбери состав."
+    if caption:
+        text_part = (
+            f"{caption}\n\n"
+            "Внимательно распознай изображение. Если на фото прибор или показатели (глюкометр, сон, часы/браслет, пульс, шаги, кислород, еда) — "
+            "ОБЯЗАТЕЛЬНО извлеки точные цифры и вызови соответствующий инструмент для сохранения в базу "
+            "(log_glucose, log_sleep, log_watch_day, log_food)."
+        )
+    else:
+        text_part = (
+            "Что на этом фото? Внимательно распознай изображение и ОБЯЗАТЕЛЬНО вызови инструмент для сохранения данных:\n"
+            "- Глюкометр: вызови log_glucose(action='add', mmol_l=<число на дисплее>, context='замер по фото глюкометра').\n"
+            "- Скриншот сна (Xiaomi Band, часы, приложение): вызови log_sleep(action='add', bedtime=..., wake_time=..., "
+            "duration_min=..., deep_min=..., rem_min=..., awake_min=..., spo2_avg=..., source='скриншот часов').\n"
+            "- Экран активности/часов (пульс, шаги, калории активности, стресс, SpO2/кислород): вызови log_watch_day(action='add', ...).\n"
+            "- Еда: оцени КБЖУ, назови оценку и вызови log_food или предложи запись.\n"
+            "- Этикетка/состав: разбери состав и КБЖУ на 100 г."
+        )
 
     content = [
         {"type": "text", "text": text_part},

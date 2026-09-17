@@ -1436,6 +1436,90 @@ def test_interactive_commands_target_plateau_forecast():
         conn.close()
 
 
+def test_daily_watch_spo2_support():
+    from plugin import tools
+    registry.set_caller("989")
+    conn = connect()
+    try:
+        migrate(conn)
+        conn.execute("DELETE FROM users WHERE id=989")
+        conn.execute(
+            "INSERT INTO users (id, telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, created_at) "
+            "VALUES (989, '989', 180, '1990-01-01', 'm', 'UTC', 80.0, '2026-01-01 00:00:00')"
+        )
+        conn.commit()
+
+        # Save day with spo2_avg, spo2_min, spo2_max
+        res = json.loads(tools.handle_log_watch_day({
+            "user_id": 989,
+            "days": [{
+                "date": "2026-09-16",
+                "hr_min": 50,
+                "hr_avg": 70,
+                "hr_max": 100,
+                "spo2_avg": 97,
+                "spo2_min": 94,
+                "spo2_max": 99,
+            }]
+        }))
+        assert "days" in res
+        assert res["days"][0]["action"] == "added"
+        assert res["days"][0]["spo2_avg"] == 97
+
+        # List days
+        listing = json.loads(tools.handle_log_watch_day({"user_id": 989, "action": "list"}))
+        assert len(listing["entries"]) >= 1
+        entry = listing["entries"][0]
+        assert entry["spo2_avg"] == 97
+        assert entry["spo2_min"] == 94
+        assert entry["spo2_max"] == 99
+    finally:
+        conn.execute("DELETE FROM daily_watch WHERE user_id=989")
+        conn.execute("DELETE FROM users WHERE id=989")
+        conn.commit()
+        conn.close()
+
+
+def test_dashboard_milestone_selection_consistency():
+    from plugin import tools
+    registry.set_caller("990")
+    conn = connect()
+    try:
+        migrate(conn)
+        conn.execute("DELETE FROM users WHERE id=990")
+        conn.execute(
+            "INSERT INTO users (id, telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, created_at) "
+            "VALUES (990, '990', 185, '1992-08-09', 'm', 'UTC', 158.8, '2026-01-01 00:00:00')"
+        )
+        # Current weight 118.4
+        conn.execute(
+            "INSERT INTO body_metrics (user_id, burst_key, measured_at, weight_kg) "
+            "VALUES (990, 'k990_0', '2026-09-17 08:00:00', 118.4)"
+        )
+        # Three milestones: 115 kg, 110 kg, 90 kg
+        conn.execute("INSERT INTO milestones (user_id, name, metric, threshold, deadline) VALUES (990, '115 кг', 'weight_kg', 115.0, '2026-10-16')")
+        conn.execute("INSERT INTO milestones (user_id, name, metric, threshold, deadline) VALUES (990, 'target_110', 'weight_kg', 110.0, '2026-11-02')")
+        conn.execute("INSERT INTO milestones (user_id, name, metric, threshold, deadline) VALUES (990, 'NEW_YEAR', 'weight_kg', 90.0, '2027-01-01')")
+        conn.commit()
+
+        bar_res = json.loads(tools.handle_get_status_bar({"user_id": 990, "format": "bar"}))
+        dash_res = json.loads(tools.handle_get_status_bar({"user_id": 990, "format": "dashboard"}))
+
+        assert "115" in bar_res["status_bar"], bar_res["status_bar"]
+        assert "115.0 кг" in dash_res["status_bar"], dash_res["status_bar"]
+        assert "110.0 кг" not in dash_res["status_bar"], dash_res["status_bar"]
+    finally:
+        conn.execute("DELETE FROM daily_targets WHERE user_id=990")
+        conn.execute("DELETE FROM user_targets WHERE user_id=990")
+        conn.execute("DELETE FROM persona_styles WHERE user_id=990")
+        conn.execute("DELETE FROM alerts WHERE user_id=990")
+        conn.execute("DELETE FROM body_metrics WHERE user_id=990")
+        conn.execute("DELETE FROM milestones WHERE user_id=990")
+        conn.execute("DELETE FROM users WHERE id=990")
+        conn.commit()
+        conn.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

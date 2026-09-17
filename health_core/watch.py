@@ -21,6 +21,7 @@ _RANGES = {
     # а записанный ноль тянет вниз оценку расхода по шагам (ADR 0004).
     "steps": (1, 100000), "active_kcal": (1, 5000),
     "stress_avg": (1, 100), "hrv_ms": (5, 300),
+    "spo2_avg": (70, 100), "spo2_min": (70, 100), "spo2_max": (70, 100),
 }
 
 
@@ -51,7 +52,7 @@ def _validate_day(date_str, raw: dict, today: str) -> tuple[str, dict]:
 
     if all(v is None for v in vals.values()):
         raise ValueError(
-            "нужно хотя бы одно значение: hr_min, hr_avg, hr_max, steps, active_kcal, stress_avg или hrv_ms"
+            "нужно хотя бы одно значение: hr_min, hr_avg, hr_max, steps, active_kcal, stress_avg, hrv_ms или spo2_avg"
         )
 
     if vals["hr_min"] is not None and vals["hr_avg"] is not None and vals["hr_min"] > vals["hr_avg"]:
@@ -60,6 +61,12 @@ def _validate_day(date_str, raw: dict, today: str) -> tuple[str, dict]:
         raise ValueError(f"hr_avg ({vals['hr_avg']}) больше hr_max ({vals['hr_max']})")
     if vals["hr_min"] is not None and vals["hr_max"] is not None and vals["hr_min"] > vals["hr_max"]:
         raise ValueError(f"hr_min ({vals['hr_min']}) больше hr_max ({vals['hr_max']})")
+    if vals["spo2_min"] is not None and vals["spo2_avg"] is not None and vals["spo2_min"] > vals["spo2_avg"]:
+        raise ValueError(f"spo2_min ({vals['spo2_min']}) больше spo2_avg ({vals['spo2_avg']})")
+    if vals["spo2_avg"] is not None and vals["spo2_max"] is not None and vals["spo2_avg"] > vals["spo2_max"]:
+        raise ValueError(f"spo2_avg ({vals['spo2_avg']}) больше spo2_max ({vals['spo2_max']})")
+    if vals["spo2_min"] is not None and vals["spo2_max"] is not None and vals["spo2_min"] > vals["spo2_max"]:
+        raise ValueError(f"spo2_min ({vals['spo2_min']}) больше spo2_max ({vals['spo2_max']})")
 
     return d.isoformat(), vals
 
@@ -127,7 +134,7 @@ def save_days(conn, user_id: int, days: list, source: str = "watch") -> dict:
         ).fetchone()
         conn.execute(
             "INSERT INTO daily_watch(user_id, date, hr_min, hr_avg, hr_max, steps, active_kcal, "
-            "stress_avg, hrv_ms, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "stress_avg, hrv_ms, spo2_avg, spo2_min, spo2_max, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(user_id, date) DO UPDATE SET "
             "hr_min=COALESCE(excluded.hr_min, daily_watch.hr_min), "
             "hr_avg=COALESCE(excluded.hr_avg, daily_watch.hr_avg), "
@@ -136,9 +143,13 @@ def save_days(conn, user_id: int, days: list, source: str = "watch") -> dict:
             "active_kcal=COALESCE(excluded.active_kcal, daily_watch.active_kcal), "
             "stress_avg=COALESCE(excluded.stress_avg, daily_watch.stress_avg), "
             "hrv_ms=COALESCE(excluded.hrv_ms, daily_watch.hrv_ms), "
+            "spo2_avg=COALESCE(excluded.spo2_avg, daily_watch.spo2_avg), "
+            "spo2_min=COALESCE(excluded.spo2_min, daily_watch.spo2_min), "
+            "spo2_max=COALESCE(excluded.spo2_max, daily_watch.spo2_max), "
             "source=excluded.source, created_at=excluded.created_at",
             (user_id, d_iso, vals["hr_min"], vals["hr_avg"], vals["hr_max"], vals["steps"],
-             vals["active_kcal"], vals["stress_avg"], vals["hrv_ms"], source, now),
+             vals["active_kcal"], vals["stress_avg"], vals["hrv_ms"],
+             vals["spo2_avg"], vals["spo2_min"], vals["spo2_max"], source, now),
         )
         results.append({
             "date": d_iso, "action": "replaced" if existing else "added",
@@ -151,7 +162,8 @@ def save_days(conn, user_id: int, days: list, source: str = "watch") -> dict:
 
 
 def list_days(conn, user_id: int, limit: int = 30, since_days: int | None = None) -> list[dict]:
-    q = ("SELECT date, hr_min, hr_avg, hr_max, steps, active_kcal, stress_avg, hrv_ms, source "
+    q = ("SELECT date, hr_min, hr_avg, hr_max, steps, active_kcal, stress_avg, hrv_ms, "
+         "spo2_avg, spo2_min, spo2_max, source "
          "FROM daily_watch WHERE user_id=?")
     args: list = [user_id]
     if since_days is not None:

@@ -90,7 +90,17 @@ def import_tcx(conn, user_id: int, path: str) -> dict:
         (user_id, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), file_hash),
     )
     conn.commit()
-    return {"added": added, "skipped": 1 - added}
+    return {
+        "added": added,
+        "skipped": 1 - added,
+        "activity": {
+            "sport": sport,
+            "duration_min": round(duration_min, 1) if duration_min else None,
+            "kcal": summary["kcal"],
+            "avg_hr": summary["avg_hr"],
+            "started_at": started_at,
+        } if added else None,
+    }
 
 
 if __name__ == "__main__":

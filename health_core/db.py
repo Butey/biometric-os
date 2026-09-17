@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -466,6 +466,9 @@ CREATE TABLE IF NOT EXISTS daily_watch (
     active_kcal INTEGER,
     stress_avg INTEGER,
     hrv_ms INTEGER,
+    spo2_avg INTEGER,
+    spo2_min INTEGER,
+    spo2_max INTEGER,
     source TEXT,
     created_at TEXT NOT NULL,
     UNIQUE(user_id, date)
@@ -670,6 +673,13 @@ def _migrate_v25_to_v26(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE daily_heart_rate")
 
 
+def _migrate_v26_to_v27(conn: sqlite3.Connection) -> None:
+    """v26->v27: добавляет колонки spo2_avg, spo2_min, spo2_max в daily_watch."""
+    _add_column(conn, "daily_watch", "spo2_avg", "INTEGER")
+    _add_column(conn, "daily_watch", "spo2_min", "INTEGER")
+    _add_column(conn, "daily_watch", "spo2_max", "INTEGER")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
     row = conn.execute("SELECT version FROM schema_version").fetchone()
@@ -718,6 +728,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v24_to_v25(conn)
         if row["version"] < 26:
             _migrate_v25_to_v26(conn)
+        if row["version"] < 27:
+            _migrate_v26_to_v27(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 
