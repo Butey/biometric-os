@@ -21,3 +21,6 @@ dependencies = [
 
 [tool.setuptools]
 packages = ["health_core", "health_core.ingest", "bot"]
+
+[tool.pytest.ini_options]
+python_files = ["test_bot.py"]

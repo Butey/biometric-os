@@ -1520,6 +1520,64 @@ def test_dashboard_milestone_selection_consistency():
         conn.close()
 
 
+def test_check_stale_calib_streak():
+    from health_core.guards import check_stale_calib
+    from datetime import datetime, timedelta
+
+    conn = connect()
+    try:
+        migrate(conn)
+        conn.execute("DELETE FROM users WHERE id=991")
+        # User created 20 days ago
+        conn.execute(
+            "INSERT INTO users (id, telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, created_at) "
+            "VALUES (991, '991', 180, '1990-01-01', 'm', 'UTC', 100.0, '2026-08-01 00:00:00')"
+        )
+        conn.commit()
+
+        # Case 1: No food log -> streak 0 < 7 -> alert
+        al = check_stale_calib(conn, 991)
+        assert al is not None, "Должен сработать STALE_CALIB при 0 днях лога"
+        assert al["code"] == "STALE_CALIB"
+        assert "0 из 7 дней подряд" in al["message"]
+
+        # Case 2: Only 3 days streak -> alert
+        today = datetime.now()
+        for d in range(3):
+            dt = (today - timedelta(days=d)).strftime("%Y-%m-%d 12:00:00")
+            conn.execute("INSERT INTO food_log (user_id, eaten_at, meal_slot) VALUES (991, ?, 'lunch')", (dt,))
+        conn.commit()
+        al = check_stale_calib(conn, 991)
+        assert al is not None, "Должен сработать STALE_CALIB при серии 3 дня (< 7)"
+        assert "3 из 7 дней подряд" in al["message"]
+
+        # Case 3: 7 days continuous streak -> None (no alert)
+        for d in range(3, 8):
+            dt = (today - timedelta(days=d)).strftime("%Y-%m-%d 12:00:00")
+            conn.execute("INSERT INTO food_log (user_id, eaten_at, meal_slot) VALUES (991, ?, 'lunch')", (dt,))
+        conn.commit()
+        al = check_stale_calib(conn, 991)
+        assert al is None, f"При серии >= 7 дней STALE_CALIB не должен срабатывать, получено: {al}"
+
+        # Case 4: Brand new user (< 7 days account age) -> None
+        conn.execute("DELETE FROM users WHERE id=992")
+        conn.execute(
+            "INSERT INTO users (id, telegram_user_id, height_cm, birth_date, sex, timezone, base_weight_kg, created_at) "
+            "VALUES (992, '992', 180, '1990-01-01', 'm', 'UTC', 100.0, ?)",
+            ((today - timedelta(days=3)).strftime("%Y-%m-%d 00:00:00"),)
+        )
+        conn.commit()
+        al_new = check_stale_calib(conn, 992)
+        assert al_new is None, f"Новый аккаунт (< 7 дней) не должен получать алерт, получено: {al_new}"
+
+    finally:
+        conn.execute("DELETE FROM food_log WHERE user_id IN (991, 992)")
+        conn.execute("DELETE FROM alerts WHERE user_id IN (991, 992)")
+        conn.execute("DELETE FROM users WHERE id IN (991, 992)")
+        conn.commit()
+        conn.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

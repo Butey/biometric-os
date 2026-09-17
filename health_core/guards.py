@@ -435,18 +435,20 @@ def check_weight_regain(conn: sqlite3.Connection, user_id: int):
 
 def check_stale_calib(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
-    window, min_days = cfg["stale_calib_window_days"], cfg["stale_calib_min_days"]
+    min_days = cfg.get("stale_calib_min_days", 7)
     urow = conn.execute("SELECT created_at FROM users WHERE id=?", (user_id,)).fetchone()
-    if urow is None or (_now(conn, user_id) - _parse(urow["created_at"])).days < window:
+    if urow is None or (_now(conn, user_id) - _parse(urow["created_at"])).days < min_days:
         return None
-    since = (_now(conn, user_id) - timedelta(days=window)).strftime("%Y-%m-%d %H:%M:%S")
-    n = conn.execute(
-        "SELECT COUNT(DISTINCT date(eaten_at)) n FROM food_log WHERE user_id=? AND eaten_at>=?",
-        (user_id, since),
-    ).fetchone()["n"]
-    if n < min_days:
-        return _alert("STALE_CALIB", "warning", f"Лог еды {n} из {window} дней, ниже {min_days}. Цель заморожена.",
-                      n, min_days)
+    from health_core.energy import logged_streak
+    streak, _ = logged_streak(conn, user_id, _now(conn, user_id).date())
+    if streak < min_days:
+        return _alert(
+            "STALE_CALIB",
+            "warning",
+            f"Серия лога еды {streak} из {min_days} дней подряд. Цель заморожена.",
+            streak,
+            min_days,
+        )
     return None
 
 
@@ -984,10 +986,10 @@ GUARD_DEFINITIONS = {
         "name": "Полнота пищевого дневника (TDEE)",
         "category": "Дисциплина данных",
         "default_severity": "warning",
-        "description": "Еда залогирована менее чем в 11 из последних 14 дней.",
-        "rationale": "Без непрерывного и точного учёта калорий математическая адаптивная модель расхода энергии (TDEE) не может свести баланс. Расчёт замораживается, чтобы не выдавать искажённые рекомендации.",
-        "action": "Вести регулярный дневник питания без пропусков хотя бы 11 дней из двухнедельного окна.",
-        "keys": ["stale_calib_min_days", "stale_calib_window_days"],
+        "description": "Непрерывная серия лога еды менее 7 дней подряд.",
+        "rationale": "Без непрерывной и точного учёта калорий математическая адаптивная модель расхода энергии (TDEE) не может свести баланс. Расчёт замораживается, чтобы не выдавать искажённые рекомендации.",
+        "action": "Вести регулярный дневник питания без пропусков хотя бы 7 дней подряд.",
+        "keys": ["stale_calib_min_days"],
     },
     "NO_MEASURE": {
         "code": "NO_MEASURE",
@@ -1085,8 +1087,8 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
                 item["current_val"] = f"{val * 100:.0f}% плана"
                 item["threshold_val"] = f"≤ {thr * 100:.0f}% от плана" if isinstance(thr, (int, float)) else str(thr)
             elif code == "STALE_CALIB":
-                item["current_val"] = f"{val} из {cfg.get('stale_calib_window_days', 14)} дн."
-                item["threshold_val"] = f"≥ {thr} дн."
+                item["current_val"] = f"{val} дн. подряд"
+                item["threshold_val"] = f"≥ {thr} дн. подряд"
             elif code == "WHR_HIGH":
                 item["current_val"] = f"{val:.2f}" if isinstance(val, (int, float)) else str(val)
                 item["threshold_val"] = f"≤ {thr:.2f}" if isinstance(thr, (int, float)) else str(thr)
@@ -1235,12 +1237,11 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
                 item["current_val"] = "—"
 
         elif code == "STALE_CALIB":
-            min_d, win_d = cfg["stale_calib_min_days"], cfg["stale_calib_window_days"]
-            item["threshold_val"] = f"≥ {min_d} из {win_d} дней"
-            since_calib = (now - timedelta(days=win_d)).strftime("%Y-%m-%d %H:%M:%S")
-            n = conn.execute("SELECT COUNT(DISTINCT date(eaten_at)) n FROM food_log WHERE user_id=? AND eaten_at>=?",
-                             (user_id, since_calib)).fetchone()["n"]
-            item["current_val"] = f"{n} из {win_d} дней"
+            min_d = cfg.get("stale_calib_min_days", 7)
+            item["threshold_val"] = f"≥ {min_d} дн. подряд"
+            from health_core.energy import logged_streak
+            streak, _ = logged_streak(conn, user_id, now.date())
+            item["current_val"] = f"{streak} из {min_d} дн. подряд"
 
         elif code in ("NO_MEASURE", "MEASURE_SOON"):
             item["threshold_val"] = f"< {cfg['no_measure_days']} дн (напоминание {cfg['measure_soon_after_days']} дн)"
