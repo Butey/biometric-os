@@ -197,15 +197,28 @@ def check_undereating(conn: sqlite3.Connection, user_id: int):
 # ---------------------------------------------------------------- PLATEAU
 
 def check_plateau(conn: sqlite3.Connection, user_id: int):
+    """Утренние замеры (06:00-11:00, как везде в проекте) в окне, дни рефида
+    исключены — там рост веса плановый (гликоген/вода), не сигнал плато.
+    С 6+ точками размах — |медиана первых 3 − медиана последних 3| (гасит один
+    шумный замер, тот же приём, что в check_rate_high/check_weight_regain);
+    меньше 6 точек — старый max-min, медианное окно на них не выигрывает."""
+    from health_core.energy import _is_refeed
+
     cfg = _cfg()
     since = (_now(conn, user_id) - timedelta(days=cfg["plateau_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute(
-        "SELECT weight_kg FROM body_metrics WHERE user_id=? AND measured_at>=?", (user_id, since)
+        "SELECT measured_at, weight_kg FROM body_metrics WHERE user_id=? AND measured_at>=? "
+        "AND time(measured_at) BETWEEN '06:00:00' AND '11:00:00' ORDER BY measured_at",
+        (user_id, since),
     ).fetchall()
+    rows = [r for r in rows if not _is_refeed(conn, user_id, r["measured_at"][:10])]
     if len(rows) < cfg["plateau_min_points"]:
         return None
     weights = [r["weight_kg"] for r in rows]
-    spread = max(weights) - min(weights)
+    if len(weights) >= 6:
+        spread = abs(statistics.median(weights[:3]) - statistics.median(weights[-3:]))
+    else:
+        spread = max(weights) - min(weights)
     threshold = cfg["plateau_range_kg"]
     if spread <= threshold:
         return _alert(
@@ -219,11 +232,23 @@ def check_plateau(conn: sqlite3.Connection, user_id: int):
 # ---------------------------------------------------------------- BMR_FLOOR
 
 def check_bmr_floor(conn: sqlite3.Connection, user_id: int):
+    """Сравниваем цель с ПОЛОМ, СОХРАНЁННЫМ на момент апсерта daily_targets, а не
+    с пересчётом daily_target() прямо сейчас — тот дрейфует в течение дня
+    (шаги/активность двигают TDEE), давая ложные critical на честной цели.
+    Строки до миграции v29 без kcal_floor — прежний пересчёт."""
     today = _now(conn, user_id).date().isoformat()
     row = conn.execute(
-        "SELECT kcal_target FROM daily_targets WHERE user_id=? AND date=?", (user_id, today)
+        "SELECT kcal_target, kcal_floor FROM daily_targets WHERE user_id=? AND date=?", (user_id, today)
     ).fetchone()
     if row is None or row["kcal_target"] is None:
+        return None
+    stored_floor = row["kcal_floor"]
+    if stored_floor is not None:
+        if row["kcal_target"] < stored_floor:
+            return _alert("BMR_FLOOR", "critical",
+                          f"Цель {row['kcal_target']:.0f} ккал ниже безопасного пола {stored_floor:.0f} ккал "
+                          f"(сохранённое значение).",
+                          row["kcal_target"], stored_floor)
         return None
     try:
         # ponytail: energy.py делает clamp сам при расчёте (§10, "при расчёте"); эта
@@ -636,10 +661,24 @@ def check_binge_risk(conn: sqlite3.Connection, user_id: int):
     tdee = energy.adaptive_tdee(conn, user_id, for_date=yesterday.isoformat())
     if tdee is not None:
         window_start = yesterday - timedelta(days=window_days - 1)
+        window_start_s, window_end_s = window_start.isoformat(), yesterday.isoformat()
+        # Дни рефида/болезни исключаются целиком — как в energy._adaptive_tdee_core
+        # и check_weight_regain: интейк там сознательно поднят до maintenance и не
+        # отражает обычное питание на дефиците, а его включение размывало бы
+        # deficit_sum и молча гасило гард.
+        refeed_sick_dates = {r["date"] for r in conn.execute(
+            "SELECT date FROM refeed_days WHERE user_id=? AND date BETWEEN ? AND ? "
+            "UNION SELECT date FROM sick_days WHERE user_id=? AND date BETWEEN ? AND ?",
+            (user_id, window_start_s, window_end_s, user_id, window_start_s, window_end_s),
+        ).fetchall()}
         logged_days = 0
+        counted_days = 0
         deficit_sum = 0.0
         for i in range(window_days):
             d = (window_start + timedelta(days=i)).isoformat()
+            if d in refeed_sick_dates:
+                continue
+            counted_days += 1
             row = conn.execute(
                 "SELECT COUNT(*) n, COALESCE(SUM(fi.kcal),0) kcal FROM food_log fl "
                 "JOIN food_items fi ON fi.food_log_id=fl.id "
@@ -648,7 +687,7 @@ def check_binge_risk(conn: sqlite3.Connection, user_id: int):
             if row["n"] > 0:
                 logged_days += 1
                 deficit_sum += tdee - row["kcal"]
-        if logged_days >= window_days - 1:
+        if logged_days >= counted_days - 1:
             threshold_deficit = cfg["binge_deficit_kcal"]
             deficit_fired = deficit_sum > threshold_deficit
             if deficit_fired:
@@ -1868,6 +1907,24 @@ if __name__ == "__main__":
             assert "завтрака нет" in binge44[0]["message"], f"сообщение должно упоминать пропуск завтрака: {binge44[0]}"
             assert binge44[0]["severity"] == "warning", f"2 фактора -> warning, получили {binge44[0]}"
 
+            # Сценарий F (задача 1): рефид-день внутри окна дефицита исключается из
+            # deficit_sum и logged_days целиком — без исключения его большой интейк
+            # (8000 ккал) разбавил бы реальный дефицит (4×1800=7200) ниже порога
+            # (7200-5500=1700 < 3500) и молча погасил бы фактор 1.
+            u45 = make_user(145, height_cm=185, created_days_ago=30)
+            energy_mod.adaptive_tdee = lambda conn, user_id, window_days=14, for_date=None: 2500.0
+            for days_ago in range(1, 5):
+                _add_binge_food(u45, days_ago, 700)  # 4 дня реального дефицита, (2500-700)*4=7200
+            refeed_date = (_now().date() - timedelta(days=5)).isoformat()
+            conn.execute("INSERT INTO refeed_days(user_id, date) VALUES (?, ?)", (u45, refeed_date))
+            _add_binge_food(u45, 5, 8000)  # рефид: без исключения дал бы -5500, гасил бы гард
+            _add_binge_sleep(u45, today_iso, 300)  # второй фактор — короткий сон
+            conn.commit()
+            alerts45 = check_all(conn, u45)
+            binge45 = [a for a in alerts45 if a["code"] == "BINGE_RISK"]
+            assert binge45, f"BINGE_RISK должен сработать: рефид-день исключён из окна дефицита, получили {alerts45}"
+            assert "дефицит" in binge45[0]["message"], binge45[0]
+
             energy_mod.adaptive_tdee = orig_adaptive_tdee
             print("OK: BINGE_RISK — 3 фактора critical, 2 фактора warning, 1 фактор молчит, "
                   "без данных молчит, пропуск завтрака после 12:00 засчитан как фактор")
@@ -1984,6 +2041,49 @@ if __name__ == "__main__":
 
             print("OK: WEIGHT_REGAIN — 3.5% срабатывает, 2.5% молчит, скачок только в дни рефида "
                   "молчит, мало точек молчит")
+
+            # ---------------------------------------------------------------- PLATEAU (задача 3)
+            # Одиночный всплеск +0.6 кг (вода/рефид-подобный шум) НЕ должен ломать
+            # детектор: старый max-min давал 0.7 кг > порога 0.5 и молчал бы.
+            # Медианы первых/последних 3 из 7 точек не видят всплеск в середине.
+            u_plat = make_user(200, height_cm=185, created_days_ago=30)
+            add_metric(u_plat, 9, 100.0, None)
+            add_metric(u_plat, 8, 99.9, None)
+            add_metric(u_plat, 7, 100.1, None)   # медиана первых 3 = 100.0
+            add_metric(u_plat, 5, 100.6, None)   # всплеск +0.6 — вне первых/последних 3
+            add_metric(u_plat, 3, 100.0, None)
+            add_metric(u_plat, 1, 99.9, None)
+            add_metric(u_plat, 0, 100.1, None)   # медиана последних 3 = 100.0
+            conn.commit()
+            alerts_plat = check_all(conn, u_plat)
+            assert any(a["code"] == "PLATEAU" for a in alerts_plat), (
+                f"PLATEAU должен сработать: медианы 100.0/100.0 несмотря на всплеск +0.6 кг, получили {alerts_plat}"
+            )
+            print("OK: PLATEAU — одиночный всплеск +0.6 кг не срывает детектор (медианное окно)")
+
+            # ---------------------------------------------------------------- BMR_FLOOR (задача 2)
+            u_floor = make_user(192, height_cm=185, created_days_ago=30)
+            today_floor = user_today(conn, u_floor)
+            conn.execute(
+                "INSERT INTO daily_targets(user_id, date, kcal_target, kcal_floor) VALUES (?,?,?,?)",
+                (u_floor, today_floor, 1700, 1800),
+            )
+            conn.commit()
+            alert_floor = check_bmr_floor(conn, u_floor)
+            assert alert_floor is not None and alert_floor["code"] == "BMR_FLOOR", (
+                f"BMR_FLOOR должен сработать по сохранённому kcal_floor=1800 > kcal_target=1700, получили {alert_floor}"
+            )
+            assert alert_floor["threshold"] == 1800, f"порог должен быть сохранённым полом, получили {alert_floor}"
+
+            u_floor_ok = make_user(193, height_cm=185, created_days_ago=30)
+            today_floor_ok = user_today(conn, u_floor_ok)
+            conn.execute(
+                "INSERT INTO daily_targets(user_id, date, kcal_target, kcal_floor) VALUES (?,?,?,?)",
+                (u_floor_ok, today_floor_ok, 2200, 1800),
+            )
+            conn.commit()
+            assert check_bmr_floor(conn, u_floor_ok) is None, "BMR_FLOOR не должен сработать: цель выше сохранённого пола"
+            print("OK: BMR_FLOOR использует сохранённый daily_targets.kcal_floor без пересчёта daily_target()")
 
             # --- RECOVERY_LOW: 3 дня подряд HRV заметно ниже медианы и hr_min заметно выше — срабатывает ---
             from health_core import watch as _watch

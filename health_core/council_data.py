@@ -8,8 +8,8 @@ import sqlite3
 import statistics
 from datetime import timedelta
 
-from health_core.config import load, local_now, latest_ffm, user_now
-from health_core.energy import bmr_floor, adaptive_tdee, kcal_floor, fat_mass_kg, lean_share, _tcx_net
+from health_core.config import local_now, latest_ffm, user_now
+from health_core.energy import daily_expenditure, kcal_floor, fat_mass_kg, lean_share
 from health_core.report import whr, trends
 from health_core.nutrition import day_macros
 from health_core.meds import stock_runs_out
@@ -76,24 +76,18 @@ def _nutrition_vs_target_28d(conn: sqlite3.Connection, user_id: int) -> list[dic
 
 def _kcal_floor_now(conn: sqlite3.Connection, user_id: int) -> dict:
     """Текущий пол калоража и его причина через kcal_floor() — функцию, которая
-    НЕ пишет в БД (в отличие от energy.daily_target). full_tdee считается тем
-    же способом, что шаг 1 daily_target(), без побочных эффектов.
+    НЕ пишет в БД (в отличие от energy.daily_target). full_tdee считается через
+    daily_expenditure() — реальный блендер расхода, используется в daily_target().
 
     Неполный профиль (нет body_metrics/роста/даты рождения) -> bmr_floor()
-    бросает ValueError — тогда пол консилиуму неизвестен, а не падение пакета."""
+    бросает ValueError внутри daily_expenditure() — тогда пол консилиуму
+    неизвестен, а не падение пакета."""
     today = user_now(conn, user_id).date().isoformat()
     try:
-        bmr = bmr_floor(conn, user_id)
+        full_tdee = daily_expenditure(conn, user_id, today)["kcal"]
     except ValueError:
         return {"kcal_floor": None, "floor_reason": None, "full_tdee": None,
                 "current_target_kcal": None, "current_target_source": None}
-    adaptive = adaptive_tdee(conn, user_id, for_date=today)
-    if adaptive is not None:
-        base = adaptive
-    else:
-        factor = load()["policy"].get("activity_factor") or 1.0
-        base = bmr * factor
-    full_tdee = base + _tcx_net(conn, user_id, today)
     floor, reason = kcal_floor(conn, user_id, full_tdee)
     current = conn.execute(
         "SELECT kcal_target, computed_from FROM daily_targets WHERE user_id=? AND date=?",

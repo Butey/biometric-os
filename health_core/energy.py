@@ -167,6 +167,7 @@ def _smoothed_weight_kg(conn: sqlite3.Connection, user_id: int) -> float | None:
     window_days = load()["policy"].get("weight_trend_window_days", 7)
     last = conn.execute(
         "SELECT measured_at FROM body_metrics WHERE user_id=? AND weight_kg IS NOT NULL "
+        "AND time(measured_at) BETWEEN '06:00:00' AND '11:00:00' "
         "ORDER BY measured_at DESC LIMIT 1",
         (user_id,),
     ).fetchone()
@@ -176,7 +177,8 @@ def _smoothed_weight_kg(conn: sqlite3.Connection, user_id: int) -> float | None:
     start = end.fromordinal(end.toordinal() - window_days + 1)
     rows = conn.execute(
         "SELECT weight_kg FROM body_metrics WHERE user_id=? AND weight_kg IS NOT NULL "
-        "AND date(measured_at) BETWEEN ? AND ?",
+        "AND date(measured_at) BETWEEN ? AND ? "
+        "AND time(measured_at) BETWEEN '06:00:00' AND '11:00:00'",
         (user_id, start.isoformat(), end.isoformat()),
     ).fetchall()
     vals = [r["weight_kg"] for r in rows]
@@ -290,6 +292,16 @@ def _adaptive_tdee_core(
 
     TDEE_факт = средний_intake_Nд + (Δвес_Nд · 7700 / N).
 
+    Intake рефидных и больничных дней исключается из mean_intake: в эти дни
+    intake сознательно поднят до maintenance и не отражает обычное питание на
+    дефиците — включение завышает среднее и раздувает оценку расхода. Вес и
+    делитель N остаются от полного окна: потеря веса происходила весь период,
+    а N — календарное время, не число дней питания. Прецедент:
+    guards.py::check_weight_regain исключает рефиды/болезнь по той же логике.
+
+    logged_days считает ВСЕ залогированные дни (включая рефид): рефид тоже
+    залогирован и подтверждает, что человек ведёт дневник.
+
     Окно по умолчанию заканчивается сегодня (для forecast.py/report.py, которым
     нужен именно текущий TDEE). daily_target() пересчитывает цель задним числом
     и обязан передавать свою же дату через for_date, иначе повторный вызов на
@@ -307,12 +319,22 @@ def _adaptive_tdee_core(
     if logged_days < min_days:
         return None, logged_days
 
+    # Дни рефида/болезни: intake сознательно повышен до maintenance —
+    # не отражает обычное питание на дефиците и завышает mean_intake.
+    refeed_sick_dates = {r["date"] for r in conn.execute(
+        "SELECT date FROM refeed_days WHERE user_id=? AND date BETWEEN ? AND ? "
+        "UNION SELECT date FROM sick_days WHERE user_id=? AND date BETWEEN ? AND ?",
+        (user_id, start_s, end_s, user_id, start_s, end_s),
+    ).fetchall()}
+
     daily_kcals = conn.execute(
-        "SELECT SUM(fi.kcal) kcal FROM food_log fl JOIN food_items fi ON fi.food_log_id = fl.id "
+        "SELECT date(fl.eaten_at) d, SUM(fi.kcal) kcal "
+        "FROM food_log fl JOIN food_items fi ON fi.food_log_id = fl.id "
         "WHERE fl.user_id=? AND date(fl.eaten_at) BETWEEN ? AND ? GROUP BY date(fl.eaten_at)",
         (user_id, start_s, end_s),
     ).fetchall()
-    kcal_values = [r["kcal"] for r in daily_kcals if r["kcal"] is not None]
+    kcal_values = [r["kcal"] for r in daily_kcals
+                   if r["kcal"] is not None and r["d"] not in refeed_sick_dates]
     if not kcal_values:
         return None, logged_days
     mean_intake = sum(kcal_values) / len(kcal_values)
@@ -323,12 +345,16 @@ def _adaptive_tdee_core(
     delta_weight = weights[-1] - weights[0]
 
     tdee = mean_intake - (delta_weight * 7700 / window_days)
-    # Расход ниже базового обмена физиологически невозможен — так выходит, когда
-    # в окно попали недописанные дни (220 ккал за день в логе). Такая калибровка
-    # хуже, чем никакой: от неё считается пол, и цель проваливалась до ~1090 ккал.
-    if tdee < bmr_floor(conn, user_id):
+    bmr = bmr_floor(conn, user_id)
+    # Расход намного ниже базового обмена физиологически невозможен — так выходит,
+    # когда в окно попали недописанные дни (220 ккал за день в логе). Такая
+    # калибровка хуже, чем никакой: от неё считается пол, и цель проваливалась до
+    # ~1090 ккал. 0.70×BMR — литерал, отличающий недописанный лог от честного tdee
+    # чуть ниже BMR (малоподвижный период/погрешность), который не отбрасываем, а
+    # клампим к BMR, а не теряем калибровку целиком.
+    if tdee < 0.70 * bmr:
         return None, logged_days
-    return tdee, logged_days
+    return max(tdee, bmr), logged_days
 
 
 # Порог достоверности лога — не «11 любых дней из 14», а непрерывная серия
@@ -405,9 +431,12 @@ def _tcx_net(conn: sqlite3.Connection, user_id: int, date_: str) -> float:
     return total
 
 
-def _target_kcal(base: float, tcx_net: float, floor: float) -> float:
-    """Гардрейл шага 3: цель никогда не опускается ниже BMR_floor."""
-    return max(base + tcx_net, floor)
+def _target_kcal(base: float, floor: float) -> float:
+    """Гардрейл шага 3: цель никогда не опускается ниже BMR_floor.
+
+    tcx_net сюда больше не входит (defect 2): тренировочная добавка цель
+    питания не поднимает."""
+    return max(base, floor)
 
 
 def _active_milestone(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
@@ -576,14 +605,15 @@ def daily_expenditure(conn: sqlite3.Connection, user_id: int, date: str) -> dict
     Доля адаптивной части a = policy.blend_adaptive_max_share × logged_days/14,
     и только если сама часть доступна (иначе a=0). Остаток 1-a делят поровну
     доступные {steps, watch}; если недоступна ни одна — весь остаток уходит
-    activity_factor (BMR × коэффициент активности + тренировочная добавка, как
-    в daily_target() до ADR 0004). Тренировочная добавка (_tcx_net) входит в
-    adaptive/steps/activity_factor как есть — watch её не берёт: часы уже
-    считают калории тренировки в active_kcal, добавлять её ещё раз было бы
-    двойным счётом."""
+    activity_factor (BMR × коэффициент активности). Тренировочная добавка
+    (_tcx_net) в расход дня не входит нигде: шаги уже считают ходьбу,
+    адаптивная оценка уже отражает тренировки через фактическое изменение
+    веса, а часы уже считают калории тренировки в active_kcal — прибавлять
+    её ещё и здесь было бы либо двойным счётом, либо неверно поднимало бы
+    цель питания за саму тренировку. tcx_net остаётся информационным полем
+    в daily_target()."""
     policy = load()["policy"]
     bmr = bmr_floor(conn, user_id)
-    tcx_net = _tcx_net(conn, user_id, date)
 
     min_days = policy.get("blend_min_logged_days", 4)
     adaptive_est, logged_days = _adaptive_tdee_core(conn, user_id, 14, date, min_days)
@@ -592,7 +622,7 @@ def daily_expenditure(conn: sqlite3.Connection, user_id: int, date: str) -> dict
     a = 0.0
     if adaptive_est is not None:
         a = policy.get("blend_adaptive_max_share", 0.6) * logged_days / 14
-        parts["adaptive"] = {"estimate": adaptive_est + tcx_net, "share": a}
+        parts["adaptive"] = {"estimate": adaptive_est, "share": a}
 
     window_days = policy.get("blend_watch_window_days", 7)
     end = datetime.fromisoformat(date[:10]).date()
@@ -620,7 +650,6 @@ def daily_expenditure(conn: sqlite3.Connection, user_id: int, date: str) -> dict
         steps_est = (
             bmr * policy.get("blend_steps_base_factor", 1.2)
             + over_steps * policy.get("blend_kcal_per_step_kg", 0.0005) * weight_kg
-            + tcx_net
         )
 
     watch_est = None
@@ -638,7 +667,7 @@ def daily_expenditure(conn: sqlite3.Connection, user_id: int, date: str) -> dict
             parts["watch"] = {"estimate": watch_est, "share": share_each}
     else:
         factor = policy.get("activity_factor") or 1.0
-        parts["activity_factor"] = {"estimate": bmr * factor + tcx_net, "share": remaining}
+        parts["activity_factor"] = {"estimate": bmr * factor, "share": remaining}
 
     kcal = sum(p["estimate"] * p["share"] for p in parts.values() if p is not None)
     tags = [n for n in ("adaptive", "steps", "watch", "activity_factor") if parts[n] and parts[n]["share"] > 0]
@@ -650,6 +679,9 @@ def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
     bmr = bmr_floor(conn, user_id)
     expenditure = daily_expenditure(conn, user_id, date)
     full_tdee = expenditure["kcal"]  # шаг 1 (ADR 0004: расход дня — блендер), без дефицита и без клампа
+    # Информационное поле для отчётов (см. plugin/tools.py, admin/pages.py) — сама
+    # цель питания от tcx_net больше не зависит (defect 2), поэтому в source её
+    # тег больше не ставим: тег "tcx" вводил бы в заблуждение.
     tcx_net = _tcx_net(conn, user_id, date)
 
     # Пол считается ПОСЛЕ расхода и от него: безопасный дефицит ограничен тем,
@@ -658,8 +690,6 @@ def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
 
     seed_tag = "blend:" + "+".join(expenditure["tags"]) if expenditure["tags"] else "blend"
     tags = [seed_tag]
-    if tcx_net:
-        tags.append("tcx")
 
     deadline_unreachable = False
     active_milestone_name = None
@@ -738,15 +768,16 @@ def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
         carbs_g = round(max(0.0, kcal - protein_g * 4 - fat_g * 9) / 4.0, 1)
     conn.execute(
         "INSERT INTO daily_targets(user_id, date, kcal_target, protein_g_target, fat_g_target, "
-        "carbs_g_target, fiber_g_target, water_ml_target, computed_from) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "carbs_g_target, fiber_g_target, water_ml_target, computed_from, kcal_floor) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(user_id, date) DO UPDATE SET "
         "kcal_target=excluded.kcal_target, protein_g_target=excluded.protein_g_target, "
         "fat_g_target=excluded.fat_g_target, carbs_g_target=excluded.carbs_g_target, "
         "fiber_g_target=excluded.fiber_g_target, "
-        "water_ml_target=excluded.water_ml_target, computed_from=excluded.computed_from",
+        "water_ml_target=excluded.water_ml_target, computed_from=excluded.computed_from, "
+        "kcal_floor=excluded.kcal_floor",
         (user_id, date, kcal, protein_g, fat_g, carbs_g, targets.get("fiber_g"),
-         targets.get("water_ml"), source),
+         targets.get("water_ml"), source, floor),
     )
     conn.commit()
 
@@ -812,36 +843,32 @@ if __name__ == "__main__":
         print(f"bmr_floor = {floor:.2f}")
         assert abs(floor - 2209.25) < 0.01  # Mifflin выигрывает по максимуму на этих данных
 
-        for tcx in (0, -5000, 5000, -1_000_000):
-            kcal = _target_kcal(base=floor, tcx_net=tcx, floor=floor)
-            assert kcal >= floor, f"target {kcal} fell below floor {floor} for tcx={tcx}"
-        print("daily_target clamp holds for tcx in {0, -5000, 5000, -1000000}")
+        for base in (floor - 500, floor, floor + 500):
+            kcal = _target_kcal(base=base, floor=floor)
+            assert kcal >= floor, f"target {kcal} fell below floor {floor} for base={base}"
+        print("daily_target clamp holds for base below/at/above floor")
 
         result = daily_target(conn, uid, "2026-08-20")
         print(f"daily_target = {result}")
         assert result["kcal"] >= result["bmr_floor"]
 
         # --- шаг 2: достижимый срок даёт дефицит строго между полом и базой ---
-        # Без адаптивного TDEE база == пол (нет запаса, дефицит любого размера
-        # уже недостижим) — добавляем тренировку, чтобы появился зазор над полом,
-        # в котором дефицит физически умещается.
-        conn.execute(
-            "INSERT INTO activity(user_id, started_at, kcal, avg_hr, sport, file_hash) "
-            "VALUES (?, '2026-08-21 08:00:00', 1000, 140, 'run', 'selfcheck-activity-1')",
-            (uid,),
-        )
+        # Без адаптивного TDEE база = BMR × коэффициент активности (activity_factor
+        # в конфиге, обычно > 1) — зазор над полом (= BMR, без биоимпеданса) уже
+        # есть без тренировки. Тренировочная добавка (defect 2) в базу больше не
+        # входит — см. отдельный assert ниже, что она не поднимает цель питания.
         conn.execute(
             "INSERT INTO milestones(user_id, name, metric, threshold, deadline) "
             "VALUES (?, 'reachable', 'weight_kg', 118, '2026-12-01')",
             (uid,),
         )
         conn.commit()
-        # База без дефицита = оценка расхода (BMR × коэффициент активности,
-        # пока нет калибровки) + тренировочная добавка. Раньше здесь стоял голый
-        # BMR — это молча предполагало, что база равна полу, а значит любой
-        # дефицит обрезается. Именно то допущение и убрали.
+        # База без дефицита = оценка расхода (BMR × коэффициент активности, пока
+        # нет калибровки). Раньше здесь стоял голый BMR — это молча предполагало,
+        # что база равна полу, а значит любой дефицит обрезается. Именно то
+        # допущение и убрали.
         _factor = load()["policy"].get("activity_factor") or 1.0
-        base_before_deficit = bmr_floor(conn, uid) * _factor + _tcx_net(conn, uid, "2026-08-21")
+        base_before_deficit = bmr_floor(conn, uid) * _factor
         result_reachable = daily_target(conn, uid, "2026-08-21")
         print(f"daily_target (reachable deadline) = {result_reachable}")
         assert result_reachable["active_milestone"] == "reachable"
@@ -897,8 +924,8 @@ if __name__ == "__main__":
         assert result_refeed["kcal"] >= result_refeed["bmr_floor"]
         # Рефид отдаёт ПОЛНЫЙ расход, а он теперь оценивается как
         # BMR × коэффициент активности, пока нет калибровки (см. daily_target).
-        expected_full_tdee = (bmr_floor(conn, uid) * (load()["policy"].get("activity_factor") or 1.0)
-                              + _tcx_net(conn, uid, "2026-08-21"))
+        # Тренировочная добавка (tcx_net) в расход дня не входит (defect 2).
+        expected_full_tdee = bmr_floor(conn, uid) * (load()["policy"].get("activity_factor") or 1.0)
         assert abs(result_refeed["kcal"] - max(expected_full_tdee, floor)) < 0.01
         conn.execute("DELETE FROM milestones WHERE user_id=? AND name='refeed-deadline'", (uid,))
         conn.execute("DELETE FROM refeed_days WHERE user_id=?", (uid,))
@@ -1266,6 +1293,49 @@ if __name__ == "__main__":
         assert exp4["tags"] == ["activity_factor"], exp4["tags"]
         print(f"OK: daily_expenditure без данных -> activity_factor 1.0, kcal={exp4['kcal']:.1f} = BMR×коэффициент "
               f"(тот же путь, что старый estimated_tdee)")
+
+        # ---- defect 1: tdee чуть ниже BMR клампится к BMR, tdee ниже 0.70×BMR -> None ----
+        _reset_all(uid)
+        for days_ago in range(13, -1, -1):
+            _add_metric(days_ago, 100.0)  # постоянный вес -> Δвес=0 -> tdee = mean_intake
+        conn.commit()
+        bmr_d1 = bmr_floor(conn, uid)
+
+        for days_ago in range(13, -1, -1):
+            _add_food_day(uid, (today - timedelta(days=days_ago)).isoformat(), bmr_d1 - 50)
+        conn.commit()
+        tdee_near, _ = _adaptive_tdee_core(conn, uid, 14, de_date, 4)
+        assert tdee_near == bmr_d1, f"tdee чуть ниже BMR должен клампиться к BMR: {tdee_near} != {bmr_d1}"
+
+        conn.execute("DELETE FROM food_log WHERE user_id=?", (uid,))
+        for days_ago in range(13, -1, -1):
+            _add_food_day(uid, (today - timedelta(days=days_ago)).isoformat(), bmr_d1 * 0.5)
+        conn.commit()
+        tdee_low, _ = _adaptive_tdee_core(conn, uid, 14, de_date, 4)
+        assert tdee_low is None, f"tdee ниже 0.70×BMR должен быть None, получили {tdee_low}"
+        print(f"OK: _adaptive_tdee_core клампит tdee чуть ниже BMR ({bmr_d1:.0f}) к BMR и "
+              f"отбрасывает tdee ниже 0.70×BMR в None")
+
+        # ---- defect 2: тренировочная добавка (tcx_net) не поднимает цель питания ----
+        _reset_all(uid)
+        _add_metric(0, 100.0)
+        conn.commit()
+        result_no_tcx = daily_target(conn, uid, de_date)
+        conn.execute(
+            "INSERT INTO activity(user_id, started_at, kcal, avg_hr, sport, file_hash) "
+            "VALUES (?, ?, 1000, 140, 'run', 'selfcheck-defect2')",
+            (uid, f"{de_date} 08:00:00"),
+        )
+        conn.commit()
+        result_with_tcx = daily_target(conn, uid, de_date)
+        assert result_with_tcx["tcx_net"] > 0, "фикстура должна дать ненулевую tcx_net"
+        assert result_with_tcx["kcal"] == result_no_tcx["kcal"], (
+            f"тренировка не должна менять цель питания: {result_no_tcx['kcal']} -> {result_with_tcx['kcal']}"
+        )
+        assert "tcx" not in result_with_tcx["source"], result_with_tcx["source"]
+        conn.execute("DELETE FROM activity WHERE user_id=? AND file_hash='selfcheck-defect2'", (uid,))
+        conn.commit()
+        print("OK: тренировочная добавка (tcx_net) не поднимает цель питания (defect 2)")
 
         _reset_all(uid)
         conn.commit()

@@ -277,9 +277,12 @@ refeed_schema = {
     "type": "object",
     "properties": {
         "action": {"type": "string", "enum": ["status", "schedule", "clear"],
-                   "description": "status — фаза сегодня; schedule — расставить цикл; clear — снять будущие"},
-        "start": {"type": "string", "description": "Дата старта цикла YYYY-MM-DD, по умолчанию сегодня"},
-        "horizon_weeks": {"type": "integer", "description": "На сколько недель вперёд, по умолчанию 12"},
+                   "description": "status — фаза сегодня и уведомления; schedule — назначить рефид (по умолчанию разовый на 4 дня с причиной); clear — снять будущие"},
+        "start": {"type": "string", "description": "Дата старта YYYY-MM-DD, по умолчанию сегодня или завтра"},
+        "days": {"type": "integer", "description": "Длительность рефида в днях (по умолчанию 4)"},
+        "reason": {"type": "string", "enum": ["plateau", "recovery_low", "council", "manual"],
+                   "description": "Причина: plateau (плато), recovery_low (восстановление), council (консилиум), manual (вручную)"},
+        "horizon_weeks": {"type": "integer", "description": "УСТАРЕЛО: цикл MATADOR на N недель (не рекомендуется)"},
         "user_id": {"type": "integer", "description": "ID пользователя"}
     },
     "required": ["action"]

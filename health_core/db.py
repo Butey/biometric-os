@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 29
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -209,6 +209,7 @@ CREATE TABLE IF NOT EXISTS daily_targets (
     fiber_g_target REAL,
     water_ml_target REAL,
     computed_from TEXT,
+    kcal_floor REAL,
     UNIQUE(user_id, date)
 );
 
@@ -257,10 +258,12 @@ CREATE TABLE IF NOT EXISTS import_log (
 -- §09 шаг 5: рефид/диет-брейк — булев признак на дату. Кто и на сколько дней
 -- его включает — вне контракта БД, это просто набор дат; вставить несколько
 -- подряд дат = многодневный диет-брейк, вставить одну = разовый рефид.
+-- reason: 'plateau', 'recovery_low', 'council', 'manual' (NULL у старых записей).
 CREATE TABLE IF NOT EXISTS refeed_days (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id),
     date TEXT NOT NULL,
+    reason TEXT,
     UNIQUE(user_id, date)
 );
 
@@ -680,6 +683,17 @@ def _migrate_v26_to_v27(conn: sqlite3.Connection) -> None:
     _add_column(conn, "daily_watch", "spo2_max", "INTEGER")
 
 
+def _migrate_v27_to_v28(conn: sqlite3.Connection) -> None:
+    """v27->v28: добавляет колонку reason в refeed_days."""
+    _add_column(conn, "refeed_days", "reason", "TEXT")
+
+
+def _migrate_v28_to_v29(conn: sqlite3.Connection) -> None:
+    """v28->v29: пол калоража, действовавший на момент расчёта цели дня
+    (BMR_FLOOR сверяется с ним, а не с пересчётом, дрейфующим за день)."""
+    _add_column(conn, "daily_targets", "kcal_floor", "REAL")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
     row = conn.execute("SELECT version FROM schema_version").fetchone()
@@ -730,6 +744,10 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v25_to_v26(conn)
         if row["version"] < 27:
             _migrate_v26_to_v27(conn)
+        if row["version"] < 28:
+            _migrate_v27_to_v28(conn)
+        if row["version"] < 29:
+            _migrate_v28_to_v29(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 

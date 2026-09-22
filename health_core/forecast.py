@@ -171,7 +171,13 @@ def _observed_intake(conn: sqlite3.Connection, user_id: int, window_days: int = 
         "WHERE fl.user_id=? AND date(fl.eaten_at) BETWEEN ? AND ? GROUP BY 1",
         (user_id, start.isoformat(), end.isoformat()),
     ).fetchall()
-    values = [r["kcal"] for r in rows if r["kcal"] is not None]
+    # Дни рефида/болезни: intake сознательно повышен до maintenance.
+    refeed_sick_dates = {r["date"] for r in conn.execute(
+        "SELECT date FROM refeed_days WHERE user_id=? AND date BETWEEN ? AND ? "
+        "UNION SELECT date FROM sick_days WHERE user_id=? AND date BETWEEN ? AND ?",
+        (user_id, start.isoformat(), end.isoformat(), user_id, start.isoformat(), end.isoformat()),
+    ).fetchall()}
+    values = [r["kcal"] for r in rows if r["kcal"] is not None and r["d"] not in refeed_sick_dates]
     if not values:
         return None
     return statistics.fmean(values)

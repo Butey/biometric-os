@@ -3946,7 +3946,7 @@ def handle_forecast(params: dict) -> str:
 
 @_handler_wrapper
 def handle_refeed(params: dict) -> str:
-    """Плановые перерывы в дефиците, протокол MATADOR (health_core/refeed.py)."""
+    """Плановые перерывы в дефиците (health_core/refeed.py)."""
     from health_core import refeed as _refeed
 
     conn = connect()
@@ -3960,19 +3960,24 @@ def handle_refeed(params: dict) -> str:
         conn.close()
         if st.get("phase") is None:
             return json.dumps({"phase": None,
-                               "hint": "Цикл не запущен. refeed schedule расставит "
-                                       "2 недели дефицита / 2 недели поддержания."},
+                               "hint": "Рефид не запланирован. Назначается по показаниям (плато, восстановление, консилиум)."},
                               ensure_ascii=False)
         return json.dumps(st, ensure_ascii=False)
 
-    if action == "schedule":
+    if action in ("schedule", "schedule_once"):
         start = _norm_ts(params.get("start"))
         start = start[:10] if start else today
-        try:
-            weeks = min(max(int(params.get("horizon_weeks") or 12), 4), 52)
-        except (TypeError, ValueError):
-            weeks = 12
-        res = _refeed.schedule(conn, user_id, start, weeks)
+        reason = params.get("reason") or "manual"
+        # Если явно передан horizon_weeks и не указан days — legacy MATADOR цикл
+        if params.get("horizon_weeks") and not params.get("days"):
+            try:
+                weeks = min(max(int(params.get("horizon_weeks")), 4), 52)
+            except (TypeError, ValueError):
+                weeks = 12
+            res = _refeed.schedule(conn, user_id, start, weeks)
+        else:
+            days = int(params.get("days") or 4)
+            res = _refeed.schedule_once(conn, user_id, start, days=days, reason=reason)
         conn.close()
         res["note"] = ("В первые дни перерыва вес прибавит 1.5-2.5 кг — это гликоген "
                        "с водой, не жир. Перерыв не отменять.")

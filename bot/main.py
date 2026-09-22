@@ -727,7 +727,7 @@ def _format_plateau_interactive(uid: str, args: str = "") -> tuple[str, InlineKe
                 lines.append(f"• {r}")
 
         buttons = [
-            [InlineKeyboardButton(text="🍽 Назначить рефид MATADOR (2 нед)", callback_data="plateau_refeed")],
+            [InlineKeyboardButton(text="🍽 Назначить рефид (4 дня)", callback_data="plateau_refeed")],
             [InlineKeyboardButton(text="🩺 Созвать консилиум (/council)", callback_data="plateau_council")],
             [
                 InlineKeyboardButton(text="🎯 Подобрать калораж", callback_data="nav_target"),
@@ -1688,13 +1688,13 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             try:
                 migrate(conn)
                 user_id = _resolve_uid_to_user_id(conn, cb_uid)
-                today = config.user_now(conn, user_id).date()
-                res = _refeed.schedule(conn, user_id, today, horizon_weeks=4)
+                tomorrow = (config.user_now(conn, user_id).date() + __import__('datetime').timedelta(days=1))
+                res = _refeed.schedule_once(conn, user_id, tomorrow, days=4, reason="plateau")
             finally:
                 conn.close()
-            await callback.answer("✅ Рефид MATADOR запланирован!", show_alert=True)
+            await callback.answer("✅ Рефид запланирован!", show_alert=True)
             msg_text, kb = await asyncio.to_thread(_format_plateau_interactive, cb_uid, "")
-            msg_text += f"\n\n🍽 **Рефид MATADOR запланирован** ({res['scheduled']} дней поддержания на уровне TDEE для нормализации лептина)."
+            msg_text += f"\n\n🍽 **Рефид запланирован** ({res['days']} дней на уровне TDEE, причина: плато)."
             try:
                 if callback.message:
                     await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)

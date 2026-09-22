@@ -18,6 +18,7 @@ from health_core.guards import check_all
 from health_core.chrono import caffeine_cutoff
 from health_core.meds import stock_runs_out
 from health_core import sick
+from health_core import refeed
 from health_core.config import user_today
 from health_core.watch import steps_on, step_goal
 
@@ -95,6 +96,10 @@ def main() -> int:
                     f"🤒 Режим болезни до {until_dd_mm}: цель без дефицита, "
                     "напоминания о еде выключены."
                 )
+            # Рефид: уведомление за 2 дня, в день, в последний день
+            ref_st = refeed.status(conn, u["id"], today)
+            if ref_st.get("notify"):
+                block_lines.append(ref_st["notify"])
             # Инъекции
             inj_block = injection_block(conn, u, today)
             if inj_block:
