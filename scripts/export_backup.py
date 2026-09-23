@@ -27,6 +27,8 @@ from health_core.export import backup_db, export_all, rclone_push
 
 
 def main() -> int:
+    from admin.auth import load_env_file
+    load_env_file()
     conn = connect()
     migrate(conn)
     users = conn.execute("SELECT id FROM users ORDER BY id").fetchall()

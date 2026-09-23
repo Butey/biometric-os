@@ -1357,6 +1357,18 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
             await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
             return
 
+        if cmd_name == "balance":
+            if uid not in admin_user_ids():
+                await message.answer("⚠ Команда /balance доступна только администраторам.")
+                return
+            current_cfg = load_config()
+            providers = list((current_cfg.get("bot") or {}).get("providers", []))
+            
+            await message.answer("🔄 Проверяю статус провайдеров...")
+            res = await llm.check_balances(session, providers)
+            await message.answer(f"📊 Статус моделей:\n{res}")
+            return
+
         if cmd_name == "plateau":
             cmd_args = text[1:].partition(" ")[2].strip()
             msg_text, kb = await asyncio.to_thread(_format_plateau_interactive, uid, cmd_args)

@@ -39,18 +39,51 @@ TELEGRAM_LIMIT = 4096
 
 def send(token: str, chat_id: str, text: str) -> None:
     """Один POST. Ошибку телеграма не глотаем: cron пишет stderr в лог, и это
-    единственный способ узнать, что напоминания перестали доходить."""
-    for start in range(0, len(text), TELEGRAM_LIMIT):
-        data = urllib.parse.urlencode({
-            "chat_id": chat_id,
-            "text": text[start:start + TELEGRAM_LIMIT],
-        }).encode()
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage", data=data)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = json.loads(resp.read())
-        if not body.get("ok"):
-            print(f"telegram отказал для {chat_id}: {body}", file=sys.stderr)
+    единственный способ узнать, что напоминания перестали доходить.
+    Поддерживает отправку файлов, если строка начинается с MEDIA:."""
+    lines = text.split("\n")
+    media_files = []
+    text_lines = []
+    for line in lines:
+        if line.startswith("MEDIA:"):
+            media_files.append(line[6:].strip())
+        else:
+            text_lines.append(line)
+            
+    clean_text = "\n".join(text_lines).strip()
+    
+    if clean_text:
+        for start in range(0, len(clean_text), TELEGRAM_LIMIT):
+            data = urllib.parse.urlencode({
+                "chat_id": chat_id,
+                "text": clean_text[start:start + TELEGRAM_LIMIT],
+            }).encode()
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read())
+            if not body.get("ok"):
+                print(f"telegram отказал для {chat_id}: {body}", file=sys.stderr)
+                
+    for mf in media_files:
+        import os
+        import subprocess
+        if not os.path.exists(mf):
+            print(f"Файл {mf} не найден", file=sys.stderr)
+            continue
+        cmd = [
+            "curl", "-s",
+            "-F", f"chat_id={chat_id}",
+            "-F", f"document=@{mf}",
+            f"https://api.telegram.org/bot{token}/sendDocument"
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            body = json.loads(res.stdout)
+            if not body.get("ok"):
+                print(f"telegram отказал в отправке файла {chat_id}: {body}", file=sys.stderr)
+        except Exception as e:
+            print(f"ошибка curl при отправке файла: {e}\n{res.stderr}", file=sys.stderr)
 
 
 def admin_ids() -> list[str]:

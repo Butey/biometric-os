@@ -263,6 +263,8 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                 msg = f"{provider['model']} (key {_mask_key(key)}): сетевая ошибка/таймаут — {exc!r}"
                 log.warning(msg)
                 failures.append(msg)
+                state.cooldown_until = time.time() + 300.0
+                state.failure_count += 1
                 # Сетевая ошибка часто на уровне хоста/провайдера — пробуем следующий ключ или провайдера
                 continue
 
@@ -307,12 +309,12 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                 # Мгновенно пробуем следующий ключ для этой же модели!
                 continue
 
-            if status in (401, 403):
-                # Неверный ключ или запрет доступа: ставим кулдаун на 1 час
+            if status in (401, 402, 403):
+                # Неверный ключ, баланс или запрет доступа: ставим кулдаун на 1 час
                 state.cooldown_until = time.time() + 3600.0
-                log.warning("%s (key %s): HTTP %s ошибка авторизации, ротация на следующий ключ",
+                log.warning("%s (key %s): HTTP %s ошибка авторизации/баланса, ротация на следующий ключ",
                             provider["model"], _mask_key(key), status)
-                failures.append(f"{provider['model']}[{_mask_key(key)}]: HTTP {status} AuthError")
+                failures.append(f"{provider['model']}[{_mask_key(key)}]: HTTP {status} Auth/BalanceError")
                 continue
 
             if status in (400, 422):
@@ -323,6 +325,7 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                 break
 
             # Прочие 4xx / 5xx
+            state.cooldown_until = time.time() + 300.0
             log.warning("%s (key %s): HTTP %s — %s", provider["model"], _mask_key(key), status, _short(body, 200))
             failures.append(f"{provider['model']}[{_mask_key(key)}]: HTTP {status} — {_short(body, 150)}")
 
@@ -595,3 +598,58 @@ if __name__ == "__main__":
         print("=" * 60)
 
     asyncio.run(main())
+
+
+async def check_balances(session: aiohttp.ClientSession, providers: list[Provider]) -> str:
+    lines = []
+    for p in providers:
+        keys = get_provider_keys(p)
+        if not keys:
+            lines.append(f"❌ {p['model']}: нет ключей в {p.get('api_key_env')}")
+            continue
+            
+        key = keys[0]
+        url = f"{p['base_url'].rstrip('/')}/chat/completions"
+        headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+        
+        # openrouter native billing endpoint if applicable
+        if "openrouter.ai" in url:
+            try:
+                auth_url = "https://openrouter.ai/api/v1/auth/key"
+                async with session.get(auth_url, headers=headers, timeout=5) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        remain = data.get("data", {}).get("limit_remaining")
+                        if remain is not None:
+                            lines.append(f"✅ {p['model']}: баланс {remain:.3f} USD")
+                            continue
+            except Exception:
+                pass
+
+        # Google Gemini API
+        if "generativelanguage.googleapis.com" in url:
+            lines.append(f"✅ {p['model']}: квоты Google проверяются в Cloud Console (обычно free tier работает ок)")
+            continue
+
+        payload = {
+            "model": p["model"],
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1
+        }
+        try:
+            status, body = await _post(session, url, headers, payload, timeout_s=10.0)
+            if status == 200:
+                lines.append(f"✅ {p['model']}: API доступен (баланс в норме)")
+            elif status == 402:
+                lines.append(f"❌ {p['model']}: 402 Insufficient balance (кончились деньги)")
+            elif status in (401, 403):
+                lines.append(f"❌ {p['model']}: {status} Неверный ключ или отказ в доступе")
+            elif status == 429:
+                lines.append(f"⚠️ {p['model']}: 429 Превышен лимит запросов (Rate Limit)")
+            else:
+                lines.append(f"❓ {p['model']}: статус {status}")
+        except Exception as e:
+            lines.append(f"❌ {p['model']}: сетевая ошибка ({e})")
+            
+    return "\n".join(lines)
+

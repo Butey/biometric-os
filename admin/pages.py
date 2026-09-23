@@ -1414,6 +1414,20 @@ def actions_page(csrf_token: str, result: str | None = None) -> str:
   </form>
 </div>"""
 
+
+    password_form = f'''
+<div class="card">
+  <h3>Смена пароля администратора</h3>
+  <p class="comment">Новый пароль (минимум 12 символов). Будет записан в файл конфигурации ~/.hermes/.env и применен немедленно.</p>
+  <form method="post" action="/actions/password">
+    {_csrf_field(csrf_token)}
+    <div style="display: flex; gap: 10px; align-items: center; margin-top: 10px;">
+      <input type="password" name="new_password" placeholder="Новый пароль" minlength="12" required style="flex-grow: 1;">
+      <button type="submit">Сменить пароль</button>
+    </div>
+  </form>
+</div>'''
+
     scale_upload_html = f"""
 <div class="card">
   <h3>Загрузить файлы (весы / тренировки / ZIP-архив)</h3>

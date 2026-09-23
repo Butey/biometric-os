@@ -766,20 +766,23 @@ def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
     carbs_g = None
     if protein_g is not None and fat_g is not None:
         carbs_g = round(max(0.0, kcal - protein_g * 4 - fat_g * 9) / 4.0, 1)
-    conn.execute(
-        "INSERT INTO daily_targets(user_id, date, kcal_target, protein_g_target, fat_g_target, "
-        "carbs_g_target, fiber_g_target, water_ml_target, computed_from, kcal_floor) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(user_id, date) DO UPDATE SET "
-        "kcal_target=excluded.kcal_target, protein_g_target=excluded.protein_g_target, "
-        "fat_g_target=excluded.fat_g_target, carbs_g_target=excluded.carbs_g_target, "
-        "fiber_g_target=excluded.fiber_g_target, "
-        "water_ml_target=excluded.water_ml_target, computed_from=excluded.computed_from, "
-        "kcal_floor=excluded.kcal_floor",
-        (user_id, date, kcal, protein_g, fat_g, carbs_g, targets.get("fiber_g"),
-         targets.get("water_ml"), source, floor),
-    )
-    conn.commit()
+
+    from health_core.config import user_today
+    if date <= user_today(conn, user_id):
+        conn.execute(
+            "INSERT INTO daily_targets(user_id, date, kcal_target, protein_g_target, fat_g_target, "
+            "carbs_g_target, fiber_g_target, water_ml_target, computed_from, kcal_floor) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, date) DO UPDATE SET "
+            "kcal_target=excluded.kcal_target, protein_g_target=excluded.protein_g_target, "
+            "fat_g_target=excluded.fat_g_target, carbs_g_target=excluded.carbs_g_target, "
+            "fiber_g_target=excluded.fiber_g_target, "
+            "water_ml_target=excluded.water_ml_target, computed_from=excluded.computed_from, "
+            "kcal_floor=excluded.kcal_floor",
+            (user_id, date, kcal, protein_g, fat_g, carbs_g, targets.get("fiber_g"),
+             targets.get("water_ml"), source, floor),
+        )
+        conn.commit()
 
     return {
         "kcal": kcal,

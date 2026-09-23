@@ -28,6 +28,9 @@ _BODY_METRICS_COLS = [
     "metabolic_age", "device_mac",
 ]
 _SUGAR_COLS = ["at", "mmol_l", "context", "confirmed"]
+_ACTIVITY_COLS = ["started_at", "duration_min", "kcal", "avg_hr", "sport", "notes", "source"]
+_WATCH_COLS = ["date", "hr_min", "hr_avg", "hr_max", "steps", "active_kcal", "stress_avg", "hrv_ms", "spo2_avg", "spo2_min", "spo2_max", "source"]
+_SLEEP_COLS = ["night_date", "bedtime", "wake_time", "duration_min", "deep_min", "rem_min", "awake_min", "quality", "efficiency_pct", "hr_avg", "spo2_avg", "source", "notes"]
 _BATCH = 500  # ponytail: слабый VPS — стримим строки, не грузим таблицу целиком
 
 
@@ -83,14 +86,60 @@ def export_all(conn: sqlite3.Connection, user_id: int, out_dir: str) -> dict:
     files: list[str] = []
     rows = 0
 
-    p = base / "Metrics" / "body_metrics.csv"
-    rows += _write_csv_streamed(conn, p, "body_metrics", _BODY_METRICS_COLS, user_id, "measured_at")
-    files.append(str(p))
+    try:
+        from openpyxl import Workbook
+        has_openpyxl = True
+    except ImportError:
+        has_openpyxl = False
 
-    p = base / "Metrics" / "Sugar" / "sugar_log.csv"
-    rows += _write_csv_streamed(conn, p, "glucose_log", _SUGAR_COLS, user_id, "at")
-    files.append(str(p))
+    def _write_xlsx(path: Path, table: str, cols: list[str], uid: int, order: str):
+        if not has_openpyxl: return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        wb = Workbook()
+        ws = wb.active
+        ws.append(cols)
+        cur = conn.execute(f"SELECT {','.join(cols)} FROM {table} WHERE user_id=? ORDER BY {order}", (uid,))
+        for row in cur:
+            ws.append([row[c] for c in cols])
+        wb.save(path)
+        files.append(str(path))
 
+    # Body metrics
+    p_csv = base / "Metrics" / "Body composition" / "body_metrics.csv"
+    p_xlsx = base / "Metrics" / "Body composition" / "body_metrics.xlsx"
+    rows += _write_csv_streamed(conn, p_csv, "body_metrics", _BODY_METRICS_COLS, user_id, "measured_at")
+    files.append(str(p_csv))
+    _write_xlsx(p_xlsx, "body_metrics", _BODY_METRICS_COLS, user_id, "measured_at")
+
+    # Sugar log
+    p_csv = base / "Metrics" / "Sugar" / "sugar_log.csv"
+    p_xlsx = base / "Metrics" / "Sugar" / "sugar_log.xlsx"
+    rows += _write_csv_streamed(conn, p_csv, "glucose_log", _SUGAR_COLS, user_id, "at")
+    files.append(str(p_csv))
+    _write_xlsx(p_xlsx, "glucose_log", _SUGAR_COLS, user_id, "at")
+
+    # Activity log
+    p_csv = base / "Metrics" / "Activity" / "activity.csv"
+    p_xlsx = base / "Metrics" / "Activity" / "activity.xlsx"
+    rows += _write_csv_streamed(conn, p_csv, "activity", _ACTIVITY_COLS, user_id, "started_at")
+    files.append(str(p_csv))
+    _write_xlsx(p_xlsx, "activity", _ACTIVITY_COLS, user_id, "started_at")
+
+    # Daily watch
+    p_csv = base / "Metrics" / "Activity" / "daily_watch.csv"
+    p_xlsx = base / "Metrics" / "Activity" / "daily_watch.xlsx"
+    rows += _write_csv_streamed(conn, p_csv, "daily_watch", _WATCH_COLS, user_id, "date")
+    files.append(str(p_csv))
+    _write_xlsx(p_xlsx, "daily_watch", _WATCH_COLS, user_id, "date")
+
+    # Sleep log
+    p_csv = base / "Metrics" / "Sleep" / "sleep_log.csv"
+    p_xlsx = base / "Metrics" / "Sleep" / "sleep_log.xlsx"
+    rows += _write_csv_streamed(conn, p_csv, "sleep_log", _SLEEP_COLS, user_id, "night_date")
+    files.append(str(p_csv))
+    _write_xlsx(p_xlsx, "sleep_log", _SLEEP_COLS, user_id, "night_date")
+
+    # Nutrition logs
     logs_dir = base / "Nutrition" / "daily_logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     dates = [r["d"] for r in conn.execute(

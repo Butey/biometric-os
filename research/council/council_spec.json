@@ -1,0 +1,44 @@
+{
+  "task": "Evaluate the 5-pillar research dossier for Health Agent System (Metabolic Contour) and formulate a definitive, prioritized implementation and validation plan. The evaluation covers: 1) Hardware/API plugins, 2) Clinical AI skills & dual-system architecture, 3) Endocrinology and metabolic mathematics (Hall, Pontzer, Alpert, MATADOR), 4) Open-source computation engines (PMC, PK, PuLP), 5) Behavioral psychology & adherence telemetry (CBT-E, ACT, Binge Risk Triad).",
+  "constraints": [
+    "Strict hardware limitation: Debian Linux, 1 vCPU, 1 GB RAM, SQLite. Zero local heavy ML/DL (no local Whisper, PaddleOCR, Torch, Transformers, or YASA).",
+    "Clinical target: Single user on Tirzepatide (GIP/GLP-1), massive fat loss with mandatory preservation of Lean Body Mass (LBM). Protein 1.6-2.2 g/kg FFM.",
+    "Zero-math LLM policy: LLM performs only semantic NLU and empathetic coaching; all calculations and guardrails are 100% deterministic Python with Pydantic V2 schemas.",
+    "Address core bug fixes: inverted sign in adaptive_tdee, Alpert constant unit error (31 kcal/lb vs 69.3 kcal/kg), sex-blind FFMI and essential fat floors, LBM drift direction check.",
+    "Structure requirements: Planner must include # Plan, ## Overview, ## Scope, ## Phases, ## Testing Strategy, ## Risks, ## Rollback Plan, ## Edge Cases. Judge must include # Judge Report, ## Scores, ## Comparative Analysis, ## Missing Steps, ## Contradictions, ## Improvements, ## Final Plan."
+  ],
+  "repo_context": {
+    "root": "/opt/webapps/health_agent_system",
+    "paths": [
+      "research/00_master_research_dossier.md",
+      "research/01_agent_plugins_hardware_api.md",
+      "research/02_agent_skills_and_frameworks.md",
+      "research/03_agent_clinical_literature_and_models.md",
+      "research/04_agent_opensource_engines_and_libraries.md",
+      "research/05_agent_behavioral_psychology_and_adherence.md"
+    ],
+    "notes": "Base all decisions on the detailed research reports in research/ directory."
+  },
+  "agents": {
+    "planners": [
+      {
+        "name": "gemini-flash-planner",
+        "kind": "custom",
+        "command": "agy --model gemini-3.8-flash-high --output-format text -p",
+        "prompt_mode": "arg"
+      },
+      {
+        "name": "gemini-pro-planner",
+        "kind": "custom",
+        "command": "agy --model gemini-3.1-pro-high --output-format text -p",
+        "prompt_mode": "arg"
+      }
+    ],
+    "judge": {
+      "name": "gemini-pro-judge",
+      "kind": "custom",
+      "command": "agy --model gemini-3.1-pro-high --output-format text -p",
+      "prompt_mode": "arg"
+    }
+  }
+}

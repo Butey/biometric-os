@@ -1,0 +1,92 @@
+{
+  "task": "Develop and integrate Home Resistance Training & Cardiovascular Prescription Module for Health Agent System (Metabolic Contour)",
+  "version": "1.0.0",
+  "created_at": "2026-09-13T05:42:00Z",
+  "target_user_profile": {
+    "gender": "male",
+    "age": 34,
+    "height_cm": 185,
+    "weight_kg": 121.0,
+    "ffm_kg": 79.0,
+    "fat_mass_kg": 42.0,
+    "bmi": 35.4,
+    "pharmacotherapy": {
+      "drug": "Tirzepatide",
+      "cycle_days": 7,
+      "t_half_days": 5.0,
+      "t_max_hours": [24, 48],
+      "additional": "Oral androgen support"
+    },
+    "pathology_constraints": [
+      "Prior knee fracture",
+      "Prior Anterior Cruciate Ligament (ACL) tear / reconstruction"
+    ],
+    "dietary_status": {
+      "daily_intake_actual_kcal": [900, 1300],
+      "target_kcal": 1750,
+      "deficit_depth_kcal": [1000, 1600]
+    }
+  },
+  "hardware_and_environment_constraints": {
+    "os": "Debian 12 Bookworm",
+    "cpu": "1 vCPU",
+    "ram_total_mb": 1024,
+    "storage": "SQLite 3 with WAL mode",
+    "runtime": "Python 3.11",
+    "web_framework": "FastAPI / aiogram 3 (Telegram bot)",
+    "architecture_rules": [
+      "Pure deterministic calculations (no heavy ML/PyTorch)",
+      "Streaming or indexed DB access (O(1) memory footprint)",
+      "Strict separation of LLM semantic layer and deterministic computation",
+      "No direct code modification of health_core/ during research phase"
+    ]
+  },
+  "required_clinical_and_training_modules": {
+    "pk_synchronizer": {
+      "name": "Tirzepatide 7-Day PK Cycle Training Scheduler",
+      "rules": {
+        "day_0": "Injection day (evening), baseline maintenance",
+        "day_1_2": "Gastric Cmax peak, nausea & reflux window -> Cardio deload (walking only, low IAP, strictly no Valsalva or inverted positions)",
+        "day_3_4": "Elimination phase, normalizing GI -> Moderate session (Full Body A)",
+        "day_5_6": "PK Trough (lowest concentration, peak appetite/vigor) -> Primary heavy session (Full Body B), optional refeed synchronization",
+        "day_7": "Rest / prep for next injection"
+      }
+    },
+    "knee_safety_guardrails": {
+      "hard_prohibitions": [
+        "Jumping / plyometrics / running",
+        "Weighted vest rucking (BMI >= 35)",
+        "Deep knee flexion > 90 degrees under load",
+        "Leg extension machine (anterior tibial shear force)",
+        "Axial barbell back squats"
+      ],
+      "approved_mechanics": [
+        "Hip-hinge dominant movements (vertical shin)",
+        "Bulgarian split squats (RFESS) with 20 deg forward torso lean",
+        "B-Stance Romanian Deadlifts (Kickstand RDL)",
+        "Under-desk walking pad (2.5-3.5 km/h)",
+        "Incline treadmill walking (3-6% incline, 4.0-4.5 km/h)"
+      ]
+    },
+    "volume_and_intensity_bounds": {
+      "minimum_effective_dose_sets_per_muscle_group_week": 6,
+      "maximum_recoverable_volume_sets_per_muscle_group_week": 12,
+      "weekly_resistance_sessions": 2,
+      "session_duration_minutes": [30, 40],
+      "reps_in_reserve_range": [1, 2],
+      "tempo_standard": "3-1-1-0",
+      "rest_interval_seconds": [120, 150]
+    },
+    "neat_and_cardio_bounds": {
+      "daily_step_target_corridor": [7500, 9000],
+      "pontzer_compensation_kappa": 0.48,
+      "fatmax_zone_2_formula": "Karvonen Heart Rate Reserve with empirical resting HR shift (+4-8 bpm)"
+    },
+    "monitoring_triad": {
+      "primary": "Standardized home training log (load x reps at 3-1-1-0 tempo)",
+      "secondary": "Weekly isometric handgrip dynamometry (<10% drop threshold)",
+      "tertiary": "Morning waist-to-height ratio",
+      "decoupled_metric": "Wearable HRV/RMSSD (excluded from fatigue gating due to HCN4 nodal pacing)"
+    }
+  }
+}

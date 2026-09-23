@@ -598,6 +598,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/personas": self._post_personas,
                 "/actions": self._post_actions,
                 "/actions/import-scale": self._post_actions_import_scale,
+                "/actions/password": self._post_actions_password,
                 "/knowledge/upload": self._post_knowledge_upload,
                 "/knowledge/delete": self._post_knowledge_delete,
                 "/plans/save": self._post_plans_save,
@@ -1931,3 +1932,45 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+    def _post_actions_password(self):
+        ctx = self._check_auth()
+        if not ctx:
+            return
+        conn, user_id, token, sess = ctx
+        conn.close()
+        
+        form = self._read_form()
+        if not auth.csrf_ok(sess, form.get("csrf_token")):
+            return self._error_page(403, "Неверный CSRF-токен.")
+
+        new_pwd = form.get("new_password", "")
+        if len(new_pwd) < auth.MIN_PASSWORD_LEN:
+            body = pages.actions_page(sess["csrf"], result=f"Пароль должен быть не короче {auth.MIN_PASSWORD_LEN} символов.")
+            return self._html(400, self._layout("Действия", body, sess["csrf"], active="actions"))
+        
+        salt = os.urandom(16)
+        digest = auth.hash_password(new_pwd, salt)
+        salt_hex = salt.hex()
+        hash_hex = digest.hex()
+        
+        try:
+            with open(auth.ENV_PATH, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                
+            with open(auth.ENV_PATH, "w", encoding="utf-8") as f:
+                for line in lines:
+                    if line.startswith("ADMIN_PASSWORD_HASH="):
+                        f.write(f"ADMIN_PASSWORD_HASH={hash_hex}\n")
+                    elif line.startswith("ADMIN_PASSWORD_SALT="):
+                        f.write(f"ADMIN_PASSWORD_SALT={salt_hex}\n")
+                    else:
+                        f.write(line)
+                        
+            auth.load_env_file(force=True)
+            
+            body = pages.actions_page(sess["csrf"], result="Пароль успешно изменён.")
+            return self._html(200, self._layout("Действия", body, sess["csrf"], active="actions"))
+        except Exception as e:
+            body = pages.actions_page(sess["csrf"], result=f"Ошибка при сохранении пароля: {e}")
+            return self._html(500, self._layout("Действия", body, sess["csrf"], active="actions"))
