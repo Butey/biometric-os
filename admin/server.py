@@ -22,7 +22,7 @@ import sys
 import tempfile
 import traceback
 import urllib.parse
-from datetime import date, datetime
+from datetime import date, datetime, timezone as _tz
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -1160,7 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error_page(400, "Заполните все обязательные поля (дата, тип, текст плана).")
 
             from datetime import datetime
-            now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_iso = datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
             conn.execute(
                 "INSERT INTO plan_log(user_id, date, kind, body, rationale, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, date, kind) DO UPDATE SET "
@@ -1328,7 +1328,7 @@ class Handler(BaseHTTPRequestHandler):
             started_at = (form.get("started_at") or "").strip()
             if not started_at:
                 from datetime import datetime
-                started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                started_at = datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
             elif len(started_at) == 16:
                 started_at += ":00"
 

@@ -106,6 +106,9 @@ def _resolve(topic: str) -> Path | None:
     """Путь собирается от KNOWLEDGE_DIR + расширение; topic приходит от модели —
     граница доверия, поэтому итог обязан лежать ВНУТРИ каталога (resolve +
     сравнение), иначе "../../.env" утечёт файлом."""
+    import re
+    if not re.fullmatch(r"[a-zA-Z0-9_\-]+", topic):
+        return None
     # Файл обязан лежать ПРЯМО в своём каталоге, а не где-то внутри: иначе
     # topic "personal/<чужой id>/protocol" прочитал бы чужие личные документы.
     for d in _dirs():

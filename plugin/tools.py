@@ -5477,9 +5477,7 @@ if __name__ == "__main__":
         os.environ["HEALTH_DB"] = str(Path(tmp) / "health.db")
 
         # Reimport to pick up the temp DB path
-        import importlib
         import health_core.db as db
-        importlib.reload(db)
         db.DB_PATH = Path(os.environ["HEALTH_DB"])
 
         # Create test database

@@ -57,7 +57,11 @@ def meal_slot(conn: sqlite3.Connection, user_id: int, eaten_at: datetime, named:
 
     for name in _MEAL_NAMES:
         w = windows[name]
-        if not (w["start"] <= t <= w["end"]):
+        if w["start"] > w["end"]:
+            in_window = t >= w["start"] or t <= w["end"]
+        else:
+            in_window = w["start"] <= t <= w["end"]
+        if not in_window:
             continue
         row = conn.execute(
             "SELECT MIN(eaten_at) AS first FROM food_log WHERE user_id=? AND date(eaten_at)=? AND meal_slot=?",

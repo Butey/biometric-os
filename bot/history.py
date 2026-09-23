@@ -18,16 +18,6 @@ def _now_iso() -> str:
     return local_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _ensure_table(conn) -> None:
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS chat_history "
-        "(telegram_user_id TEXT, ts TEXT, role TEXT, content TEXT)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(telegram_user_id)"
-    )
-
-
 def _bot_config() -> tuple[int, int]:
     # раздела bot: в config.yaml может не быть вовсе (пишется параллельно) —
     # тогда умолчания, без падения.
@@ -56,7 +46,6 @@ def _trim(rows: list, window: int, chars: int) -> list:
 def load(conn, telegram_id: str) -> list[dict]:
     """Окно последних сообщений: до history_window штук И до history_chars символов,
     что жёстче, срезано строго по границе хода (см. _trim)."""
-    _ensure_table(conn)
     window, chars = _bot_config()
     rows = conn.execute(
         "SELECT ts, role, content FROM ("
@@ -71,7 +60,6 @@ def load(conn, telegram_id: str) -> list[dict]:
 def append(conn, telegram_id: str, message: dict) -> None:
     """message — dict формата OpenAI chat (role/content, возможны tool_calls /
     tool_call_id) — хранится сериализованным целиком, чтобы ничего не потерять."""
-    _ensure_table(conn)
     conn.execute(
         "INSERT INTO chat_history(telegram_user_id, ts, role, content) VALUES (?, ?, ?, ?)",
         (str(telegram_id), _now_iso(), message.get("role", ""),
@@ -81,7 +69,6 @@ def append(conn, telegram_id: str, message: dict) -> None:
 
 
 def clear(conn, telegram_id: str) -> None:
-    _ensure_table(conn)
     conn.execute("DELETE FROM chat_history WHERE telegram_user_id=?", (str(telegram_id),))
     conn.commit()
 

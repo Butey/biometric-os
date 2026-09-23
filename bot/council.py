@@ -179,7 +179,7 @@ async def execute(conn: sqlite3.Connection, user_id: int, run_id: int, reason: s
     cfg = _cfg()
     timeout_s, retry_delay_s, max_retries = cfg["timeout_s"], cfg["retry_delay_s"], cfg["max_retries"]
 
-    data = council_data.build(conn, user_id)
+    data = await asyncio.to_thread(council_data.build, conn, user_id)
     pack_text = _format_data_pack(data, reason)
 
     async with aiohttp.ClientSession() as session:

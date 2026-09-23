@@ -306,7 +306,7 @@ def _latest_triple_day(conn, user_id, marker_a, marker_b, marker_c):
 
 
 def _age_years(birth_date, on_date):
-    b = datetime.strptime(birth_date, "%Y-%m-%d").date()
+    b = datetime.strptime(birth_date[:10], "%Y-%m-%d").date()
     d = datetime.strptime(on_date, "%Y-%m-%d").date()
     return d.year - b.year - ((d.month, d.day) < (b.month, b.day))
 

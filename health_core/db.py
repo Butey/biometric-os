@@ -696,6 +696,17 @@ def _migrate_v28_to_v29(conn: sqlite3.Connection) -> None:
 
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_council_running
+        ON council_runs(user_id) WHERE status = 'running'
+    """)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chat_history "
+        "(telegram_user_id TEXT, ts TEXT, role TEXT, content TEXT)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(telegram_user_id)"
+    )
     row = conn.execute("SELECT version FROM schema_version").fetchone()
     if row is None:
         conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
@@ -751,6 +762,12 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 
+
+def get_target_users(conn: sqlite3.Connection, user_id: int | None) -> list:
+    """Список строк users для переданного user_id или всех пользователей."""
+    if user_id is not None:
+        return conn.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchall()
+    return conn.execute("SELECT id FROM users ORDER BY id").fetchall()
 
 if __name__ == "__main__":
     import tempfile

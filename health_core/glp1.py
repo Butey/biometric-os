@@ -50,7 +50,8 @@ def _solve_ka(ke: float, tmax: float) -> float:
 
     lo, hi = ke * 1.0001, ke * 1000.0
     flo, fhi = f(lo), f(hi)
-    assert flo > 0 > fhi, ("вилка бисекции не накрывает корень", flo, fhi)
+    if not (flo > 0 > fhi):
+        raise ValueError(f"Неверная вилка бисекции: flo={flo}, fhi={fhi}")
     for _ in range(200):
         mid = (lo + hi) / 2
         if f(mid) > 0:

@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")
 
 from health_core.config import user_today
-from health_core.db import connect, migrate
+from health_core.db import connect, migrate, get_target_users
 
 
 def injection_block(conn, user_row: dict, today: str) -> str | None:
@@ -68,10 +68,7 @@ def main() -> int:
     conn = connect()
     migrate(conn)
 
-    if args.user is not None:
-        users = conn.execute("SELECT id FROM users WHERE id=?", (args.user,)).fetchall()
-    else:
-        users = conn.execute("SELECT id FROM users ORDER BY id").fetchall()
+    users = get_target_users(conn, args.user)
 
     if not users:
         msg = f"user_id={args.user} не найден в БД." if args.user is not None else "Нет ни одного пользователя в БД."

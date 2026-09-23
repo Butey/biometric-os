@@ -22,6 +22,9 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
+_COOLDOWN_NOT_FOUND_S = 86400   # 24 ч — модель не найдена / удалена
+_COOLDOWN_RATE_LIMIT_S = 3600   # 1 ч — rate limit
+_COOLDOWN_DEFAULT_S = 300       # 5 мин — прочие ошибки
 
 class Provider(TypedDict, total=False):
     base_url: str
@@ -139,12 +142,22 @@ async def _post(session: aiohttp.ClientSession, url: str, headers: dict, payload
             body = await resp.json(content_type=None)
         except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError):
             body = {"raw": await resp.text()}
+        if isinstance(body, dict):
+            body["_headers"] = dict(resp.headers)
         return resp.status, body
 
 
 def _parse_retry_delay(body: Any, default: float = 60.0) -> float:
     """Пытается извлечь время ожидания из ответа об ошибке 429."""
     if isinstance(body, dict):
+        headers = body.get("_headers", {})
+        retry_after = headers.get("Retry-After") or headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(5.0, float(retry_after))
+            except ValueError:
+                pass
+        
         # 1. Google Gemini error structure: details -> retryDelay
         error_info = body.get("error", {})
         if isinstance(error_info, dict):
@@ -263,7 +276,7 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                 msg = f"{provider['model']} (key {_mask_key(key)}): сетевая ошибка/таймаут — {exc!r}"
                 log.warning(msg)
                 failures.append(msg)
-                state.cooldown_until = time.time() + 300.0
+                state.cooldown_until = time.time() + _COOLDOWN_DEFAULT_S
                 state.failure_count += 1
                 # Сетевая ошибка часто на уровне хоста/провайдера — пробуем следующий ключ или провайдера
                 continue
@@ -287,7 +300,7 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
 
             if status == 404:
                 # Модель не найдена / закрыта — кулдаун на 24 часа и сразу переход к следующему провайдеру
-                state.cooldown_until = time.time() + 86400.0
+                state.cooldown_until = time.time() + _COOLDOWN_NOT_FOUND_S
                 log.warning("%s (key %s): HTTP 404 модель не найдена, переход к следующему провайдеру — %s",
                             provider["model"], _mask_key(key), _short(body, 180))
                 failures.append(f"{provider['model']}[{_mask_key(key)}]: HTTP 404 NotFound")
@@ -311,7 +324,7 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
 
             if status in (401, 402, 403):
                 # Неверный ключ, баланс или запрет доступа: ставим кулдаун на 1 час
-                state.cooldown_until = time.time() + 3600.0
+                state.cooldown_until = time.time() + _COOLDOWN_RATE_LIMIT_S
                 log.warning("%s (key %s): HTTP %s ошибка авторизации/баланса, ротация на следующий ключ",
                             provider["model"], _mask_key(key), status)
                 failures.append(f"{provider['model']}[{_mask_key(key)}]: HTTP {status} Auth/BalanceError")
@@ -325,7 +338,7 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                 break
 
             # Прочие 4xx / 5xx
-            state.cooldown_until = time.time() + 300.0
+            state.cooldown_until = time.time() + _COOLDOWN_DEFAULT_S
             log.warning("%s (key %s): HTTP %s — %s", provider["model"], _mask_key(key), status, _short(body, 200))
             failures.append(f"{provider['model']}[{_mask_key(key)}]: HTTP {status} — {_short(body, 150)}")
 

@@ -6,6 +6,12 @@
 
     python -m bot.main
 """
+try:
+    import defusedxml
+    defusedxml.defuse_stdlib()
+except ImportError:
+    pass
+
 import asyncio
 import base64
 import contextlib
@@ -210,6 +216,7 @@ def _now_iso() -> str:
 
 
 def _bootstrap_env_allowlist(conn) -> None:
+
     """Разовая миграция: каждому id из TELEGRAM_ALLOWED_USERS заводим approved-
     строку в access_list, если её ещё нет — так существующие до этой правки
     пользователи не теряют доступ. Идемпотентно: повторный запуск ничего не
@@ -244,7 +251,6 @@ def _check_access(uid: str, from_user) -> str:
     один раз, а не при каждом следующем сообщении того же pending-человека."""
     conn = connect()
     try:
-        migrate(conn)
         row = conn.execute(
             "SELECT status FROM access_list WHERE telegram_user_id=?", (uid,)
         ).fetchone()
@@ -410,7 +416,6 @@ def _format_target_interactive(uid: str, args: str = "") -> tuple[str, InlineKey
     from health_core import forecast as _fc
     conn = connect()
     try:
-        migrate(conn)
         user_id = _resolve_uid_to_user_id(conn, uid)
 
         args = args.strip()
@@ -579,7 +584,6 @@ def _format_target_option_preview(uid: str, opt_name: str) -> tuple[str, InlineK
     from health_core import forecast as _fc
     conn = connect()
     try:
-        migrate(conn)
         user_id = _resolve_uid_to_user_id(conn, uid)
         res = _fc.calibrate(conn, user_id)
         if "error" in res:
@@ -626,7 +630,6 @@ def _apply_target(uid: str, kcal: float) -> tuple[str, InlineKeyboardMarkup | No
     from health_core import forecast as _fc
     conn = connect()
     try:
-        migrate(conn)
         user_id = _resolve_uid_to_user_id(conn, uid)
         res = _fc.calibrate(conn, user_id, target_kcal=kcal, apply=True)
         if "error" in res:
@@ -664,7 +667,6 @@ def _format_plateau_interactive(uid: str, args: str = "") -> tuple[str, InlineKe
     from health_core import forecast as _fc
     conn = connect()
     try:
-        migrate(conn)
         user_id = _resolve_uid_to_user_id(conn, uid)
         res = _fc.plateau_forecast(conn, user_id)
         if "error" in res:
@@ -743,7 +745,6 @@ def _format_forecast_interactive(uid: str, args: str = "") -> tuple[str, InlineK
     from health_core import forecast as _fc
     conn = connect()
     try:
-        migrate(conn)
         user_id = _resolve_uid_to_user_id(conn, uid)
         intake = None
         args = args.strip()
@@ -860,7 +861,6 @@ async def _run_council_task(bot: Bot, telegram_uid: str, user_id: int, run_id: i
     закрыто registry.release_connections к моменту, когда эта задача стартует."""
     conn = connect()
     try:
-        migrate(conn)
         result = await council.execute(conn, user_id, run_id, reason)
     except Exception:
         log.exception("консилиум упал целиком, run_id=%s", run_id)
@@ -929,7 +929,6 @@ def _cmd_approve(uid: str, args: str) -> str:
         return err
     conn = connect()
     try:
-        migrate(conn)
         _access_upsert_status(conn, tg_id, "approved")
         # Строка users нужна ДО первого сообщения человека: _get_user_id в
         # plugin/tools.py бросает для незнакомого telegram id, а без неё
@@ -958,7 +957,6 @@ def _cmd_deny(uid: str, args: str) -> str:
         return err
     conn = connect()
     try:
-        migrate(conn)
         _access_upsert_status(conn, tg_id, "denied")
     finally:
         conn.close()
@@ -976,7 +974,6 @@ def _cmd_revoke(uid: str, args: str) -> str:
         return "⚠ Нельзя отозвать доступ администратору."
     conn = connect()
     try:
-        migrate(conn)
         _access_upsert_status(conn, tg_id, "denied")
     finally:
         conn.close()
@@ -989,7 +986,6 @@ def _cmd_access_list(uid: str) -> str:
         return err
     conn = connect()
     try:
-        migrate(conn)
         rows = conn.execute(
             "SELECT telegram_user_id, status, username, requested_at, decided_at "
             "FROM access_list ORDER BY requested_at"
@@ -1100,7 +1096,6 @@ def _open_turn(uid: str, text: str) -> list[dict]:
     вместе с ним переписку всех остальных."""
     conn = connect()
     try:
-        migrate(conn)
         time_ctx = _user_time_context(conn, uid)
         prefix = [{"role": "system", "content": system_prompt() + time_ctx}]
         prefix += history.load(conn, uid)
@@ -1116,7 +1111,6 @@ def _open_turn_vision(uid: str, content: list[dict], text_for_history: str) -> l
     только текстовую часть — base64 занимает мегабайты и убивает окно."""
     conn = connect()
     try:
-        migrate(conn)
         time_ctx = _user_time_context(conn, uid)
         prefix = [{"role": "system", "content": system_prompt() + time_ctx}]
         prefix += history.load(conn, uid)
@@ -1176,7 +1170,6 @@ async def _handle_document(message: Message, uid: str) -> None:
             
             conn = connect()
             try:
-                migrate(conn)
                 user_id_row = conn.execute("SELECT id FROM users WHERE telegram_user_id=?", (uid,)).fetchone()
                 user_id = user_id_row["id"] if user_id_row else 1
                 
@@ -1698,7 +1691,6 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             from health_core import refeed as _refeed
             conn = connect()
             try:
-                migrate(conn)
                 user_id = _resolve_uid_to_user_id(conn, cb_uid)
                 tomorrow = (config.user_now(conn, user_id).date() + __import__('datetime').timedelta(days=1))
                 res = _refeed.schedule_once(conn, user_id, tomorrow, days=4, reason="plateau")
@@ -1724,7 +1716,6 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             cb_uid = str(callback.from_user.id)
             conn = connect()
             try:
-                migrate(conn)
                 user_id = _resolve_uid_to_user_id(conn, cb_uid)
                 try:
                     run_id = council.reserve(conn, user_id, "plateau")

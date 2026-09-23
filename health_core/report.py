@@ -2,8 +2,14 @@
 формат, который модель дописывает верно, а не пересказывает."""
 import sqlite3
 import statistics
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
+def _parse_date_safe(s: str) -> "date | None":
+    """Безопасный парсинг ISO-даты; логирует и возвращает None при ошибке."""
+    try:
+        return date.fromisoformat(str(s)[:10])
+    except (ValueError, TypeError):
+        return None
 from health_core.config import load, local_now, targets_for, user_now
 from health_core.guards import check_all
 from health_core.chrono import eating_window, late_load, meal_windows
@@ -245,7 +251,7 @@ def status_bar(conn: sqlite3.Connection, user_id: int) -> str:
 def evening_report(conn: sqlite3.Connection, user_id: int, date: str) -> str:
     """Вечерний отчёт 21:30 (§11) — данные для единственного вызова LLM за этот тик."""
     d = day_summary(conn, user_id, date)
-    fired = check_all(conn, user_id)
+    fired = _active_alerts_today(conn, user_id, date)
     lines = [f"Отчёт за {date}."]
     from health_core import sick
     if sick.is_sick(conn, user_id, date):
@@ -261,13 +267,15 @@ def evening_report(conn: sqlite3.Connection, user_id: int, date: str) -> str:
     if window is not None:
         lines.append(f"Пищевое окно {window['first']}–{window['last']} ({window['hours']} ч).")
     # Отбой сегодняшней ночи в 21:30 ещё не записан — поздняя нагрузка только за вчера.
-    yesterday = (datetime.fromisoformat(date[:10]) - timedelta(days=1)).strftime("%Y-%m-%d")
-    late = late_load(conn, user_id, yesterday)
-    if late is not None:
-        late_pct = round(late["share"] * 100)
-        lines.append(f"Вчера за {load()['chrono']['late_load_hours']} ч до сна: {late_pct}% ккал.")
+    parsed_date = _parse_date_safe(date)
+    if parsed_date:
+        yesterday = (parsed_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        late = late_load(conn, user_id, yesterday)
+        if late is not None:
+            late_pct = round(late["share"] * 100)
+            lines.append(f"Вчера за {load()['chrono']['late_load_hours']} ч до сна: {late_pct}% ккал.")
     if fired:
-        lines.append("Гардрейлы: " + "; ".join(f"{a['code']} — {a['message']}" for a in fired))
+        lines.append("Гардрейлы: " + "; ".join(f"{a['rule']} — {a['message']}" for a in fired))
     else:
         lines.append("Гардрейлы: без срабатываний.")
     return "\n".join(lines)
@@ -295,13 +303,13 @@ def meals_of_day(conn: sqlite3.Connection, user_id: int, date: str) -> list[dict
     if not logs:
         return []
 
-    ids = [r["food_log_id"] for r in logs]
-    placeholders = ",".join("?" * len(ids))
     items_by_log: dict[int, list[dict]] = {}
     for row in conn.execute(
-        "SELECT id, food_log_id, name, grams, kcal, protein_g, fat_g, carbs_g, fiber_g, plate_category "
-        f"FROM food_items WHERE food_log_id IN ({placeholders})",
-        ids,
+        "SELECT fi.id, fi.food_log_id, fi.name, fi.grams, fi.kcal, fi.protein_g, fi.fat_g, fi.carbs_g, fi.fiber_g, fi.plate_category "
+        "FROM food_items fi "
+        "JOIN food_log fl ON fl.id = fi.food_log_id "
+        "WHERE fl.user_id=? AND date(fl.eaten_at)=?",
+        (user_id, date),
     ):
         item = {k: row[k] for k in row.keys() if k != "food_log_id"}
         items_by_log.setdefault(row["food_log_id"], []).append(item)

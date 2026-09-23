@@ -95,8 +95,8 @@ def export_all(conn: sqlite3.Connection, user_id: int, out_dir: str) -> dict:
     def _write_xlsx(path: Path, table: str, cols: list[str], uid: int, order: str):
         if not has_openpyxl: return
         path.parent.mkdir(parents=True, exist_ok=True)
-        wb = Workbook()
-        ws = wb.active
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet(title=table)
         ws.append(cols)
         cur = conn.execute(f"SELECT {','.join(cols)} FROM {table} WHERE user_id=? ORDER BY {order}", (uid,))
         for row in cur:
@@ -215,10 +215,13 @@ def rclone_push(local_dir: str, remote: str) -> str:
     """
     if not rclone_available():
         raise RuntimeError("rclone не установлен (проверьте: rclone version)")
-    proc = subprocess.run(
-        ["rclone", "copy", local_dir, remote, "--transfers", "4", "--quiet"],
-        capture_output=True, text=True, timeout=_RCLONE_TIMEOUT,
-    )
+    try:
+        proc = subprocess.run(
+            ["rclone", "copy", local_dir, remote, "--transfers", "4", "--quiet"],
+            capture_output=True, text=True, timeout=_RCLONE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Таймаут rclone ({_RCLONE_TIMEOUT}с)")
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "").strip() or f"rclone exit {proc.returncode}")
     return remote
@@ -239,10 +242,13 @@ def rclone_pull(remote_path: str, dest_dir: str) -> str:
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
     local = dest / name
-    proc = subprocess.run(
-        ["rclone", "copyto", remote_path, str(local), "--quiet"],
-        capture_output=True, text=True, timeout=_RCLONE_TIMEOUT,
-    )
+    try:
+        proc = subprocess.run(
+            ["rclone", "copyto", remote_path, str(local), "--quiet"],
+            capture_output=True, text=True, timeout=_RCLONE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Таймаут rclone ({_RCLONE_TIMEOUT}с)")
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "").strip() or f"rclone exit {proc.returncode}")
     if not local.is_file():
@@ -356,7 +362,7 @@ if __name__ == "__main__":
     # --- разбор remote-пути: буква диска Windows не должна уехать в rclone ---
     for path_, expected in [
         ("gdrive:Health/Scale/export.xlsx", True), ("gdrive:a.tcx", True),
-        ("C:/data/a.xlsx", False), ("C:\data\a.xlsx", False),
+        ("C:/data/a.xlsx", False), (r"C:\data\a.xlsx", False),
         ("/home/u/a.tcx", False), ("a.xlsx", False),
     ]:
         assert is_remote_path(path_) is expected, f"is_remote_path({path_!r}) != {expected}"
