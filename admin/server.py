@@ -112,6 +112,15 @@ def _user_exists(conn, user_id: int) -> bool:
     return conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is not None
 
 
+def _user_tz(conn, user_id: int | None) -> str | None:
+    """Часовой пояс выбранного в панели пользователя (поле timezone из таблицы users).
+    Возвращает строку вида 'Europe/Moscow' или None если не задан."""
+    if user_id is None:
+        return None
+    row = conn.execute("SELECT timezone FROM users WHERE id=?", (user_id,)).fetchone()
+    return (row["timezone"] or None) if row else None
+
+
 def _resolve_user_id(conn, sess: dict, path: str) -> int | None:
     """Selected persona for this request. Priority: ?user=<id> query param (when
     it names a real row — remembered on the session for next time), else the id
@@ -1063,7 +1072,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ORDER BY created_at DESC LIMIT 50 OFFSET ?",
                     (user_id, (page - 1) * 50),
                 ).fetchall()
-            body = pages.alerts_page(rows, page, total, sess["csrf"])
+            body = pages.alerts_page(rows, page, total, sess["csrf"], tz_name=_user_tz(conn, user_id))
             self._html(200, self._layout("Алерты", body, sess["csrf"], active="alerts"))
         finally:
             conn.close()
@@ -1467,7 +1476,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         conn, _user_id, _token, sess = ctx
         try:
-            body = pages.personas_page(self._persona_rows(conn), sess["csrf"])
+            body = pages.personas_page(self._persona_rows(conn), sess["csrf"], tz_name=_user_tz(conn, _user_id))
             self._html(200, self._layout("Персоны", body, sess["csrf"], active="personas"))
         finally:
             conn.close()
@@ -1498,7 +1507,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         conn, _user_id, _token, sess = ctx
         try:
-            body = pages.drafts_page(self._draft_rows(conn), sess["csrf"])
+            body = pages.drafts_page(self._draft_rows(conn), sess["csrf"], tz_name=_user_tz(conn, _user_id))
             self._html(200, self._layout("Черновики карт", body, sess["csrf"], active="drafts"))
         finally:
             conn.close()
@@ -1540,7 +1549,7 @@ class Handler(BaseHTTPRequestHandler):
                 error = "Неизвестное действие."
 
             if error:
-                body = pages.drafts_page(self._draft_rows(conn), sess["csrf"], error=error)
+                body = pages.drafts_page(self._draft_rows(conn), sess["csrf"], error=error, tz_name=_user_tz(conn, _user_id))
                 return self._html(400, self._layout("Черновики карт", body, sess["csrf"], active="drafts"))
             self._redirect("/drafts")
         finally:
@@ -1573,6 +1582,7 @@ class Handler(BaseHTTPRequestHandler):
             if typed != str(row["telegram_user_id"]):
                 body = pages.personas_page(
                     self._persona_rows(conn), sess["csrf"],
+                    tz_name=_user_tz(conn, _user_id),
                     error=(f"Подтверждение не совпало: введите ровно {row['telegram_user_id']}. "
                            f"Ничего не удалено."),
                 )
@@ -1587,6 +1597,7 @@ class Handler(BaseHTTPRequestHandler):
                 traceback.print_exc(file=sys.stderr)
                 body = pages.personas_page(
                     self._persona_rows(conn), sess["csrf"],
+                    tz_name=_user_tz(conn, _user_id),
                     error="Удаление не выполнено, изменения откачены. Подробности в логах сервера.",
                 )
                 return self._html(500, self._layout("Персоны", body, sess["csrf"], active="personas"))
@@ -1594,6 +1605,7 @@ class Handler(BaseHTTPRequestHandler):
             body = pages.personas_page(
                 self._persona_rows(conn), sess["csrf"],
                 summary=[(t, n) for t, n in summary if n],
+                tz_name=_user_tz(conn, _user_id),
             )
             self._html(200, self._layout("Персоны", body, sess["csrf"], active="personas"))
         finally:

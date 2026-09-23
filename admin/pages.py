@@ -5,37 +5,32 @@ alert messages, device strings, the lot. That is the entire XSS defense for a
 panel serving personal medical data, so it is applied without exception.
 """
 import html
-from datetime import date, datetime, timezone as _utc
+from datetime import date, datetime, timezone as _tz_module
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-
-def _admin_tz() -> ZoneInfo:
-    """Часовой пояс из config.yaml → schedule.default_timezone.
-    Фолбэк: UTC (чтобы панель не ломалась при кривом конфиге)."""
-    try:
-        from health_core.config import load as _load_cfg
-        name = (_load_cfg().get("schedule") or {}).get("default_timezone") or "UTC"
-        return ZoneInfo(name)
-    except (ImportError, ZoneInfoNotFoundError, Exception):
-        return ZoneInfo("UTC")
+_UTC = _tz_module.utc  # timezone-aware UTC sentinel для replace(tzinfo=...)
 
 
-def _fmt_dt(value) -> str:
+def _fmt_dt(value, tz_name: str | None = None) -> str:
     """Форматирует строку даты-времени из БД (хранится как UTC) в часовой пояс
-    администратора (schedule.default_timezone из config.yaml).
-    Если разобрать не получается — возвращает исходную строку как есть."""
+    выбранного пользователя. tz_name — строка вида 'Europe/Moscow'; если None
+    или невалидная — показывает время в UTC."""
     if value is None:
         return "—"
     s = str(value).strip()
+    try:
+        tz = ZoneInfo(tz_name) if tz_name else ZoneInfo("UTC")
+    except (ZoneInfoNotFoundError, Exception):
+        tz = ZoneInfo("UTC")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(s[:len(fmt) + 2].rstrip("Z"), fmt)
-            # Помечаем как UTC и переводим в пояс админа
-            dt = dt.replace(tzinfo=_utc.utc).astimezone(_admin_tz())
+            dt = dt.replace(tzinfo=_UTC).astimezone(tz)
             return dt.strftime("%d.%m.%Y %H:%M")
         except ValueError:
             continue
     return html.escape(s)
+
 
 _VALID_METRICS = ("weight_kg", "ffm_kg", "fat_pct", "waist")  # must match plugin/tools.py handle_set_milestone
 
@@ -1280,12 +1275,12 @@ def thresholds_page(parsed: dict, comments: dict[str, str], csrf_token: str,
 
 # ---------------------------------------------------------------- alerts
 
-def alerts_page(rows, page: int, total: int, csrf_token: str) -> str:
+def alerts_page(rows, page: int, total: int, csrf_token: str, tz_name: str | None = None) -> str:
     if not rows:
         table_html = "<p>Алертов нет.</p>"
     else:
         trs = "".join(
-            f"<tr><td>{_fmt_dt(r['created_at'])}</td><td>{_e(r['rule'])}</td><td>{_e(r['message'])}</td></tr>"
+            f"<tr><td>{_fmt_dt(r['created_at'], tz_name)}</td><td>{_e(r['rule'])}</td><td>{_e(r['message'])}</td></tr>"
             for r in rows
         )
         table_html = f'<div class="table-responsive"><table><tr><th>Когда</th><th>Правило</th><th>Сообщение</th></tr>{trs}</table></div>'
@@ -1305,7 +1300,8 @@ def alerts_page(rows, page: int, total: int, csrf_token: str) -> str:
 # ---------------------------------------------------------------- personas
 
 def personas_page(personas: list[dict], csrf_token: str, error: str | None = None,
-                   summary: list[tuple[str, int]] | None = None) -> str:
+                   summary: list[tuple[str, int]] | None = None,
+                   tz_name: str | None = None) -> str:
     """Одна карточка на персону (= строка users): профиль, счётчики записей,
     форма удаления с подтверждением через ввод telegram_user_id. summary — итог
     последнего удаления (список (таблица, число_удалённых_строк))."""
@@ -1338,7 +1334,7 @@ def personas_page(personas: list[dict], csrf_token: str, error: str | None = Non
     <tr><td>Пол</td><td>{_e(u.get('sex'))}</td></tr>
     <tr><td>Дата рождения</td><td>{_e(u.get('birth_date'))}</td></tr>
     <tr><td>Стартовый вес</td><td>{_e(u.get('base_weight_kg'))} кг</td></tr>
-    <tr><td>Дата регистрации</td><td>{_fmt_dt(u.get('created_at'))}</td></tr>
+    <tr><td>Дата регистрации</td><td>{_fmt_dt(u.get('created_at'), tz_name)}</td></tr>
     <tr><td>Записи еды (food_log)</td><td>{food_line}</td></tr>
     <tr><td>Замеры тела (body_metrics)</td><td>{bm_line}</td></tr>
   </table>
@@ -1366,7 +1362,8 @@ def personas_page(personas: list[dict], csrf_token: str, error: str | None = Non
 
 # ---------------------------------------------------------------- drug card drafts
 
-def drafts_page(drafts: list[dict], csrf_token: str, error: str | None = None) -> str:
+def drafts_page(drafts: list[dict], csrf_token: str, error: str | None = None,
+                tz_name: str | None = None) -> str:
     """Pending-черновики карт (health_core/card_drafts.py, CONTEXT.md «Черновик
     карты», docs/adr/0002): одна карточка на черновик, поля редактируемые —
     цифры составила модель по официальным источникам, но подтверждает их
@@ -1396,7 +1393,7 @@ def drafts_page(drafts: list[dict], csrf_token: str, error: str | None = None) -
         blocks.append(f"""
 <div class="card">
   <h3>#{_e(d['id'])} · {_e(d['substance'])}</h3>
-  <p class="comment">Запросил пользователь {_e(d['requested_by'])} · {_fmt_dt(d['created_at'])}</p>
+  <p class="comment">Запросил пользователь {_e(d['requested_by'])} · {_fmt_dt(d['created_at'], tz_name)}</p>
   <p class="comment error">Составлено моделью по официальным источникам — сверь цифры перед одобрением.</p>
   <ul>{sources_html}</ul>
   <form method="post" action="/drafts">
