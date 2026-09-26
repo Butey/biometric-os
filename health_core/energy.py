@@ -270,15 +270,19 @@ def ffmi(ffm_kg: float, height_cm: float) -> float:
     return ffm_kg / (height_m ** 2)
 
 
-def _morning_weights(conn: sqlite3.Connection, user_id: int, start: str, end: str) -> list[float]:
+def _morning_weights(conn: sqlite3.Connection, user_id: int, start: str, end: str) -> list[tuple[int, float]]:
     # §09: "в расчёт тренда идут только замеры с 06:00 до 11:00" — вечерние
     # (вода к вечеру) сохраняются для гидратации, но цель не двигают.
     rows = conn.execute(
-        "SELECT weight_kg FROM body_metrics WHERE user_id=? AND date(measured_at) BETWEEN ? AND ? "
+        "SELECT date(measured_at) d, weight_kg FROM body_metrics WHERE user_id=? AND date(measured_at) BETWEEN ? AND ? "
         "AND time(measured_at) BETWEEN '06:00:00' AND '11:00:00' ORDER BY measured_at",
         (user_id, start, end),
     ).fetchall()
-    return [r["weight_kg"] for r in rows]
+    return [(date.fromisoformat(r["d"]).toordinal(), r["weight_kg"]) for r in rows]
+
+
+_WASHOUT_DAYS = 5  # дней после рефида/болезни, вес которых не идёт в наклон
+_MIN_WEIGHT_DAYS = 4  # меньше дней с весом наклон шумный, калибровку не даём
 
 
 def _adaptive_tdee_core(
@@ -290,7 +294,7 @@ def _adaptive_tdee_core(
     или None, число залогированных дней в окне) — logged_days нужен блендеру
     для доли адаптивной части независимо от того, прошла ли она сама порог.
 
-    TDEE_факт = средний_intake_Nд + (Δвес_Nд · 7700 / N).
+    TDEE_факт = средний_intake_Nд - наклон_веса_кг_в_день · 7700 (линейная регрессия по утренним весам окна).
 
     Intake рефидных и больничных дней исключается из mean_intake: в эти дни
     intake сознательно поднят до maintenance и не отражает обычное питание на
@@ -339,12 +343,26 @@ def _adaptive_tdee_core(
         return None, logged_days
     mean_intake = sum(kcal_values) / len(kcal_values)
 
-    weights = _morning_weights(conn, user_id, start_s, end_s)
-    if len(weights) < 2:
+    # Вес рефид/больничных дней и следующих _WASHOUT_DAYS не берём: вода и
+    # гликоген, набранные на рефиде, уходят следом и читались бы как жир (7700 ккал/кг).
+    # Рефид до начала окна тоже считаем: его вымывание может попасть в окно.
+    washout_from = (start - timedelta(days=_WASHOUT_DAYS)).isoformat()
+    washout: set[int] = set()
+    for r in conn.execute(
+        "SELECT date FROM refeed_days WHERE user_id=? AND date BETWEEN ? AND ? "
+        "UNION SELECT date FROM sick_days WHERE user_id=? AND date BETWEEN ? AND ?",
+        (user_id, washout_from, end_s, user_id, washout_from, end_s),
+    ).fetchall():
+        o = date.fromisoformat(r["date"]).toordinal()
+        washout.update(range(o, o + _WASHOUT_DAYS + 1))
+    weights = [(d, w) for d, w in _morning_weights(conn, user_id, start_s, end_s) if d not in washout]
+    if len({d for d, _ in weights}) < _MIN_WEIGHT_DAYS:
         return None, logged_days
-    delta_weight = weights[-1] - weights[0]
+    # Наклон регрессии по всем замерам окна, а не по двум крайним точкам: один
+    # водный всплеск (рефид) на краю окна иначе раздувает Δвес и расход.
+    slope_kg_day = statistics.linear_regression([d for d, _ in weights], [w for _, w in weights]).slope
 
-    tdee = mean_intake - (delta_weight * 7700 / window_days)
+    tdee = mean_intake - slope_kg_day * 7700
     bmr = bmr_floor(conn, user_id)
     # Расход намного ниже базового обмена физиологически невозможен — так выходит,
     # когда в окно попали недописанные дни (220 ккал за день в логе). Такая
@@ -399,7 +417,7 @@ def logged_streak(conn: sqlite3.Connection, user_id: int, end: date) -> tuple[in
 def adaptive_tdee(
     conn: sqlite3.Connection, user_id: int, window_days: int = 14, for_date: str | None = None
 ) -> float | None:
-    """TDEE_факт = средний_intake_Nд + (Δвес_Nд · 7700 / N).
+    """TDEE_факт = средний_intake_Nд - наклон_веса_кг_в_день · 7700 (линейная регрессия по утренним весам окна).
 
     Достоверность требует MIN_LOG_STREAK_DAYS дней лога подряд, а окно сужается
     до этой серии (но не шире window_days). Серия короче — None, калибровка
@@ -617,6 +635,15 @@ def daily_expenditure(conn: sqlite3.Connection, user_id: int, date: str) -> dict
 
     min_days = policy.get("blend_min_logged_days", 4)
     adaptive_est, logged_days = _adaptive_tdee_core(conn, user_id, 14, date, min_days)
+    # Среднее за последние дни: оценка по наклону веса шумная (5-7 точек после
+    # вымывания рефида), и без сглаживания цель прыгает на сотни ккал за день.
+    day = datetime.fromisoformat(date[:10]).date()
+    ests = [adaptive_est] if adaptive_est is not None else []
+    for k in range(1, policy.get("blend_adaptive_smooth_days", 7)):
+        est, _ = _adaptive_tdee_core(conn, user_id, 14, (day - timedelta(days=k)).isoformat(), min_days)
+        if est is not None:
+            ests.append(est)
+    adaptive_est = sum(ests) / len(ests) if ests else None
 
     parts: dict[str, dict | None] = {"adaptive": None, "steps": None, "watch": None, "activity_factor": None}
     a = 0.0

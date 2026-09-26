@@ -85,6 +85,8 @@ policy:
   blend_min_logged_days: 4
   # максимальная доля адаптивной части при полном логе (14/14); растёт линейно с полнотой лога
   blend_adaptive_max_share: 0.6
+  # среднее адаптивной оценки за столько последних дней: одна шумная оценка веса не двигает цель рывком
+  blend_adaptive_smooth_days: 7
   # окно шагов и часов для блендера, дней
   blend_watch_window_days: 7
   # оценка по шагам: BMR × коэффициент покоя + шаги сверх свободного порога
@@ -304,7 +306,7 @@ bot:
     - base_url: https://claude-n-codex.com:8443/v1
       api_key_env: OPENAI_API_KEY
       model: gpt-5.6-terra
-      timeout_s: 40
+      timeout_s: 60
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
       model: gemini-3.5-flash-lite

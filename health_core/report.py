@@ -180,6 +180,14 @@ def _meal_clause(conn: sqlite3.Connection, user_id: int, date: str, now: datetim
 def day_summary(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
     """Все числа дня одним словарём — источник и для status_bar, и для evening_report."""
     macros = _day_macros(conn, user_id, date)
+    # Строка цели на сегодня могла быть записана до правок формулы или до новых данных: пересчитываем при чтении.
+    from health_core.config import user_today
+    from health_core.energy import daily_target
+    if date == user_today(conn, user_id):
+        try:
+            daily_target(conn, user_id, date)
+        except ValueError:  # ещё нет ни одного замера тела — считать цель не от чего
+            pass
     target = conn.execute(
         "SELECT kcal_target, protein_g_target, fat_g_target, carbs_g_target, fiber_g_target, "
         "water_ml_target FROM daily_targets WHERE user_id=? AND date=?",

@@ -1447,10 +1447,14 @@ def handle_log_weight(params: dict) -> str:
         except (TypeError, ValueError):
             limit = 10
         rows = conn.execute(
-            "SELECT id, weight_kg, measured_at FROM body_metrics WHERE user_id=? ORDER BY measured_at DESC LIMIT ?",
+            "SELECT * FROM body_metrics WHERE user_id=? ORDER BY measured_at DESC LIMIT ?",
             (user_id, limit),
         ).fetchall()
-        entries = [{"weight_id": r["id"], "weight_kg": r["weight_kg"], "measured_at": r["measured_at"]} for r in rows]
+        skip = ("id", "user_id", "burst_key")
+        entries = [
+            {"weight_id": r["id"], **{k: r[k] for k in r.keys() if k not in skip and r[k] is not None}}
+            for r in rows
+        ]
         conn.close()
         return json.dumps({
             "entries": entries,
@@ -4276,7 +4280,9 @@ def handle_explain_target(params: dict) -> str:
     user_id = _get_user_id(params, conn)
     date_str = params.get("date", _today_iso())
 
-    # Get the target row
+    # Строка на сегодня могла устареть — пересчитываем при чтении
+    if date_str == _today_iso(conn, user_id):
+        daily_target(conn, user_id, date_str)
     target_row = conn.execute(
         "SELECT kcal_target, computed_from FROM daily_targets WHERE user_id=? AND date=?",
         (user_id, date_str),
