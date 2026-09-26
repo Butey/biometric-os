@@ -94,14 +94,50 @@ def test_dispatch_routes_knowledge():
 def test_tool_rules_attach_and_strip():
     """with_tool_rules приклеивает правила из Core/tool_rules.md к результату
     инструмента, у которого есть секция (forecast), и не трогает тот, у
-    которого её нет (log_water). strip_tool_rules снимает блок обратно, и
+    которого её нет (log_glucose). strip_tool_rules снимает блок обратно, и
     снятый текст совпадает с исходным результатом инструмента дословно."""
     plain = json.dumps({"ok": True}, ensure_ascii=False)
     with_rules = main.with_tool_rules("forecast", plain)
     assert with_rules != plain and "[ПРАВИЛА forecast]" in with_rules
-    assert main.with_tool_rules("log_water", plain) == plain, "у log_water нет секции правил"
+    assert main.with_tool_rules("log_glucose", plain) == plain, "у log_glucose нет секции правил"
     assert main.strip_tool_rules(with_rules) == plain, "strip должен вернуть исходный текст дословно"
     assert main.strip_tool_rules(plain) == plain, "strip не должен ничего ломать без блока правил"
+
+
+def test_log_water_pace_only_when_behind():
+    """water_pace появляется, когда воды меньше 85% линейной нормы к этому часу
+    (08:00-20:00), и не появляется при норме, вне окна и для прошлых дат."""
+    from unittest.mock import patch
+    from datetime import datetime as _dt
+    import plugin.tools as _pt
+    registry.set_caller("987")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM users WHERE id=987")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(987,'987',180,'1990-01-01',"
+            "'male','UTC',75,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+        today = _dt.now().strftime("%Y-%m-%d")
+
+        def _log(clock, ml):
+            with patch.object(_pt, "_now_iso", lambda *a, **k: f"{today} {clock}"):
+                return json.loads(main.strip_tool_rules(main.dispatch("log_water", {"ml": ml})))
+
+        r = _log("15:00:00", 100)
+        assert r["water_pace"]["behind_ml"] > 0, r
+        r = _log("15:00:00", 5000)
+        assert "water_pace" not in r, r
+        conn.execute("DELETE FROM water_log WHERE user_id=987")
+        conn.commit()
+        assert "water_pace" not in _log("22:00:00", 100), "после 20:00 темп не считаем"
+        assert "water_pace" not in _log("07:00:00", 100), "до 08:00 темп не считаем"
+    finally:
+        conn.execute("DELETE FROM water_log WHERE user_id=987")
+        conn.commit()
+        conn.close()
 
 
 def test_system_prompt_moved_rules_out():
@@ -813,26 +849,26 @@ def test_log_side_effect_add_list_delete():
             "'male','UTC',75,'2026-01-01','2026-01-01 00:00:00')")
         conn.commit()
 
-        result_add = json.loads(main.dispatch("log_side_effect", {
+        result_add = json.loads(main.strip_tool_rules(main.dispatch("log_side_effect", {
             "symptom": "тошнота",
             "severity": "mild",
             "at": "2026-01-01 12:00:00",
-        }))
+        })))
         assert "side_effect_id" in result_add, f"нет side_effect_id в ответе: {result_add}"
         side_effect_id = result_add["side_effect_id"]
         assert side_effect_id > 0, f"side_effect_id должен быть положительным, получено {side_effect_id}"
 
-        result_list = json.loads(main.dispatch("log_side_effect", {"action": "list", "limit": 10}))
+        result_list = json.loads(main.strip_tool_rules(main.dispatch("log_side_effect", {"action": "list", "limit": 10})))
         assert "entries" in result_list, f"нет entries в list: {result_list}"
         found = any(e["side_effect_id"] == side_effect_id for e in result_list["entries"])
         assert found, f"side_effect_id {side_effect_id} не найден в list: {result_list}"
 
-        result_del = json.loads(main.dispatch("log_side_effect", {"action": "delete"}))
+        result_del = json.loads(main.strip_tool_rules(main.dispatch("log_side_effect", {"action": "delete"})))
         assert "deleted" in result_del, f"нет deleted в ответе: {result_del}"
         assert result_del["deleted"]["side_effect_id"] == side_effect_id, \
             f"удалилась не та запись: {result_del['deleted']['side_effect_id']} != {side_effect_id}"
 
-        result_list2 = json.loads(main.dispatch("log_side_effect", {"action": "list", "limit": 10}))
+        result_list2 = json.loads(main.strip_tool_rules(main.dispatch("log_side_effect", {"action": "list", "limit": 10})))
         found2 = any(e["side_effect_id"] == side_effect_id for e in result_list2["entries"])
         assert not found2, f"side_effect_id {side_effect_id} всё ещё есть в list после удаления"
     finally:

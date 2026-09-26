@@ -861,17 +861,26 @@ def handle_log_water(params: dict) -> str:
     water_ml = d.get("water_ml", 0)
     water_target_ml = d.get("water_target_ml", 0)
 
+    # Темп воды: цель равномерно растёт с 08:00 до 20:00, только для записей сегодняшнего дня.
+    # ponytail: линейный график и порог 15% отставания — литералы, менять по опыту.
+    water_pace = None
+    now = datetime.fromisoformat(_now_iso(conn, user_id))
+    if record_date == now.date().isoformat() and water_target_ml and 8 <= now.hour < 20:
+        expected = water_target_ml * (now.hour + now.minute / 60 - 8) / 12
+        if water_ml < expected * 0.85:
+            water_pace = {"expected_ml": round(expected), "behind_ml": round(expected - water_ml)}
+
     conn.close()
 
-    return json.dumps(
-        {
-            "water_id": water_id,
-            "water_ml": water_ml,
-            "water_target_ml": water_target_ml,
-            "alerts": alerts,
-        },
-        ensure_ascii=False,
-    )
+    result = {
+        "water_id": water_id,
+        "water_ml": water_ml,
+        "water_target_ml": water_target_ml,
+        "alerts": alerts,
+    }
+    if water_pace:
+        result["water_pace"] = water_pace
+    return json.dumps(result, ensure_ascii=False)
 
 
 @_handler_wrapper
