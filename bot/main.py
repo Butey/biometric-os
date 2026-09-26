@@ -871,10 +871,15 @@ async def _run_council_task(bot: Bot, telegram_uid: str, user_id: int, run_id: i
         return
     finally:
         conn.close()
-    try:
-        await bot.send_message(int(telegram_uid), result["text"])
-    except Exception:
-        log.exception("не удалось отправить итог консилиума пользователю %s", telegram_uid)
+    for chunk in _chunks(result["text"], TELEGRAM_LIMIT):
+        try:
+            try:
+                await bot.send_message(int(telegram_uid), chunk)
+            except TelegramBadRequest:
+                await bot.send_message(int(telegram_uid), chunk, parse_mode=None)
+        except Exception:
+            log.exception("не удалось отправить итог консилиума пользователю %s", telegram_uid)
+            return
 
 
 _COUNCIL_TASKS: set = set()

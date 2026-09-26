@@ -112,7 +112,7 @@ def reserve(conn: sqlite3.Connection, user_id: int, reason: str) -> int:
         since = (local_now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
         window_msg = f"{hours} часов"
     if conn.execute(
-        "SELECT 1 FROM council_runs WHERE user_id=? AND reason=? AND started_at>=?",
+        "SELECT 1 FROM council_runs WHERE user_id=? AND reason=? AND started_at>=? AND status!='failed'",
         (user_id, reason, since),
     ).fetchone():
         raise ValueError(f"Консилиум по причине «{reason}» уже собирался за последние {window_msg}.")
@@ -179,7 +179,8 @@ async def execute(conn: sqlite3.Connection, user_id: int, run_id: int, reason: s
     cfg = _cfg()
     timeout_s, retry_delay_s, max_retries = cfg["timeout_s"], cfg["retry_delay_s"], cfg["max_retries"]
 
-    data = await asyncio.to_thread(council_data.build, conn, user_id)
+    # sqlite-соединение привязано к своему потоку -> to_thread падает; сборка пакета быстрая
+    data = council_data.build(conn, user_id)
     pack_text = _format_data_pack(data, reason)
 
     async with aiohttp.ClientSession() as session:
