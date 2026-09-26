@@ -180,6 +180,112 @@ def _parse_retry_delay(body: Any, default: float = 60.0) -> float:
     return default
 
 
+def _has_thought_signature(m: dict) -> bool:
+    """Проверяет наличие thought_signature (Gemini 3.x) в сообщении или вызовах инструментов."""
+    if m.get("thought_signature") or m.get("extra_content"):
+        return True
+    tool_calls = m.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                if tc.get("thought_signature") or tc.get("extra_content"):
+                    return True
+                fn = tc.get("function")
+                if isinstance(fn, dict) and (fn.get("thought_signature") or fn.get("extra_content")):
+                    return True
+    return False
+
+
+def _convert_tool_calls_to_text(messages: list[dict], force_all: bool = False) -> list[dict]:
+    """Конвертирует tool_calls и tool-ответы в обычные текстовые сообщения для Google Gemini,
+    если они чужие (без thought_signature) или принудительно (force_all)."""
+    foreign_tc_ids: set[str] = set()
+    tool_id_to_name: dict[str, str] = {}
+    for m in messages:
+        if m.get("role") == "assistant":
+            is_foreign = force_all or (bool(m.get("tool_calls")) and not _has_thought_signature(m))
+            for tc in m.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    call_id = tc.get("id")
+                    fn = tc.get("function")
+                    name = fn.get("name") if isinstance(fn, dict) else None
+                    if call_id and name:
+                        tool_id_to_name[call_id] = name
+                    if is_foreign and call_id:
+                        foreign_tc_ids.add(call_id)
+
+    has_foreign_assistant = force_all or any(
+        m.get("role") == "assistant" and m.get("tool_calls") and not _has_thought_signature(m)
+        for m in messages
+    )
+    if not has_foreign_assistant and not foreign_tc_ids:
+        return messages
+
+    converted: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls") and (force_all or not _has_thought_signature(m)):
+            call_lines = []
+            for tc in m.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                name = fn.get("name", "tool")
+                args = fn.get("arguments", "")
+                call_lines.append(f"Вызов функции {name}({args})")
+            calls_desc = "\n".join(call_lines)
+
+            parts = []
+            if m.get("content"):
+                parts.append(str(m["content"]))
+            if calls_desc:
+                parts.append(calls_desc)
+
+            c = dict(m)
+            c.pop("tool_calls", None)
+            c["content"] = "\n".join(parts) if parts else ""
+            converted.append(c)
+        elif role == "tool" and (force_all or m.get("tool_call_id") in foreign_tc_ids or not foreign_tc_ids):
+            call_id = m.get("tool_call_id", "")
+            fn_name = tool_id_to_name.get(call_id, "")
+            res_content = m.get("content", "")
+            if fn_name:
+                text = f"Результат вызова {fn_name}: {res_content}"
+            else:
+                text = f"Результат вызова: {res_content}"
+            converted.append({
+                "role": "user",
+                "content": text,
+            })
+        else:
+            converted.append(m)
+
+    return converted
+
+
+def _build_clean_messages(messages: list[dict], is_google: bool = False, force_text_tools: bool = False) -> list[dict]:
+    """Формирует очищенные сообщения для API. Сохраняет ВСЕ поля assistant-сообщения
+    (включая thought_signature/extra_content). Для Google Gemini конвертирует чужие
+    tool_calls (без thought_signature) в текстовый формат."""
+    source = _convert_tool_calls_to_text(messages, force_all=force_text_tools) if (is_google or force_text_tools) else messages
+    clean = []
+    for m in source:
+        if m.get("role") == "assistant":
+            c = dict(m)
+            if m.get("content") is not None:
+                c["content"] = m["content"]
+            elif not m.get("tool_calls"):
+                c["content"] = ""
+            else:
+                c["content"] = None
+            if not c.get("tool_calls"):
+                c.pop("tool_calls", None)
+            clean.append(c)
+        else:
+            clean.append(m)
+    return clean
+
+
 async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict],
                 providers: list[Provider], timeout_s: float = DEFAULT_TIMEOUT_S) -> dict:
     """Идёт по providers по порядку, ротирует API-ключи для каждого провайдера,
@@ -210,21 +316,8 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
         prov_timeout = float(provider.get("timeout_s", timeout_s))
 
         url = f"{provider['base_url'].rstrip('/')}/chat/completions"
-        clean_messages = []
-        for m in messages:
-            if m.get("role") == "assistant":
-                c = {"role": "assistant"}
-                if m.get("content") is not None:
-                    c["content"] = m["content"]
-                elif not m.get("tool_calls"):
-                    c["content"] = ""
-                else:
-                    c["content"] = None
-                if m.get("tool_calls"):
-                    c["tool_calls"] = m["tool_calls"]
-                clean_messages.append(c)
-            else:
-                clean_messages.append(m)
+        is_google = "googleapis.com" in provider.get("base_url", "")
+        clean_messages = _build_clean_messages(messages, is_google=is_google)
 
         payload: dict[str, Any] = {
             "model": provider["model"],
@@ -331,6 +424,27 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                 continue
 
             if status in (400, 422):
+                if status == 400 and is_google and "thought_signature" in str(body).lower():
+                    # Google отклонил запрос из-за thought_signature:
+                    # повторяем запрос к этому же провайдеру со всеми tool_calls, переведёнными в текст
+                    log.warning("%s (key %s): HTTP 400 thought_signature, повтор с принудительной конвертацией tool_calls в текст",
+                                provider["model"], _mask_key(key))
+                    retry_payload = dict(payload)
+                    retry_payload["messages"] = _build_clean_messages(messages, is_google=True, force_text_tools=True)
+                    try:
+                        retry_status, retry_body = await _post(session, url, headers, retry_payload, timeout_s=prov_timeout)
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                        log.warning("%s (key %s): сетевая ошибка при повторе 400 — %r", provider["model"], _mask_key(key), exc)
+                    else:
+                        if retry_status == 200:
+                            state.cooldown_until = 0.0
+                            state.failure_count = 0
+                            state.last_status = 200
+                            try:
+                                return dict(retry_body["choices"][0]["message"])
+                            except (KeyError, IndexError, TypeError) as exc:
+                                log.warning("%s (key %s): 200 на повторе, но битый ответ — %r", provider["model"], _mask_key(key), exc)
+
                 # Ошибка схемы/параметров (не поддерживаются tools или thinking) — переход к след. провайдеру
                 log.warning("%s (key %s): HTTP %s ошибка запроса, переход к следующему провайдеру — %s",
                             provider["model"], _mask_key(key), status, _short(body, 200))
@@ -601,6 +715,93 @@ if __name__ == "__main__":
                 assert msg_triple["content"] == "ответ с третьего ключа", (msg_triple, seen)
                 assert len(seen) == 3, seen
             print("OK: 8) устаревший снимок healthy_keys не пропускает отпустивший ключ")
+
+            # --- 9. Bug 1: сохранение thought_signature и других полей в clean_messages ---
+            tc_with_ts = {
+                "id": "call_gemini",
+                "type": "function",
+                "function": {"name": "log_water", "arguments": '{"ml": 250}'},
+                "thought_signature": "gemini_ts_token_123",
+            }
+            assistant_with_ts = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [tc_with_ts],
+                "thought_signature": "gemini_ts_msg_token",
+                "extra_content": "some_extra_data",
+            }
+            payloads_received = []
+
+            async def _post_inspect_payload(session, url, headers, payload, timeout_s=None):
+                payloads_received.append(payload)
+                return 200, {"choices": [{"message": _msg(content="финал")}]}
+
+            with patch(__name__ + "._post", _post_inspect_payload):
+                await chat(session, [{"role": "user", "content": "запиши воду"}, assistant_with_ts], [], PROVIDERS)
+                assert len(payloads_received) == 1
+                sent_msgs = payloads_received[0]["messages"]
+                sent_assistant = sent_msgs[1]
+                assert sent_assistant["thought_signature"] == "gemini_ts_msg_token", sent_assistant
+                assert sent_assistant["extra_content"] == "some_extra_data", sent_assistant
+                assert sent_assistant["tool_calls"][0]["thought_signature"] == "gemini_ts_token_123", sent_assistant
+            print("OK: 9) thought_signature и extra_content сохраняются в clean_messages")
+
+            # --- 10. Bug 2: конвертация чужих tool_calls без thought_signature перед запросом к Google ---
+            google_provider: list[Provider] = [
+                {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "api_key_env": "TEST_KEY_1", "model": "gemini-3.5-flash-lite"}
+            ]
+            foreign_tc = {"id": "gpt_call_1", "type": "function", "function": {"name": "log_weight", "arguments": '{"kg": 75}'}}
+            history_with_gpt = [
+                {"role": "user", "content": "запиши вес"},
+                {"role": "assistant", "content": None, "tool_calls": [foreign_tc]},
+                {"role": "tool", "tool_call_id": "gpt_call_1", "content": '{"ok": true}'},
+            ]
+            google_payloads = []
+
+            async def _post_google(session, url, headers, payload, timeout_s=None):
+                google_payloads.append(payload)
+                return 200, {"choices": [{"message": _msg(content="вес записан")}]}
+
+            with patch(__name__ + "._post", _post_google):
+                resp = await chat(session, history_with_gpt, [], google_provider)
+                assert resp["content"] == "вес записан"
+                assert len(google_payloads) == 1
+                sent_msgs = google_payloads[0]["messages"]
+                assert not any(m.get("tool_calls") for m in sent_msgs), sent_msgs
+                assert not any(m.get("role") == "tool" for m in sent_msgs), sent_msgs
+                assert "log_weight" in sent_msgs[1]["content"]
+                assert sent_msgs[2]["role"] == "user"
+                assert "log_weight" in sent_msgs[2]["content"]
+                assert '{"ok": true}' in sent_msgs[2]["content"]
+            print("OK: 10) чужие tool_calls конвертируются в текст перед отправкой в Google Gemini")
+
+            # --- 11. Bug 2 (fallback): HTTP 400 с thought_signature от Google перезапрашивается со сконвертированными tool_calls ---
+            google_400_calls = []
+
+            async def _post_google_400_then_ok(session, url, headers, payload, timeout_s=None):
+                google_400_calls.append(payload)
+                if len(google_400_calls) == 1:
+                    return 400, {"error": {"message": "Function call is missing a thought_signature in functionCall parts."}}
+                return 200, {"choices": [{"message": _msg(content="успешно после 400")}]}
+
+            with patch(__name__ + "._post", _post_google_400_then_ok):
+                ts_msg = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [tc_with_ts],
+                    "thought_signature": "corrupted_sig",
+                }
+                hist_400 = [
+                    {"role": "user", "content": "запиши"},
+                    ts_msg,
+                    {"role": "tool", "tool_call_id": "call_gemini", "content": '{"ok": true}'},
+                ]
+                resp_400 = await chat(session, hist_400, [], google_provider)
+                assert resp_400["content"] == "успешно после 400"
+                assert len(google_400_calls) == 2
+                assert google_400_calls[0]["messages"][1].get("tool_calls")
+                assert not any(m.get("tool_calls") for m in google_400_calls[1]["messages"])
+            print("OK: 11) HTTP 400 thought_signature от Google успешно перезапрашивается с конвертацией в текст")
 
         del os.environ["TEST_KEY_1"]
         del os.environ["TEST_KEY_2"]
