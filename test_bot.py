@@ -917,8 +917,11 @@ def test_log_watch_day_upsert_validate_autoraise_trends():
         conn.execute("DELETE FROM daily_watch WHERE user_id=996")
         conn.execute("UPDATE users SET hr_max_bpm=210, hr_max_source='watch' WHERE id=996")
         conn.commit()
-        _dispatch_json("log_watch_day", {"days": [{"date": "2026-08-26", "hr_min": 55, "hr_avg": 65, "hr_max": 100}]})
-        _dispatch_json("log_watch_day", {"days": [{"date": "2026-08-27", "hr_min": 56, "hr_avg": 66, "hr_max": 101}]})
+        # даты относительно сегодня: get_trends смотрит только последние 28 дней
+        d1 = (_date.today() - _td(days=2)).isoformat()
+        d2 = (_date.today() - _td(days=1)).isoformat()
+        _dispatch_json("log_watch_day", {"days": [{"date": d1, "hr_min": 55, "hr_avg": 65, "hr_max": 100}]})
+        _dispatch_json("log_watch_day", {"days": [{"date": d2, "hr_min": 56, "hr_avg": 66, "hr_max": 101}]})
         urow3 = conn.execute("SELECT hr_max_bpm FROM users WHERE id=996").fetchone()
         assert urow3["hr_max_bpm"] == 210, "максимум не должен снижаться от низких дней"
 

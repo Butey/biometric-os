@@ -107,7 +107,7 @@ def _resolve(topic: str) -> Path | None:
     граница доверия, поэтому итог обязан лежать ВНУТРИ каталога (resolve +
     сравнение), иначе "../../.env" утечёт файлом."""
     import re
-    if not re.fullmatch(r"[a-zA-Z0-9_\-]+", topic):
+    if not re.fullmatch(r"[\w\- ]+", topic):
         return None
     # Файл обязан лежать ПРЯМО в своём каталоге, а не где-то внутри: иначе
     # topic "personal/<чужой id>/protocol" прочитал бы чужие личные документы.
