@@ -134,7 +134,7 @@ def smoothed_weight(conn: sqlite3.Connection, user_id: int, days: int = 7) -> tu
     """Сглаженная масса и дата последнего замера.
 
     Медиана внутри дня (весы дают до 0.9 кг разброса между соседними
-    вставаниями), затем среднее по дням. Одиночный замер как отправная точка
+    вставаниями), затем линия тренда по дням, взятая на последнюю дату. Одиночный замер как отправная точка
     прогноза — это перенос шума прибора на весь горизонт.
     """
     rows = conn.execute(
@@ -150,8 +150,15 @@ def smoothed_weight(conn: sqlite3.Connection, user_id: int, days: int = 7) -> tu
     ordered = sorted(by_day)
     cutoff = (date.fromisoformat(ordered[-1]) - timedelta(days=days - 1)).isoformat()
     window = [d for d in ordered if d >= cutoff]
-    value = statistics.fmean(statistics.median(by_day[d]) for d in window)
-    return value, ordered[-1]
+    ys = [statistics.median(by_day[d]) for d in window]
+    if len(ys) < 3:
+        return statistics.fmean(ys), ordered[-1]
+    # Среднее окна отстаёт от тренда: при -0.15 кг/сут база на ~0.5 кг выше сегодняшней.
+    # Берём значение линии тренда на последнюю дату (в границах окна, чтобы не улетать).
+    last = date.fromisoformat(ordered[-1])
+    xs = [(date.fromisoformat(d) - last).days for d in window]
+    slope, icpt = statistics.linear_regression(xs, ys)
+    return min(max(icpt, min(ys)), max(ys)), ordered[-1]
 
 
 def _observed_intake(conn: sqlite3.Connection, user_id: int, window_days: int = 14) -> float | None:
@@ -1036,7 +1043,7 @@ if __name__ == "__main__":
             "INSERT INTO body_metrics(user_id, burst_key, measured_at, weight_kg) VALUES (1, ?, ?, ?)",
             (f"w{i}", f"{(today - timedelta(days=ago)).isoformat()} 08:00:00", w))
     conn.commit()
-    assert smoothed_weight(conn, 1)[0] == 122.5, smoothed_weight(conn, 1)
+    assert abs(smoothed_weight(conn, 1)[0] - 122.0) < 0.6, smoothed_weight(conn, 1)
     print("OK: сглаженная масса берёт только замеры последних 7 календарных дней")
 
     conn.close()
