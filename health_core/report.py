@@ -92,10 +92,12 @@ def _weight_trend(conn: sqlite3.Connection, user_id: int, window_days: int, late
     # Оригинал: ищет ТОЧКУ <= граница окна (якорь), затем использует latest.
     # Для медианы: берём все точки, начиная хотя бы от границы окна.
     # Дополнительный запрос: найти последнюю точку ВНЕ окна (если есть), чтобы включить якорь.
+    # Якорь старше window_days до границы окна - не «начало окна», а чужая эпоха.
+    anchor_min = (_now(conn, user_id) - timedelta(days=2 * window_days)).strftime("%Y-%m-%d %H:%M:%S")
     anchor = conn.execute(
-        "SELECT weight_kg FROM body_metrics WHERE user_id=? AND measured_at<=? "
+        "SELECT weight_kg FROM body_metrics WHERE user_id=? AND measured_at<=? AND measured_at>=? "
         "ORDER BY measured_at DESC LIMIT 1",
-        (user_id, since),
+        (user_id, since, anchor_min),
     ).fetchone()
 
     rows_in_window = conn.execute(

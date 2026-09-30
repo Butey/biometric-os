@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root: fo
 
 from admin import auth, pages, upload
 from health_core import card_drafts
-from health_core.config import CONFIG_PATH, load as load_config, user_today
+from health_core.config import CONFIG_PATH, load as load_config, user_now, user_today
 from health_core.db import DB_PATH, connect, migrate as db_migrate
 _connect = connect
 from health_core.energy import daily_target
@@ -544,6 +544,15 @@ class Handler(BaseHTTPRequestHandler):
         self._nav_users = _list_users_for_selector(conn)
         return conn, user_id, token, sess
 
+    def _persona_changed(self, form_user_id, user_id) -> bool:
+        """True (and a 409 already sent) when the form was rendered for another
+        persona than the one this request resolved to (persona switched in a
+        second tab). Forms without form_user_id are not checked."""
+        if form_user_id in (None, "") or str(form_user_id) == str(user_id):
+            return False
+        self._error_page(409, "Персона сменилась в другой вкладке, обновите страницу.")
+        return True
+
     def _layout(self, title: str, body: str, csrf_token: str, active: str | None = None) -> str:
         """Thin wrapper over pages.layout() that adds the nav's user selector,
         using the persona list _require_auth() stashed on this request. Use this
@@ -607,7 +616,6 @@ class Handler(BaseHTTPRequestHandler):
                 "/personas": self._post_personas,
                 "/actions": self._post_actions,
                 "/actions/import-scale": self._post_actions_import_scale,
-                "/actions/password": self._post_actions_password,
                 "/knowledge/upload": self._post_knowledge_upload,
                 "/knowledge/delete": self._post_knowledge_delete,
                 "/plans/save": self._post_plans_save,
@@ -801,7 +809,7 @@ class Handler(BaseHTTPRequestHandler):
         conn, user_id, token, sess = ctx
         try:
             rows = self._milestone_rows(conn, user_id) if user_id is not None else []
-            body = pages.milestones_page(rows, _VALID_MILESTONE_METRICS, sess["csrf"])
+            body = pages.milestones_page(rows, _VALID_MILESTONE_METRICS, sess["csrf"], user_id=user_id)
             self._html(200, self._layout("Вехи", body, sess["csrf"], active="milestones"))
         finally:
             conn.close()
@@ -815,6 +823,8 @@ class Handler(BaseHTTPRequestHandler):
             form = self._read_form()
             if not auth.csrf_ok(sess, form.get("csrf_token")):
                 return self._error_page(403, "Неверный CSRF-токен.")
+            if self._persona_changed(form.get("form_user_id"), user_id):
+                return
             if user_id is None:
                 return self._error_page(400, "Нет пользователя в базе.")
 
@@ -855,7 +865,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if error:
                 rows = self._milestone_rows(conn, user_id)
-                body = pages.milestones_page(rows, _VALID_MILESTONE_METRICS, sess["csrf"], error=error)
+                body = pages.milestones_page(rows, _VALID_MILESTONE_METRICS, sess["csrf"], error=error, user_id=user_id)
                 return self._html(200, self._layout("Вехи", body, sess["csrf"], active="milestones"))
             self._redirect("/milestones")
         finally:
@@ -891,7 +901,7 @@ class Handler(BaseHTTPRequestHandler):
         current = load_config()
         notes = []
         had_error = False
-        for section, key, value in pages.flatten_config(current):
+        for _section, key, value in pages.flatten_config(current):
             field = f"kv__{key}"
             if field not in form:
                 continue
@@ -1142,7 +1152,7 @@ class Handler(BaseHTTPRequestHandler):
                 weekly_template = get_plan(conn, user_id, day_of_week=None)
 
             body = pages.plans_page(today_plans, all_dates, selected_date, selected_plan,
-                                   weekly_template, sess["csrf"])
+                                   weekly_template, sess["csrf"], user_id=user_id)
             self._html(200, self._layout("Планы", body, sess["csrf"], active="plans"))
         finally:
             conn.close()
@@ -1157,6 +1167,8 @@ class Handler(BaseHTTPRequestHandler):
             csrf_tok = form.get("csrf_token") or form.get("csrf")
             if not auth.csrf_ok(sess, csrf_tok):
                 return self._error_page(403, "Неверный CSRF токен.")
+            if self._persona_changed(form.get("form_user_id"), user_id):
+                return
             if user_id is None:
                 return self._error_page(400, "Нет пользователя в базе.")
 
@@ -1192,6 +1204,8 @@ class Handler(BaseHTTPRequestHandler):
             csrf_tok = form.get("csrf_token") or form.get("csrf")
             if not auth.csrf_ok(sess, csrf_tok):
                 return self._error_page(403, "Неверный CSRF токен.")
+            if self._persona_changed(form.get("form_user_id"), user_id):
+                return
             if user_id is None:
                 return self._error_page(400, "Нет пользователя в базе.")
 
@@ -1231,6 +1245,8 @@ class Handler(BaseHTTPRequestHandler):
             csrf_tok = form.get("csrf_token") or form.get("csrf")
             if not auth.csrf_ok(sess, csrf_tok):
                 return self._error_page(403, "Неверный CSRF токен.")
+            if self._persona_changed(form.get("form_user_id"), user_id):
+                return
             if user_id is None:
                 return self._error_page(400, "Нет пользователя в базе.")
 
@@ -1253,6 +1269,8 @@ class Handler(BaseHTTPRequestHandler):
             csrf_tok = form.get("csrf_token") or form.get("csrf")
             if not auth.csrf_ok(sess, csrf_tok):
                 return self._error_page(403, "Неверный CSRF токен.")
+            if self._persona_changed(form.get("form_user_id"), user_id):
+                return
             if user_id is None:
                 return self._error_page(400, "Нет пользователя в базе.")
 
@@ -1315,7 +1333,9 @@ class Handler(BaseHTTPRequestHandler):
                 eff = training_efficiency(conn, user_id, window_days=180)
                 sports_efficiency = eff.get("sports", {})
 
-            body = pages.workouts_page(rows, stats, sports_efficiency, sess["csrf"], error, message)
+            now_local = user_now(conn, user_id).strftime("%Y-%m-%d %H:%M") if user_id is not None else ""
+            body = pages.workouts_page(rows, stats, sports_efficiency, sess["csrf"], error, message,
+                                       user_id=user_id, now_local=now_local)
             self._html(200, self._layout("Тренировки", body, sess["csrf"], active="workouts"))
         finally:
             conn.close()
@@ -1330,16 +1350,21 @@ class Handler(BaseHTTPRequestHandler):
             csrf_tok = form.get("csrf_token") or form.get("csrf")
             if not auth.csrf_ok(sess, csrf_tok):
                 return self._error_page(403, "Неверный CSRF токен.")
+            if self._persona_changed(form.get("form_user_id"), user_id):
+                return
             if user_id is None:
                 return self._error_page(400, "Нет пользователя в базе.")
 
             sport = (form.get("sport") or "Тренировка").strip()
             started_at = (form.get("started_at") or "").strip()
             if not started_at:
-                from datetime import datetime
-                started_at = datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
-            elif len(started_at) == 16:
-                started_at += ":00"
+                started_at = user_now(conn, user_id).strftime("%Y-%m-%d %H:%M")
+            try:
+                started_at = datetime.strptime(
+                    started_at[:16].replace("T", " "), "%Y-%m-%d %H:%M"
+                ).strftime("%Y-%m-%d %H:%M:00")
+            except ValueError:
+                return self._error_page(400, "Некорректная дата и время, ожидается ГГГГ-ММ-ДД ЧЧ:ММ.")
 
             try:
                 duration_min = float(form.get("duration_min") or 0)
@@ -1381,6 +1406,8 @@ class Handler(BaseHTTPRequestHandler):
             csrf_tok = form.get("csrf_token") or form.get("csrf")
             if not auth.csrf_ok(sess, csrf_tok):
                 return self._error_page(403, "Неверный CSRF токен.")
+            if self._persona_changed(form.get("form_user_id"), user_id):
+                return
             if user_id is None:
                 return self._error_page(400, "Нет пользователя в базе.")
 
@@ -1617,7 +1644,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         conn, user_id, token, sess = ctx
         conn.close()
-        body = pages.actions_page(sess["csrf"])
+        body = pages.actions_page(sess["csrf"], user_id=user_id)
         self._html(200, self._layout("Действия", body, sess["csrf"], active="actions"))
 
     def _post_actions(self):
@@ -1629,10 +1656,12 @@ class Handler(BaseHTTPRequestHandler):
             form = self._read_form()
             if not auth.csrf_ok(sess, form.get("csrf_token")):
                 return self._error_page(403, "Неверный CSRF-токен.")
+            if self._persona_changed(form.get("form_user_id"), user_id):
+                return
             if user_id is None:
                 return self._error_page(400, "Нет пользователя в базе.")
             result = _run_action(conn, user_id, form.get("action", ""))
-            body = pages.actions_page(sess["csrf"], result=result)
+            body = pages.actions_page(sess["csrf"], result=result, user_id=user_id)
             self._html(200, self._layout("Действия", body, sess["csrf"], active="actions"))
         finally:
             conn.close()
@@ -1645,7 +1674,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             read = self._read_multipart()
             if read is None:
-                body = pages.actions_page(sess["csrf"], result="Запрос повреждён или файл превышает потолок размера.")
+                body = pages.actions_page(sess["csrf"], result="Запрос повреждён или файл превышает потолок размера.", user_id=user_id)
                 return self._html(400, self._layout("Действия", body, sess["csrf"], active="actions"))
             content_type, raw_body = read
             fields = upload.parse_multipart(content_type, raw_body)
@@ -1653,20 +1682,22 @@ class Handler(BaseHTTPRequestHandler):
             csrf_val = fields.get("csrf_token")
             if not isinstance(csrf_val, str) or not auth.csrf_ok(sess, csrf_val):
                 return self._error_page(403, "Неверный CSRF-токен.")
+            if self._persona_changed(fields.get("form_user_id"), user_id):
+                return
 
             if user_id is None:
-                body = pages.actions_page(sess["csrf"], result="Нет пользователя в базе.")
+                body = pages.actions_page(sess["csrf"], result="Нет пользователя в базе.", user_id=user_id)
                 return self._html(400, self._layout("Действия", body, sess["csrf"], active="actions"))
 
             file_field = fields.get("file")
             if not isinstance(file_field, tuple) or not file_field[0]:
-                body = pages.actions_page(sess["csrf"], result="Файл не выбран.")
+                body = pages.actions_page(sess["csrf"], result="Файл не выбран.", user_id=user_id)
                 return self._html(400, self._layout("Действия", body, sess["csrf"], active="actions"))
             filename, data = file_field
 
             ok, message = _import_scale_upload(conn, user_id, filename, data)
             status = 200 if ok else 400
-            body = pages.actions_page(sess["csrf"], result=message)
+            body = pages.actions_page(sess["csrf"], result=message, user_id=user_id)
             self._html(status, self._layout("Действия", body, sess["csrf"], active="actions"))
         finally:
             conn.close()
@@ -1944,45 +1975,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-    def _post_actions_password(self):
-        ctx = self._check_auth()
-        if not ctx:
-            return
-        conn, user_id, token, sess = ctx
-        conn.close()
-        
-        form = self._read_form()
-        if not auth.csrf_ok(sess, form.get("csrf_token")):
-            return self._error_page(403, "Неверный CSRF-токен.")
-
-        new_pwd = form.get("new_password", "")
-        if len(new_pwd) < auth.MIN_PASSWORD_LEN:
-            body = pages.actions_page(sess["csrf"], result=f"Пароль должен быть не короче {auth.MIN_PASSWORD_LEN} символов.")
-            return self._html(400, self._layout("Действия", body, sess["csrf"], active="actions"))
-        
-        salt = os.urandom(16)
-        digest = auth.hash_password(new_pwd, salt)
-        salt_hex = salt.hex()
-        hash_hex = digest.hex()
-        
-        try:
-            with open(auth.ENV_PATH, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-                
-            with open(auth.ENV_PATH, "w", encoding="utf-8") as f:
-                for line in lines:
-                    if line.startswith("ADMIN_PASSWORD_HASH="):
-                        f.write(f"ADMIN_PASSWORD_HASH={hash_hex}\n")
-                    elif line.startswith("ADMIN_PASSWORD_SALT="):
-                        f.write(f"ADMIN_PASSWORD_SALT={salt_hex}\n")
-                    else:
-                        f.write(line)
-                        
-            auth.load_env_file(force=True)
-            
-            body = pages.actions_page(sess["csrf"], result="Пароль успешно изменён.")
-            return self._html(200, self._layout("Действия", body, sess["csrf"], active="actions"))
-        except Exception as e:
-            body = pages.actions_page(sess["csrf"], result=f"Ошибка при сохранении пароля: {e}")
-            return self._html(500, self._layout("Действия", body, sess["csrf"], active="actions"))

@@ -15,7 +15,6 @@ except ImportError:
 import asyncio
 import base64
 import contextlib
-import html
 import io
 import json
 import logging
@@ -309,7 +308,7 @@ async def send_long(message: Message, text: str) -> None:
             # Разметка от модели бывает битой. Логируем причину: без неё
             # «бот молчит» неотличимо от «бот не понял».
             log.warning("разметка отвергнута (%s), шлём без неё", e)
-            sent = await message.answer(html.escape(chunk), parse_mode=None)
+            sent = await message.answer(chunk, parse_mode=None)
             log.info("отправлено без разметки chat=%s message_id=%s",
                      message.chat.id, sent.message_id)
 
@@ -415,9 +414,33 @@ def switch_model_cmd(args: str) -> str:
     )
 
 
-def _resolve_uid_to_user_id(conn, uid: str) -> int:
+async def _cb_allowed(callback: CallbackQuery) -> bool:
+    """Тот же доступ, что и у сообщений: админ или approved. Новых заявок
+    из callback не заводим - только проверяем."""
+    uid = str(callback.from_user.id)
+    if uid not in admin_user_ids():
+        def _status() -> str | None:
+            conn = connect()
+            try:
+                row = conn.execute(
+                    "SELECT status FROM access_list WHERE telegram_user_id=?", (uid,)
+                ).fetchone()
+                return row["status"] if row else None
+            finally:
+                conn.close()
+        if await asyncio.to_thread(_status) != "approved":
+            await callback.answer("Нет доступа", show_alert=True)
+            return False
+    return True
+
+
+_NOT_REGISTERED = "Профиль ещё не зарегистрирован. Сначала напиши боту о себе."
+
+
+def _resolve_uid_to_user_id(conn, uid: str) -> int | None:
+    # Нет строки - None: подстановка чужого users.id=1 читала и писала данные другого человека.
     row = conn.execute("SELECT id FROM users WHERE telegram_user_id=?", (uid,)).fetchone()
-    return row["id"] if row else 1
+    return row["id"] if row else None
 
 
 def _format_target_interactive(uid: str, args: str = "") -> tuple[str, InlineKeyboardMarkup | None]:
@@ -425,6 +448,8 @@ def _format_target_interactive(uid: str, args: str = "") -> tuple[str, InlineKey
     conn = connect()
     try:
         user_id = _resolve_uid_to_user_id(conn, uid)
+        if user_id is None:
+            return _NOT_REGISTERED, None
 
         args = args.strip()
         target_kcal = None
@@ -593,6 +618,8 @@ def _format_target_option_preview(uid: str, opt_name: str) -> tuple[str, InlineK
     conn = connect()
     try:
         user_id = _resolve_uid_to_user_id(conn, uid)
+        if user_id is None:
+            return _NOT_REGISTERED, None
         res = _fc.calibrate(conn, user_id)
         if "error" in res:
             return f"ℹ️ {res['error']}", None
@@ -639,6 +666,8 @@ def _apply_target(uid: str, kcal: float) -> tuple[str, InlineKeyboardMarkup | No
     conn = connect()
     try:
         user_id = _resolve_uid_to_user_id(conn, uid)
+        if user_id is None:
+            return _NOT_REGISTERED, None
         res = _fc.calibrate(conn, user_id, target_kcal=kcal, apply=True)
         if "error" in res:
             return f"❌ {res['error']}", None
@@ -676,6 +705,8 @@ def _format_plateau_interactive(uid: str, args: str = "") -> tuple[str, InlineKe
     conn = connect()
     try:
         user_id = _resolve_uid_to_user_id(conn, uid)
+        if user_id is None:
+            return _NOT_REGISTERED, None
         res = _fc.plateau_forecast(conn, user_id)
         if "error" in res:
             return f"ℹ️ {res['error']}", None
@@ -754,6 +785,8 @@ def _format_forecast_interactive(uid: str, args: str = "") -> tuple[str, InlineK
     conn = connect()
     try:
         user_id = _resolve_uid_to_user_id(conn, uid)
+        if user_id is None:
+            return _NOT_REGISTERED, None
         intake = None
         args = args.strip()
         if args and args.replace(".", "", 1).isdigit():
@@ -841,7 +874,7 @@ async def _notify_admins_of_request(bot: Bot, uid: str, from_user) -> None:
     )
     for admin_id in admin_user_ids():
         try:
-            await bot.send_message(int(admin_id), text)
+            await bot.send_message(int(admin_id), text, parse_mode=None)
         except Exception:
             log.exception("не удалось уведомить администратора %s о заявке %s", admin_id, uid)
 
@@ -1165,7 +1198,7 @@ async def _handle_document(message: Message, uid: str) -> None:
     doc = message.document
     if not doc:
         return
-    filename = doc.file_name or "uploaded_file"
+    filename = Path(doc.file_name or "uploaded_file").name or "uploaded_file"
     log.info("получен файл %s (%d байт) от user %s", filename, doc.file_size or 0, uid)
     
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1178,23 +1211,30 @@ async def _handle_document(message: Message, uid: str) -> None:
             import migrate as _mig
             extract_dir = Path(tmp_dir) / "unzipped"
             extract_dir.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(tmp_path, "r") as zf:
-                zf.extractall(extract_dir)
-            
-            conn = connect()
-            try:
-                user_id_row = conn.execute("SELECT id FROM users WHERE telegram_user_id=?", (uid,)).fetchone()
-                user_id = user_id_row["id"] if user_id_row else 1
-                
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    _mig.run_scale(conn, user_id, str(extract_dir))
-                    _mig.run_tcx(conn, user_id, str(extract_dir))
-                conn.commit()
-                out = buf.getvalue().strip() or "Файлы из zip обработаны."
-                await message.answer(f"📦 Разобран zip-архив `{filename}`:\n\n{out}", parse_mode=ParseMode.MARKDOWN)
-            finally:
-                conn.close()
+
+            def _import_zip() -> str | None:
+                # Блокирующее (распаковка + sqlite) - в потоке, не на event loop.
+                with zipfile.ZipFile(tmp_path, "r") as zf:
+                    zf.extractall(extract_dir)
+                conn = connect()
+                try:
+                    user_id = _resolve_uid_to_user_id(conn, uid)
+                    if user_id is None:
+                        return None
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        _mig.run_scale(conn, user_id, str(extract_dir))
+                        _mig.run_tcx(conn, user_id, str(extract_dir))
+                    conn.commit()
+                    return buf.getvalue().strip() or "Файлы из zip обработаны."
+                finally:
+                    conn.close()
+
+            out = await asyncio.to_thread(_import_zip)
+            if out is None:
+                await message.answer(_NOT_REGISTERED, parse_mode=None)
+            else:
+                await message.answer(f"Разобран zip-архив {filename}:\n\n{out}", parse_mode=None)
             return
 
         # Иначе пробуем стандартный импорт файла (TCX, XLSX, CSV)
@@ -1609,6 +1649,8 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
 
         @dp.callback_query(lambda c: bool(c.data and c.data.startswith("target_opt:")))
         async def _on_target_opt(callback: CallbackQuery) -> None:
+            if not await _cb_allowed(callback):
+                return
             cb_uid = str(callback.from_user.id)
             opt_name = (callback.data or "").split(":", 1)[1]
             await callback.answer()
@@ -1627,6 +1669,8 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
 
         @dp.callback_query(lambda c: bool(c.data and c.data.startswith("target_apply:")))
         async def _on_target_apply(callback: CallbackQuery) -> None:
+            if not await _cb_allowed(callback):
+                return
             cb_uid = str(callback.from_user.id)
             try:
                 kcal_val = float((callback.data or "").split(":", 1)[1])
@@ -1634,6 +1678,9 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
                 await callback.answer("Неверное значение калорий.")
                 return
             msg_text, kb = await asyncio.to_thread(_apply_target, cb_uid, kcal_val)
+            if msg_text == _NOT_REGISTERED:
+                await callback.answer(_NOT_REGISTERED, show_alert=True)
+                return
             await callback.answer(f"✅ Цель {kcal_val:.0f} ккал зафиксирована!")
             try:
                 if callback.message:
@@ -1649,6 +1696,8 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
 
         @dp.callback_query(lambda c: bool(c.data in ("target_back", "nav_target")))
         async def _on_nav_target(callback: CallbackQuery) -> None:
+            if not await _cb_allowed(callback):
+                return
             cb_uid = str(callback.from_user.id)
             await callback.answer()
             msg_text, kb = await asyncio.to_thread(_format_target_interactive, cb_uid, "")
@@ -1666,6 +1715,8 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
 
         @dp.callback_query(lambda c: bool(c.data == "nav_plateau"))
         async def _on_nav_plateau(callback: CallbackQuery) -> None:
+            if not await _cb_allowed(callback):
+                return
             cb_uid = str(callback.from_user.id)
             await callback.answer()
             msg_text, kb = await asyncio.to_thread(_format_plateau_interactive, cb_uid, "")
@@ -1683,6 +1734,8 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
 
         @dp.callback_query(lambda c: bool(c.data == "nav_forecast"))
         async def _on_nav_forecast(callback: CallbackQuery) -> None:
+            if not await _cb_allowed(callback):
+                return
             cb_uid = str(callback.from_user.id)
             await callback.answer()
             msg_text, kb = await asyncio.to_thread(_format_forecast_interactive, cb_uid, "")
@@ -1700,11 +1753,16 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
 
         @dp.callback_query(lambda c: bool(c.data == "plateau_refeed"))
         async def _on_plateau_refeed(callback: CallbackQuery) -> None:
+            if not await _cb_allowed(callback):
+                return
             cb_uid = str(callback.from_user.id)
             from health_core import refeed as _refeed
             conn = connect()
             try:
                 user_id = _resolve_uid_to_user_id(conn, cb_uid)
+                if user_id is None:
+                    await callback.answer(_NOT_REGISTERED, show_alert=True)
+                    return
                 tomorrow = (config.user_now(conn, user_id).date() + __import__('datetime').timedelta(days=1))
                 res = _refeed.schedule_once(conn, user_id, tomorrow, days=4, reason="plateau")
             finally:
@@ -1726,10 +1784,15 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
 
         @dp.callback_query(lambda c: bool(c.data == "plateau_council"))
         async def _on_plateau_council(callback: CallbackQuery) -> None:
+            if not await _cb_allowed(callback):
+                return
             cb_uid = str(callback.from_user.id)
             conn = connect()
             try:
                 user_id = _resolve_uid_to_user_id(conn, cb_uid)
+                if user_id is None:
+                    await callback.answer(_NOT_REGISTERED, show_alert=True)
+                    return
                 try:
                     run_id = council.reserve(conn, user_id, "plateau")
                 except ValueError as e:

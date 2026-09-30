@@ -795,17 +795,24 @@ def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
         carbs_g = round(max(0.0, kcal - protein_g * 4 - fat_g * 9) / 4.0, 1)
 
     from health_core.config import user_today
-    if date <= user_today(conn, user_id):
-        conn.execute(
-            "INSERT INTO daily_targets(user_id, date, kcal_target, protein_g_target, fat_g_target, "
-            "carbs_g_target, fiber_g_target, water_ml_target, computed_from, kcal_floor) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(user_id, date) DO UPDATE SET "
+    today = user_today(conn, user_id)
+    if date <= today:
+        # Прошлые дни заморожены: пересчёт по сегодняшнему весу не должен менять
+        # историческую цель (её читают UNDEREATING и отчёты), только создать, если строки нет.
+        on_conflict = (
+            "DO UPDATE SET "
             "kcal_target=excluded.kcal_target, protein_g_target=excluded.protein_g_target, "
             "fat_g_target=excluded.fat_g_target, carbs_g_target=excluded.carbs_g_target, "
             "fiber_g_target=excluded.fiber_g_target, "
             "water_ml_target=excluded.water_ml_target, computed_from=excluded.computed_from, "
-            "kcal_floor=excluded.kcal_floor",
+            "kcal_floor=excluded.kcal_floor"
+            if date == today else "DO NOTHING"
+        )
+        conn.execute(
+            "INSERT INTO daily_targets(user_id, date, kcal_target, protein_g_target, fat_g_target, "
+            "carbs_g_target, fiber_g_target, water_ml_target, computed_from, kcal_floor) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, date) " + on_conflict,
             (user_id, date, kcal, protein_g, fat_g, carbs_g, targets.get("fiber_g"),
              targets.get("water_ml"), source, floor),
         )

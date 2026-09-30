@@ -9,6 +9,7 @@ import tempfile
 import textwrap
 from datetime import datetime, date, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from health_core.db import connect, migrate
 from health_core.guards import check_all, record
@@ -240,6 +241,18 @@ def _norm_event_ts(value: str | None, conn: sqlite3.Connection | None = None, us
     return ts
 
 
+def _year_is_stale(raw: str, today_iso: str) -> bool:
+    """Модель подставляет 2024/2025 вместо текущего года. Правим год только если дата
+    старше окна правдоподобия (её отвергла бы _norm_event_ts); законная дата прошлого года остаётся."""
+    if not raw.startswith(("2024-", "2025-")):
+        return False
+    try:
+        age = (datetime.strptime(today_iso[:10], "%Y-%m-%d") - datetime.strptime(raw[:10], "%Y-%m-%d")).days
+    except ValueError:
+        return False
+    return age > _EVENT_TS_PAST_DAYS
+
+
 def _today_iso(conn: sqlite3.Connection | None = None, user_id: int | None = None) -> str:
     """Today as ISO date string in user's timezone."""
     if conn is not None and user_id is not None:
@@ -439,7 +452,7 @@ def handle_log_food(params: dict) -> str:
     raw_eaten = params.get("eaten_at")
     if raw_eaten:
         cur_year = str(config.user_now(conn, user_id).year)
-        if raw_eaten.startswith(("2024-", "2025-")):
+        if _year_is_stale(raw_eaten, _today_iso(conn, user_id)):
             raw_eaten = cur_year + raw_eaten[4:]
     eaten_at = _norm_event_ts(raw_eaten, conn, user_id) or _now_iso(conn, user_id)
 
@@ -769,7 +782,7 @@ def handle_log_water(params: dict) -> str:
         clear_day = bool(params.get("clear_day") or params.get("all"))
         water_id = params.get("water_id")
 
-        if clear_day or (water_id is None and params.get("date")):
+        if clear_day:
             # Удалить всю воду за указанную дату
             deleted_rows = conn.execute(
                 "SELECT id, volume_ml, at FROM water_log WHERE user_id=? AND date(at)=?",
@@ -1667,7 +1680,11 @@ def handle_log_anthropometry(params: dict) -> str:
 
     site = params.get("site")
     value_cm = params.get("value_cm")
-    measured_on = params.get("measured_on") or _today_iso(conn, user_id)
+    try:
+        measured_on = _norm_ts(params.get("measured_on"))[:10] if params.get("measured_on") else _today_iso(conn, user_id)
+    except ValueError as e:
+        conn.close()
+        return json.dumps({"error": f"measured_on: {e}"}, ensure_ascii=False)
 
     # site — реальный гейт, не только enum в схеме: report.whr()/trends() ищут
     # ЛИТЕРАЛЬНО site='талия'/'таз' (health_core/ingest/anthro.SITES). Английское
@@ -1699,10 +1716,14 @@ def handle_log_anthropometry(params: dict) -> str:
     # Insert anthropometry
     cur = conn.execute(
         "INSERT INTO anthropometry(user_id, measured_on, site, value_cm) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(user_id, measured_on, site) DO NOTHING",
+        "ON CONFLICT(user_id, measured_on, site) DO UPDATE SET value_cm=excluded.value_cm",
         (user_id, measured_on, site, value_cm),
     )
-    anthropometry_id = cur.lastrowid
+    # lastrowid при UPDATE по конфликту устарел — берём id строки явно
+    anthropometry_id = conn.execute(
+        "SELECT id FROM anthropometry WHERE user_id=? AND measured_on=? AND site=?",
+        (user_id, measured_on, site),
+    ).fetchone()["id"]
     conn.commit()
 
     # Check guards and record alerts
@@ -1856,13 +1877,23 @@ def handle_log_med(params: dict) -> str:
     ).fetchone()
     dose_differs = False
     if sched is not None:
-        new_stock = None if sched["stock_doses"] is None else max(0.0, sched["stock_doses"] - 1)
-        new_next = sched["next_at"]
-        if sched["every_days"]:
-            new_next = _advance_next(sched["next_at"] or at, sched["every_days"])
-        conn.execute("UPDATE med_schedule SET stock_doses=?, next_at=?, updated_at=? WHERE id=?",
-                     (new_stock, new_next, _now_iso(), sched["id"]))
-        conn.commit()
+        # Приём задним числом (раньше уже записанной дозы) не двигает расписание и остаток
+        last_at = conn.execute(
+            "SELECT MAX(at) m FROM med_log WHERE user_id=? AND substance=? AND id<>?",
+            (user_id, drug, med_id),
+        ).fetchone()["m"]
+        if not (last_at and at < last_at):
+            new_stock = None if sched["stock_doses"] is None else max(0.0, sched["stock_doses"] - 1)
+            new_next = sched["next_at"]
+            if sched["every_days"]:
+                # Шагаем по сетке расписания, пока не окажемся после фактического приёма:
+                # поздняя доза не оставляет просроченный next_at, а день недели не уползает.
+                new_next = _advance_next(sched["next_at"] or at, sched["every_days"])
+                while new_next <= at:
+                    new_next = _advance_next(new_next, sched["every_days"])
+            conn.execute("UPDATE med_schedule SET stock_doses=?, next_at=?, updated_at=? WHERE id=?",
+                         (new_stock, new_next, _now_iso(), sched["id"]))
+            conn.commit()
         # Фактический приём записывается всегда; несовпадение с расписанием —
         # просто пометка в ответе, не отказ (docs/adr/0002).
         actual = _dose_num(dose)
@@ -2463,7 +2494,7 @@ def handle_get_day_summary(params: dict) -> str:
     cur_today = _today_iso(conn, user_id)
     if not raw_date:
         date_str = cur_today
-    elif raw_date.startswith(("2024-", "2025-")) and raw_date[5:10] == cur_today[5:10]:
+    elif _year_is_stale(raw_date, cur_today) and raw_date[5:10] == cur_today[5:10]:
         date_str = cur_today
     else:
         date_str = raw_date
@@ -3099,10 +3130,12 @@ def _render_day_dashboard(conn, user_id: int, date_str: str) -> str:
     # включая жир/углеводы. Иначе первый рендер для свежей даты берёт из day_summary
     # ещё пустые fat/carbs_g_target и не рисует их прогресс-бары.
     tgt_row = conn.execute(
-        "SELECT protein_g_target, fat_g_target, carbs_g_target, fiber_g_target "
+        "SELECT kcal_target, protein_g_target, fat_g_target, carbs_g_target, fiber_g_target "
         "FROM daily_targets WHERE user_id=? AND date=?",
         (user_id, date_str),
     ).fetchone()
+    if tgt_row and tgt_row["kcal_target"] is not None:
+        kcal_target = tgt_row["kcal_target"]  # прошлые дни заморожены в daily_targets, свежий пересчёт их не меняет
     protein_target = tgt_row["protein_g_target"] if tgt_row else None
     fat_target = tgt_row["fat_g_target"] if tgt_row else None
     carbs_target = tgt_row["carbs_g_target"] if tgt_row else None
@@ -3334,11 +3367,11 @@ def _check_dose_bounds(conn, user_id: int, substance: str, dose_f: float, card_d
     терапии (>14 дней без приёма) — не выше прежней дозы."""
     ladder = card_data["ladder"]
     note = _ladder_note(ladder)
+    if dose_f > max(ladder) + 1e-6:
+        return f"{dose_f:g} выше максимума {max(ladder):g}. {note}", False
     idx_new = _ladder_step(ladder, dose_f)
     if idx_new is None:
         return f"{dose_f:g} — не ступень лестницы титрации. {note}", False
-    if dose_f > max(ladder) + 1e-6:
-        return f"{dose_f:g} выше максимума {max(ladder):g}. {note}", False
 
     last_log = conn.execute(
         "SELECT at, dose FROM med_log WHERE user_id=? AND substance=? ORDER BY at DESC LIMIT 1",
@@ -3361,6 +3394,8 @@ def _check_dose_bounds(conn, user_id: int, substance: str, dose_f: float, card_d
         "SELECT dose FROM med_schedule WHERE user_id=? AND substance=?", (user_id, substance)
     ).fetchone()
     current_dose = current["dose"] if current else None
+    if current_dose is None and last_log is not None:
+        current_dose = _dose_num(last_log["dose"])  # нет расписания — текущая доза по последнему приёму
     if current_dose is None or dose_f <= current_dose + 1e-6:
         return None, False  # снижение/та же ступень/первое расписание — без ограничений
 
@@ -4410,6 +4445,7 @@ def handle_get_weekly_summary(params: dict) -> str:
     return json.dumps({"weekly_summary": text}, ensure_ascii=False)
 
 
+@_handler_wrapper
 def handle_get_evening_report(params: dict) -> str:
     """Вечерний отчёт §11 — готовая строка, агентный cron в 21:30 её пересказывает."""
     conn = connect()
@@ -4601,7 +4637,7 @@ def handle_register_user(params: dict) -> str:
     # которая проходит и оставляет NULL, — это ложный успех: инструмент отвечает
     # «готово», а система остаётся без цели. Требуем их на создании.
     existing_row = conn.execute(
-        "SELECT height_cm, birth_date, sex FROM users WHERE telegram_user_id=?",
+        "SELECT height_cm, birth_date, sex, meal_windows FROM users WHERE telegram_user_id=?",
         (telegram_user_id,),
     ).fetchone()
     _missing = [
@@ -4614,6 +4650,34 @@ def handle_register_user(params: dict) -> str:
             {"error": f"Не хватает полей профиля: {', '.join(_missing)}. "
                       f"Без них не посчитать BMR и целевой калораж."},
             ensure_ascii=False)
+
+    # Непереданные поля не трогаем (COALESCE), переданные проверяем до записи.
+    if sex is not None:
+        sex = {"m": "m", "male": "m", "м": "m", "f": "f", "female": "f", "ж": "f"}.get(str(sex).strip().lower())
+        if sex is None:
+            conn.close()
+            return json.dumps({"error": "sex должен быть m или f"}, ensure_ascii=False)
+    if birth_date is not None:
+        try:
+            date.fromisoformat(str(birth_date))
+        except ValueError:
+            conn.close()
+            return json.dumps({"error": f"birth_date должна быть датой YYYY-MM-DD, получено {birth_date!r}"},
+                              ensure_ascii=False)
+    if timezone is not None:
+        try:
+            ZoneInfo(str(timezone))
+        except (ZoneInfoNotFoundError, ValueError):
+            conn.close()
+            return json.dumps({"error": f"timezone: неизвестный часовой пояс {timezone!r} (пример: Europe/Moscow)"},
+                              ensure_ascii=False)
+    # Частичное обновление окон не должно стирать ранее сохранённые приёмы
+    if meal_windows_param is not None and existing_row is not None and existing_row["meal_windows"]:
+        try:
+            meal_windows_json = json.dumps(
+                {**json.loads(existing_row["meal_windows"]), **meal_windows_param}, ensure_ascii=False)
+        except ValueError:
+            pass
 
     # UPDATE first: rowcount тут и есть проверка "пользователь уже существует",
     # без отдельного SELECT-чека, который может разойтись с реальной записью.
@@ -4706,11 +4770,20 @@ def handle_set_milestone(params: dict) -> str:
         conn.close()
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
+    # Validate and normalize deadline
+    deadline = (deadline or "").strip() or None
+    if deadline is not None:
+        try:
+            date.fromisoformat(deadline[:10])
+        except ValueError:
+            conn.close()
+            return json.dumps({"error": "deadline должен быть в формате YYYY-MM-DD"}, ensure_ascii=False)
+
     # UPSERT milestone
     conn.execute(
         "INSERT INTO milestones(user_id, name, metric, threshold, deadline) "
         "VALUES (?, ?, ?, ?, ?) "
-        "ON CONFLICT(user_id, name) DO UPDATE SET metric=?, threshold=?, deadline=?",
+        "ON CONFLICT(user_id, name) DO UPDATE SET metric=?, threshold=?, deadline=?, achieved_at=NULL",
         (user_id, name, metric, threshold, deadline, metric, threshold, deadline),
     )
     conn.commit()
@@ -4783,17 +4856,8 @@ def handle_admin_cmd(params: dict) -> str:
         return json.dumps({"error": "Caller identity could not be identified"}, ensure_ascii=False)
 
     # Load config to check admin allowlist
-    cfg_path = Path(config.CONFIG_PATH)
-    try:
-        with open(cfg_path, encoding='utf-8') as f:
-            cfg = yaml.safe_load(f) or {}
-    except Exception as e:
-        return json.dumps({"error": f"Failed to load config: {e}"}, ensure_ascii=False)
-
-    admin_ids = cfg.get("admin", {}).get("telegram_admin_ids", [])
-    # Normalize both to strings for comparison: config may have ints, ContextVar yields string
-    admin_ids_str = [str(id_) for id_ in admin_ids]
-    is_admin_caller = caller_id in admin_ids_str
+    admin_ids = [str(i) for i in (config.load().get("admin", {}) or {}).get("telegram_admin_ids", [])]
+    is_admin_caller = caller_id in admin_ids
 
     # Parse command
     parts = command.split()
@@ -5331,7 +5395,7 @@ _WIPE_TABLES = (
     "food_log", "water_log", "glucose_log", "body_metrics", "anthropometry",
     "activity", "med_log", "alerts", "daily_targets", "import_log",
     "llm_calls", "refeed_days", "sick_days", "lab_results", "plan_log",
-    "side_effects", "my_products",
+    "side_effects", "my_products", "sleep_log", "daily_watch", "council_runs",
 )
 _WIPE_CONFIRM = "УДАЛИТЬ"
 
@@ -6979,7 +7043,7 @@ if __name__ == "__main__":
         row = rows[0]
         assert row["substance"] == "Тирзепатид", row["substance"]
         assert row["stock_doses"] == 3.0, f"остаток должен списаться 4->3, получили {row['stock_doses']}"
-        assert row["next_at"] == "2026-08-31 22:00:00", f"next_at должен уйти на +7 дней, получили {row['next_at']}"
+        assert row["next_at"] == "2026-08-31 22:00:00", f"next_at должен уйти на +7 дней по сетке, получили {row['next_at']}"
         # restock пополняет; remove убирает — тоже через алиасы.
         _rx(action="restock", substance="тирзетта", add_doses=2)
         assert conn.execute("SELECT stock_doses FROM med_schedule WHERE user_id=? AND substance='Тирзепатид'",

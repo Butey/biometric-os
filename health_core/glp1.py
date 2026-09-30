@@ -65,8 +65,8 @@ def _parse_dose(text) -> float | None:
     """Число из TEXT дозы ('12.5', '12.5 мг', ...). None, если не нашли."""
     if text is None:
         return None
-    m = re.search(r"[-+]?\d*\.?\d+", str(text))
-    return float(m.group()) if m else None
+    m = re.search(r"\d+(?:[.,]\d+)?", str(text))
+    return float(m.group().replace(",", ".")) if m else None
 
 
 def _parse_dt(s: str) -> datetime:
@@ -129,14 +129,24 @@ def profile(conn: sqlite3.Connection, user_id: int, substance: str | None = None
         now = config.local_now().replace(tzinfo=None)
 
     if substance is None:
-        last_row = conn.execute(
+        rows = conn.execute(
             "SELECT substance FROM med_log WHERE user_id=? AND (route IS NULL OR route='injection') "
-            "ORDER BY at DESC LIMIT 1",
+            "ORDER BY at DESC LIMIT 50",
             (user_id,),
-        ).fetchone()
-        if last_row is None:
+        ).fetchall()
+        seen = set()
+        substance = None
+        for row in rows:
+            if row["substance"] in seen:
+                continue
+            seen.add(row["substance"])
+            target = canon(row["substance"])
+            c = card(target)
+            if c and c.get("half_life_days") and c.get("tmax_h"):
+                substance = row["substance"]
+                break
+        if substance is None:
             return None
-        substance = last_row["substance"]
 
     target = canon(substance)
     c = card(target)
@@ -164,25 +174,29 @@ def profile(conn: sqlite3.Connection, user_id: int, substance: str | None = None
     last_at, last_dose = doses[-1]
 
     next_at = None
+    every_days = None
     for r in conn.execute(
-        "SELECT substance, next_at FROM med_schedule WHERE user_id=?", (user_id,)
+        "SELECT substance, next_at, every_days FROM med_schedule WHERE user_id=?", (user_id,)
     ).fetchall():
         if r["next_at"] and canon(r["substance"]) == target:
             next_at = _parse_dt(r["next_at"])
+            every_days = r["every_days"]
             break
+
+    step = timedelta(days=float(every_days) if every_days and every_days > 0 else 7)
     if next_at is None:
-        next_at = last_at + timedelta(days=7)
+        next_at = last_at + step
 
     # Прогноз будущих доз: та же доза, что последняя фактическая, раз в
-    # неделю начиная с next_at (просроченный next_at докручиваем вперёд).
+    # интервал начиная с next_at (просроченный next_at докручиваем вперёд).
     window_end = now + timedelta(days=7)
     t = next_at
     while t < now:
-        t += timedelta(days=7)
+        t += step
     future: list[tuple[datetime, float]] = []
     while t <= window_end:
         future.append((t, last_dose))
-        t += timedelta(days=7)
+        t += step
     next_dose_ref = future[0][0] if future else next_at
 
     all_doses = doses + future
@@ -250,6 +264,10 @@ if __name__ == "__main__":
     HALF_LIFE_DAYS, TMAX_H = 5.0, 24.0
     KE = math.log(2) / (HALF_LIFE_DAYS * 24)
     KA = _solve_ka(KE, TMAX_H)
+
+    # 0b) _parse_dose понимает десятичные запятые.
+    assert _parse_dose("2,5 мг") == 2.5, _parse_dose("2,5 мг")
+    print("OK: _parse_dose('2,5 мг') = 2.5")
 
     # 1) Пик одиночной дозы ≈ Tmax.
     fine = [h * 0.1 for h in range(0, 1000)]  # 0..100ч шагом 6 мин

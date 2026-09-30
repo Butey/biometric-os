@@ -159,14 +159,19 @@ def report_failure(script: str, proc: subprocess.CompletedProcess, token: str) -
     text = f"{script} упал (код {proc.returncode}):\n{proc.stderr.strip()[:3000]}"
     print(text, file=sys.stderr)
     for admin_id in admin_ids():
-        send(token, admin_id, text)
+        try:
+            send(token, admin_id, text)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            print(f"не доставлено админу {admin_id}: {e}", file=sys.stderr)
 
 
-def deliver(token: str, script: str, targets: list[tuple[int | None, str]]) -> bool:
-    """targets — (db user id или None, telegram id). Один и тот же user_id
+def deliver(token: str, script: str, targets: list[tuple[int | None, str]]) -> tuple[bool, bool]:
+    """Возвращает (had_error, send_failed): had_error — сбой скрипта или отправки,
+    send_failed — не доставлено в телеграм (диспетчер по нему отпускает слот).
+    targets — (db user id или None, telegram id). Один и тот же user_id
     (например None у всех админов) гоняем один раз и переиспользуем — иначе
     export_backup.py под --admins сделает по бэкапу на каждого админа."""
-    had_error = False
+    had_error = send_failed = False
     cache: dict[int | None, subprocess.CompletedProcess] = {}
     for user_id, chat_id in targets:
         if user_id not in cache:
@@ -185,9 +190,10 @@ def deliver(token: str, script: str, targets: list[tuple[int | None, str]]) -> b
             continue
         try:
             send(token, chat_id, text)
-        except urllib.error.URLError as e:
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
             print(f"не доставлено {chat_id}: {e}", file=sys.stderr)
-    return had_error
+            had_error = send_failed = True
+    return had_error, send_failed
 
 
 def main() -> int:
@@ -215,7 +221,7 @@ def main() -> int:
     else:
         targets = [target_for(args.to)]
 
-    had_error = deliver(token, args.script, targets)
+    had_error, _ = deliver(token, args.script, targets)
     return 1 if had_error else 0
 
 

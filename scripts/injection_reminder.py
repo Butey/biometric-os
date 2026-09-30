@@ -14,6 +14,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from health_core.config import user_today
 from health_core.db import connect, migrate, get_target_users
+from health_core.meds import card
 
 
 def injection_block(conn, user_row: dict, today: str) -> str | None:
@@ -29,11 +30,14 @@ def injection_block(conn, user_row: dict, today: str) -> str | None:
     """
     user_id = user_row["id"]
     rows = conn.execute(
-        "SELECT substance, dose, unit, next_at FROM med_schedule "
-        "WHERE user_id=? AND route='injection' AND next_at IS NOT NULL "
+        "SELECT substance, dose, unit, next_at, route FROM med_schedule "
+        "WHERE user_id=? AND (route='injection' OR route IS NULL) AND next_at IS NOT NULL "
         "ORDER BY next_at",
         (user_id,)
     ).fetchall()
+    # pharma schedule оставляет route пустым, если модель его не передала: тогда
+    # инъекцией считаем препарат, у чьей карты есть период полувыведения (GLP-1, раз в неделю)
+    rows = [r for r in rows if r["route"] == "injection" or (card(r["substance"]) or {}).get("half_life_days")]
 
     blocks = []
 
@@ -49,9 +53,9 @@ def injection_block(conn, user_row: dict, today: str) -> str | None:
 
         if scheduled_date == today:
             # Injection today
-            dose_str = f"{dose:g}" if isinstance(dose, (int, float)) else str(dose)
-            unit_str = f" {unit}" if unit else ""
-            blocks.append(f"💉 Сегодня инъекция: {substance} {dose_str}{unit_str} в {scheduled_time}.")
+            dose_str = f" {dose:g}" if isinstance(dose, (int, float)) else (f" {dose}" if dose is not None else "")
+            unit_str = f" {unit}" if unit and dose is not None else ""
+            blocks.append(f"💉 Сегодня инъекция: {substance}{dose_str}{unit_str} в {scheduled_time}.")
         elif scheduled_date < today:
             # Injection overdue
             dd_mm = f"{scheduled_date[8:10]}.{scheduled_date[5:7]}"

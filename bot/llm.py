@@ -476,7 +476,13 @@ async def _run_one(call: dict, dispatch: Callable[[str, dict], str]) -> str:
         # Модель сама прислала битый JSON в аргументах — отдаём ей ошибку как результат инструмента
         log.warning("битые arguments у tool_call %s: %r (%s)", name, raw_args, exc)
         return json.dumps({"error": f"не удалось разобрать arguments: {exc}"}, ensure_ascii=False)
-    result = await asyncio.to_thread(dispatch, name, args)
+    try:
+        result = await asyncio.to_thread(dispatch, name, args)
+    except Exception as e:
+        # Ранние инструменты хода уже закоммитили в БД: не роняем ход, иначе история
+        # теряет их tool_calls и повтор пользователя дублирует запись.
+        log.exception("tool %s упал", name)
+        return json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
     log.info("tool %s(%s) -> %s", name, _short(raw_args), _short(result))
     return result
 
@@ -665,6 +671,23 @@ if __name__ == "__main__":
                 error_payload = json.loads(tool_msgs[0]["content"])
                 assert "error" in error_payload, error_payload
             print("OK: 5) битый JSON в arguments -> результат инструмента с ключом error, ход не падает")
+
+            # --- 5b. исключение в dispatch -> error как результат инструмента, ход не падает ---
+            queue = [
+                _resp(200, _msg(content=None, tool_calls=[tc])),
+                _resp(200, _msg(content="ок")),
+            ]
+
+            def _dispatch_raises(name, args):
+                raise TypeError("boom")
+
+            with patch(__name__ + "._post", _post_ok):
+                text, msgs = await run_loop(session, [{"role": "user", "content": "запиши"}], [{"type": "function"}],
+                                             PROVIDERS, _dispatch_raises)
+                assert text == "ок", text
+                tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+                assert "TypeError: boom" in json.loads(tool_msgs[0]["content"])["error"], tool_msgs
+            print("OK: 5b) исключение в dispatch -> error в результате инструмента, ход не падает")
 
             # --- 6. зацикливание на tool_calls обрывается по max_iters ---
             tc_loop = {"id": "call_x", "type": "function", "function": {"name": "noop", "arguments": "{}"}}

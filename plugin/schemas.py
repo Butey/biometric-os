@@ -858,7 +858,7 @@ register_user_schema = {
             "description": "Источник hr_max_bpm: 'test' — нагрузочный тест, 'watch' — часы/пульсометр"
         }
     },
-    "required": ["height_cm", "birth_date", "sex"]
+    "required": []  # height_cm/birth_date/sex обязательны только при создании профиля (хендлер проверяет сам)
 }
 
 set_milestone_schema = {

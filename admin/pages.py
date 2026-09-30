@@ -370,8 +370,14 @@ def _document(title: str, body_html: str) -> str:
     )
 
 
-def _csrf_field(csrf_token: str) -> str:
-    return f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">'
+def _csrf_field(csrf_token: str, user_id: int | None = None) -> str:
+    return f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">' + _uid_field(user_id)
+
+
+def _uid_field(user_id: int | None) -> str:
+    """Persona the form was rendered for; the server rejects the POST if the
+    session's persona changed meanwhile (another tab)."""
+    return f'<input type="hidden" name="form_user_id" value="{int(user_id)}">' if user_id is not None else ""
 
 
 def _user_selector_html(users: list[dict] | None, selected_user_id, current_path: str) -> str:
@@ -1140,7 +1146,7 @@ def guards_page(guards_status: list[dict], guards_cfg: dict, comments: dict[str,
 
 # ---------------------------------------------------------------- milestones
 
-def milestones_page(rows, valid_metrics, csrf_token: str, error: str | None = None) -> str:
+def milestones_page(rows, valid_metrics, csrf_token: str, error: str | None = None, user_id: int | None = None) -> str:
     err_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
     options = "".join(f'<option value="{html.escape(m)}">{html.escape(m)}</option>' for m in valid_metrics)
 
@@ -1157,7 +1163,7 @@ def milestones_page(rows, valid_metrics, csrf_token: str, error: str | None = No
                 f"<td>{_e(m.get('threshold'))}</td><td>{_e(m.get('deadline'))}</td>"
                 f"<td>{achieved}</td>"
                 f"<td><form method='post' action='/milestones' onsubmit='return true'>"
-                f"{_csrf_field(csrf_token)}"
+                f"{_csrf_field(csrf_token, user_id)}"
                 f"<input type='hidden' name='action' value='delete'>"
                 f"<input type='hidden' name='id' value='{m['id']}'>"
                 f"<button type='submit' class='danger'>Удалить</button></form></td>"
@@ -1175,7 +1181,7 @@ def milestones_page(rows, valid_metrics, csrf_token: str, error: str | None = No
   <p class="comment">Сохранение — UPSERT по (пользователь, имя): та же логика, что использует плагин. Существующее имя обновит веху, новое — создаст.</p>
   {err_html}
   <form method="post" action="/milestones">
-    {_csrf_field(csrf_token)}
+    {_csrf_field(csrf_token, user_id)}
     <input type="hidden" name="action" value="save">
     <div class="row">
       <div><label>Имя</label><input type="text" name="name" required></div>
@@ -1219,10 +1225,14 @@ def parse_config_comments(raw_text: str) -> dict[str, str]:
     return comments
 
 
+# Sections plugin.tools._admin_set is able to edit; keep in sync with its section loop.
+ADMIN_SET_SECTIONS = ("policy", "guards", "ingest", "backup", "admin")
+
+
 def flatten_config(parsed: dict) -> list[tuple[str, str, object]]:
     out = []
     for section, values in parsed.items():
-        if not isinstance(values, dict):
+        if section not in ADMIN_SET_SECTIONS or not isinstance(values, dict):
             continue
         for key, value in values.items():
             out.append((section, key, value))
@@ -1426,7 +1436,7 @@ def drafts_page(drafts: list[dict], csrf_token: str, error: str | None = None,
 
 # ---------------------------------------------------------------- actions
 
-def actions_page(csrf_token: str, result: str | None = None) -> str:
+def actions_page(csrf_token: str, result: str | None = None, user_id: int | None = None) -> str:
     result_html = f'<div class="card"><h3>Результат</h3><pre>{html.escape(result)}</pre></div>' if result else ""
 
     def form(action: str, label: str, hint: str) -> str:
@@ -1435,32 +1445,19 @@ def actions_page(csrf_token: str, result: str | None = None) -> str:
   <h3>{html.escape(label)}</h3>
   <p class="comment">{html.escape(hint)}</p>
   <form method="post" action="/actions">
-    {_csrf_field(csrf_token)}
+    {_csrf_field(csrf_token, user_id)}
     <input type="hidden" name="action" value="{action}">
     <button type="submit">Запустить</button>
   </form>
 </div>"""
 
 
-    password_form = f'''
-<div class="card">
-  <h3>Смена пароля администратора</h3>
-  <p class="comment">Новый пароль (минимум 12 символов). Будет записан в файл конфигурации ~/.hermes/.env и применен немедленно.</p>
-  <form method="post" action="/actions/password">
-    {_csrf_field(csrf_token)}
-    <div style="display: flex; gap: 10px; align-items: center; margin-top: 10px;">
-      <input type="password" name="new_password" placeholder="Новый пароль" minlength="12" required style="flex-grow: 1;">
-      <button type="submit">Сменить пароль</button>
-    </div>
-  </form>
-</div>'''
-
     scale_upload_html = f"""
 <div class="card">
   <h3>Загрузить файлы (весы / тренировки / ZIP-архив)</h3>
   <p class="comment">Принимает выгрузку весов Feelfit (.xlsx/.xls/.csv), тренировки (.tcx) или ZIP-архив (выгрузка Mi Fitness / папка с .tcx/.csv). Повторная загрузка тех же файлов безопасна — действует дедупликация по sha256.</p>
   <form method="post" action="/actions/import-scale" enctype="multipart/form-data">
-    {_csrf_field(csrf_token)}
+    {_csrf_field(csrf_token, user_id)}
     <div class="row">
       <div><label>Файл</label><input type="file" name="file" accept=".xlsx,.xls,.csv,.tcx,.zip" required></div>
       <div><button type="submit">Загрузить и импортировать</button></div>
@@ -1483,7 +1480,8 @@ def actions_page(csrf_token: str, result: str | None = None) -> str:
 # ---------------------------------------------------------------- plans
 
 def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: str | None,
-               selected_plan: dict | None, weekly_template: dict, csrf_token: str) -> str:
+               selected_plan: dict | None, weekly_template: dict, csrf_token: str,
+               user_id: int | None = None) -> str:
     """Dated plans (plan_log): recent plans at top, history list, full plan detail on selection,
     weekly templates at bottom.
 
@@ -1515,7 +1513,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
                     kind_label = "Тренировка" if kind == "workout" else "Питание"
                     link = f'<a href="/plans?date={_e(date)}">{kind_label}</a>'
                     del_form = f"""<form method="post" action="/plans/delete" style="display:inline;margin-left:8px;" data-confirm="Удалить план ({kind_label}) на {_e(date)}?">
-<input type="hidden" name="csrf" value="{csrf_token}">
+<input type="hidden" name="csrf" value="{csrf_token}">{_uid_field(user_id)}
 <input type="hidden" name="date" value="{_e(date)}">
 <input type="hidden" name="kind" value="{_e(kind)}">
 <button type="submit" class="btn-del" style="padding:2px 8px;font-size:12px;color:var(--danger);border:1px solid var(--border);border-radius:6px;background:transparent;cursor:pointer;">Удалить</button>
@@ -1539,7 +1537,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
             preview = (row["body_preview"][:80] + "…") if len(row["body_preview"]) > 80 else row["body_preview"]
             kind_label = "Тренировка" if k == "workout" else "Питание"
             del_btn = f"""<form method="post" action="/plans/delete" style="display:inline;" data-confirm="Удалить план ({kind_label}) на {_e(d)}?">
-<input type="hidden" name="csrf" value="{csrf_token}">
+<input type="hidden" name="csrf" value="{csrf_token}">{_uid_field(user_id)}
 <input type="hidden" name="date" value="{_e(d)}">
 <input type="hidden" name="kind" value="{_e(k)}">
 <button type="submit" class="btn-del">✕</button>
@@ -1559,7 +1557,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
         kind_label = "Тренировка" if selected_plan["kind"] == "workout" else "Питание"
         back_link = '<a href="/plans">← Вернуться к списку</a>'
         del_detail = f"""<form method="post" action="/plans/delete" style="display:inline;margin-left:12px;" data-confirm="Удалить план ({kind_label}) на {_e(selected_date)}?">
-<input type="hidden" name="csrf" value="{csrf_token}">
+<input type="hidden" name="csrf" value="{csrf_token}">{_uid_field(user_id)}
 <input type="hidden" name="date" value="{_e(selected_date)}">
 <input type="hidden" name="kind" value="{_e(selected_plan['kind'])}">
 <button type="submit" style="padding:4px 12px;font-size:13px;color:var(--danger);border:1px solid var(--danger);border-radius:6px;background:transparent;cursor:pointer;">Удалить этот план</button>
@@ -1572,7 +1570,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
   <h2>{_e(kind_label)} на {_e(selected_date)}</h2>
   <p>{back_link} {del_detail}</p>
   <form method="post" action="/plans/save" style="margin-top:16px;">
-    <input type="hidden" name="csrf" value="{csrf_token}">
+    <input type="hidden" name="csrf" value="{csrf_token}">{_uid_field(user_id)}
     <input type="hidden" name="date" value="{_e(selected_date)}">
     <input type="hidden" name="kind" value="{_e(selected_plan['kind'])}">
     
@@ -1593,7 +1591,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
         back_link = '<a href="/plans">← Вернуться к списку</a>'
         detail_html = f"""<div class="card"><p>{back_link}</p><p>Плана на {_e(selected_date)} нет.</p>
   <form method="post" action="/plans/save" style="margin-top:14px;">
-    <input type="hidden" name="csrf" value="{csrf_token}">
+    <input type="hidden" name="csrf" value="{csrf_token}">{_uid_field(user_id)}
     <input type="hidden" name="date" value="{_e(selected_date)}">
     <label style="display:block;margin-bottom:6px;font-weight:600;">Создать план:</label>
     <select name="kind" style="padding:6px 10px;margin-bottom:10px;border:1px solid var(--border);border-radius:6px;background:var(--bg2);color:var(--fg);">
@@ -1639,7 +1637,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
                 kcal = _n(m.get("kcal"), "{:.0f}")
                 raw_slot = m.get("meal_slot", "")
                 del_m = f"""<form method="post" action="/plans/template/delete" style="display:inline;margin-left:4px;" data-confirm="Удалить {slot}?">
-<input type="hidden" name="csrf" value="{csrf_token}">
+<input type="hidden" name="csrf" value="{csrf_token}">{_uid_field(user_id)}
 <input type="hidden" name="type" value="meal">
 <input type="hidden" name="day_of_week" value="{dow}">
 <input type="hidden" name="meal_slot" value="{html.escape(raw_slot)}">
@@ -1657,7 +1655,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
                 dur = _n(w.get("duration_min"), "{:.0f}")
                 raw_name = w.get("name", "")
                 del_w = f"""<form method="post" action="/plans/template/delete" style="display:inline;margin-left:4px;" data-confirm="Удалить тренировку {name}?">
-<input type="hidden" name="csrf" value="{csrf_token}">
+<input type="hidden" name="csrf" value="{csrf_token}">{_uid_field(user_id)}
 <input type="hidden" name="type" value="workout">
 <input type="hidden" name="day_of_week" value="{dow}">
 <input type="hidden" name="name" value="{html.escape(raw_name)}">
@@ -1673,7 +1671,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
     clear_template_btn = ""
     if any(meals_by_day.values()) or any(workouts_by_day.values()):
         clear_template_btn = f"""<form method="post" action="/plans/template/delete" style="display:inline;margin-left:12px;" data-confirm="Очистить весь недельный шаблон?">
-<input type="hidden" name="csrf" value="{csrf_token}">
+<input type="hidden" name="csrf" value="{csrf_token}">{_uid_field(user_id)}
 <input type="hidden" name="type" value="all">
 <button type="submit" style="padding:4px 10px;font-size:12px;color:var(--danger);border:1px solid var(--border);border-radius:6px;background:transparent;cursor:pointer;">Очистить шаблон</button>
 </form>"""
@@ -1689,7 +1687,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
   <summary style="font-weight:600;cursor:pointer;color:var(--accent);font-size:14px;">➕ Добавить элемент в недельный шаблон</summary>
   <div style="margin-top:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;">
     <form method="post" action="/plans/template/save" style="background:var(--card);padding:14px;border:1px solid var(--border);border-radius:10px;">
-      {_csrf_field(csrf_token)}
+      {_csrf_field(csrf_token, user_id)}
       <input type="hidden" name="type" value="meal">
       <h4 style="margin:0 0 10px;font-size:13px;text-transform:uppercase;color:var(--muted)">🥗 Добавить приём пищи</h4>
       <div style="display:flex;flex-direction:column;gap:8px">
@@ -1730,7 +1728,7 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
     </form>
 
     <form method="post" action="/plans/template/save" style="background:var(--card);padding:14px;border:1px solid var(--border);border-radius:10px;">
-      {_csrf_field(csrf_token)}
+      {_csrf_field(csrf_token, user_id)}
       <input type="hidden" name="type" value="workout">
       <h4 style="margin:0 0 10px;font-size:13px;text-transform:uppercase;color:var(--muted)">🏋️ Добавить тренировку</h4>
       <div style="display:flex;flex-direction:column;gap:8px">
@@ -1780,7 +1778,8 @@ def plans_page(recent_plans: list[dict], all_dates: list[dict], selected_date: s
 # ---------------------------------------------------------------- workouts
 
 def workouts_page(rows: list[dict], stats: dict, sports_efficiency: dict,
-                  csrf_token: str, error: str | None = None, message: str | None = None) -> str:
+                  csrf_token: str, error: str | None = None, message: str | None = None,
+                  user_id: int | None = None, now_local: str = "") -> str:
     """Страница тренировок: дашборд статистики/эффективности, форма быстрой записи и история."""
     err_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
     msg_html = f'<p class="msg">{html.escape(message)}</p>' if message else ""
@@ -1816,17 +1815,16 @@ def workouts_page(rows: list[dict], stats: dict, sports_efficiency: dict,
     eff_html = f'<div class="grid">{"".join(eff_cards)}</div>' if eff_cards else '<p>Нет данных по эффективности.</p>'
 
     # ── Форма добавления ──
-    now_date = datetime.now().strftime("%Y-%m-%d %H:%M")
     add_form = f"""
 <form method="post" action="/workouts/save" class="grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; align-items: end;">
-  <input type="hidden" name="csrf" value="{csrf_token}">
+  <input type="hidden" name="csrf" value="{csrf_token}">{_uid_field(user_id)}
   <div>
     <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px;">Вид спорта / активность:</label>
     <input type="text" name="sport" placeholder="Силовая, Гантели, Ходьба..." required style="width:100%">
   </div>
   <div>
     <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px;">Дата и время:</label>
-    <input type="text" name="started_at" value="{now_date}" style="width:100%">
+    <input type="text" name="started_at" value="{html.escape(now_local)}" style="width:100%">
   </div>
   <div>
     <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px;">Длительность (мин):</label>
@@ -1864,7 +1862,7 @@ def workouts_page(rows: list[dict], stats: dict, sports_efficiency: dict,
             source_val = r.get("source") or ("TCX" if r.get("file_hash") and not r.get("file_hash", "").startswith("manual") else "Вручную")
 
             del_btn = f"""<form method="post" action="/workouts/delete" style="display:inline;" data-confirm="Удалить тренировку #{w_id} ({_e(sport_val)})?">
-<input type="hidden" name="csrf" value="{csrf_token}">
+<input type="hidden" name="csrf" value="{csrf_token}">{_uid_field(user_id)}
 <input type="hidden" name="workout_id" value="{w_id}">
 <button type="submit" class="btn-del">✕</button>
 </form>"""

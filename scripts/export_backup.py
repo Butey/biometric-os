@@ -61,12 +61,17 @@ def main() -> int:
     if not sync_users:
         lines.append("Экспорт пропущен: в HEALTH_GDRIVE_USERS нет ни одного из пользователей БД.")
     elif export_dir and Path(export_dir).is_dir():
-        total_rows = 0
-        for u in sync_users:
-            result = export_all(conn, u["id"], export_dir)
-            total_rows += result["rows"]
-        tail = f" Не синхронизируются: {skipped} польз." if skipped else ""
-        lines.append(f"Экспорт: {total_rows} строк в {export_dir}.{tail}")
+        # Сбой экспорта не должен отменять бэкап этой ночи
+        try:
+            total_rows = 0
+            for u in sync_users:
+                result = export_all(conn, u["id"], export_dir)
+                total_rows += result["rows"]
+            tail = f" Не синхронизируются: {skipped} польз." if skipped else ""
+            lines.append(f"Экспорт: {total_rows} строк в {export_dir}.{tail}")
+        except Exception as e:
+            print(f"Экспорт не удался: {e}", file=sys.stderr)
+            lines.append(f"⚠️ Экспорт не удался: {e}")
     else:
         lines.append("Экспорт пропущен: HEALTH_EXPORT_DIR не задан или недоступен (§13).")
 

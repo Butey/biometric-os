@@ -148,7 +148,8 @@ def smoothed_weight(conn: sqlite3.Connection, user_id: int, days: int = 7) -> tu
     for r in rows:
         by_day.setdefault(r["d"], []).append(r["w"])
     ordered = sorted(by_day)
-    window = ordered[-days:]
+    cutoff = (date.fromisoformat(ordered[-1]) - timedelta(days=days - 1)).isoformat()
+    window = [d for d in ordered if d >= cutoff]
     value = statistics.fmean(statistics.median(by_day[d]) for d in window)
     return value, ordered[-1]
 
@@ -160,7 +161,8 @@ def _observed_intake(conn: sqlite3.Connection, user_id: int, window_days: int = 
     сужается до серии. Считать по огрызку с пропусками нельзя — среднее
     занижено пропущенными днями.
     """
-    streak, end = logged_streak(conn, user_id, user_now(conn, user_id).date())
+    # Конец окна - вчера: сегодняшний день ещё не закрыт (частичный лог занижает среднее).
+    streak, end = logged_streak(conn, user_id, user_now(conn, user_id).date() - timedelta(days=1))
     if streak < MIN_LOG_STREAK_DAYS:
         return None
     window_days = min(window_days, streak)
@@ -421,8 +423,10 @@ def calibrate(
     start_weight, _ = sw
 
     active_ms = _active_milestone(conn, user_id)
+    if active_ms and active_ms["metric"] != "weight_kg":
+        active_ms = None
     if target_kg is None:
-        if active_ms and active_ms["metric"] == "weight_kg" and active_ms["threshold"]:
+        if active_ms and active_ms["threshold"]:
             target_kg = float(active_ms["threshold"])
             if deadline is None and active_ms["deadline"]:
                 deadline = active_ms["deadline"][:10]
@@ -517,7 +521,9 @@ def calibrate(
             else:
                 ms_name = f"{target_kg:.0f} кг"
                 conn.execute(
-                    "INSERT INTO milestones(user_id, name, metric, threshold, deadline) VALUES (?, ?, 'weight_kg', ?, ?)",
+                    "INSERT INTO milestones(user_id, name, metric, threshold, deadline) VALUES (?, ?, 'weight_kg', ?, ?) "
+                    "ON CONFLICT(user_id, name) DO UPDATE SET metric='weight_kg', "
+                    "threshold=excluded.threshold, deadline=excluded.deadline, achieved_at=NULL",
                     (user_id, ms_name, target_kg, aligned_deadline)
                 )
                 conn.commit()
@@ -627,7 +633,9 @@ def calibrate(
         applied = False
         applied_message = None
         if apply:
-            chosen_deadline = deadline if deadline_safe else opt_fr.get("expected", deadline)
+            if not deadline_safe and "expected" not in opt_fr:
+                return {"error": "Срок небезопасен, а при безопасной калорийности цель не достигается в пределах горизонта: веху не фиксирую"}
+            chosen_deadline = deadline if deadline_safe else opt_fr["expected"]
             if active_ms:
                 conn.execute(
                     "UPDATE milestones SET threshold=?, deadline=? WHERE id=?",
@@ -635,7 +643,9 @@ def calibrate(
                 )
             else:
                 conn.execute(
-                    "INSERT INTO milestones(user_id, name, metric, threshold, deadline) VALUES (?, ?, 'weight_kg', ?, ?)",
+                    "INSERT INTO milestones(user_id, name, metric, threshold, deadline) VALUES (?, ?, 'weight_kg', ?, ?) "
+                    "ON CONFLICT(user_id, name) DO UPDATE SET metric='weight_kg', "
+                    "threshold=excluded.threshold, deadline=excluded.deadline, achieved_at=NULL",
                     (user_id, f"{target_kg:.0f} кг", target_kg, chosen_deadline)
                 )
             conn.commit()
@@ -709,6 +719,8 @@ def plateau_forecast(
     u = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
     if u is None:
         return {"error": "Пользователь не найден"}
+    if not u["height_cm"]:
+        return {"error": "Нет роста - расход посчитать не от чего"}
 
     today = user_now(conn, user_id).date()
     sw = smoothed_weight(conn, user_id)
@@ -1007,6 +1019,16 @@ if __name__ == "__main__":
     conn.commit()
     assert "error" in project(conn, 1, 30, intake_kcal=1400)
     print("OK: замер старше недели прогноз не даёт")
+
+    # Окно сглаживания - 7 календарных дней, а не 7 дней с замерами.
+    conn.execute("DELETE FROM body_metrics WHERE user_id=1")
+    for i, (ago, w) in enumerate([(28, 130.0), (21, 128.0), (14, 126.0), (7, 124.0), (3, 123.0), (0, 122.0)]):
+        conn.execute(
+            "INSERT INTO body_metrics(user_id, burst_key, measured_at, weight_kg) VALUES (1, ?, ?, ?)",
+            (f"w{i}", f"{(today - timedelta(days=ago)).isoformat()} 08:00:00", w))
+    conn.commit()
+    assert smoothed_weight(conn, 1)[0] == 122.5, smoothed_weight(conn, 1)
+    print("OK: сглаженная масса берёт только замеры последних 7 календарных дней")
 
     conn.close()
     print("\nforecast.py: все проверки прошли")

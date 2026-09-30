@@ -47,9 +47,14 @@ def due(jobs: list[dict], local_now: datetime, grace_min: int) -> list[tuple[str
     return out
 
 
+def release(conn, user_id: int, slot_key: str) -> None:
+    conn.execute("DELETE FROM dispatch_log WHERE user_id=? AND slot_key=?", (user_id, slot_key))
+    conn.commit()
+
+
 def claim(conn, user_id: int, slot_key: str) -> bool:
-    """Застолбить слот ДО отправки. ponytail: упавшая отправка не повторяется —
-    сбой уходит админам через notify.report_failure; ретраи — если начнут терять."""
+    """Застолбить слот ДО отправки. Сбой доставки в телеграм снимает claim (release),
+    сбой скрипта не снимает — он уходит админам через notify.report_failure."""
     cur = conn.execute(
         "INSERT OR IGNORE INTO dispatch_log(user_id, slot_key, sent_at) VALUES (?, ?, ?)",
         (user_id, slot_key, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
@@ -66,16 +71,17 @@ def main() -> int:
     if args.selftest:
         return selftest()
 
-    cfg = load().get("schedule", {})
-    default_tz = zone(cfg.get("default_timezone"))
-
     token = None
     if not args.dry_run:
+        # до load(): оверлей HEALTH_ADMIN_IDS применяется только при первом чтении конфига
         notify.load_env_file()
         token = os.environ.get("TELEGRAM_BOT_TOKEN")
         if not token:
             print("TELEGRAM_BOT_TOKEN не задан (~/.hermes/.env)", file=sys.stderr)
             return 1
+
+    cfg = load().get("schedule", {})
+    default_tz = zone(cfg.get("default_timezone"))
 
     conn = connect()
     migrate(conn)
@@ -102,7 +108,10 @@ def main() -> int:
                 continue
             if not claim(conn, u["id"], slot_key):
                 continue
-            had_error |= notify.deliver(token, f"scripts/{script}.py", [(u["id"], str(u["telegram_user_id"]))])
+            err, send_failed = notify.deliver(token, f"scripts/{script}.py", [(u["id"], str(u["telegram_user_id"]))])
+            had_error |= err
+            if send_failed:
+                release(conn, u["id"], slot_key)  # не доставлено: следующий тик в grace повторит
     conn.close()
     return 1 if had_error else 0
 

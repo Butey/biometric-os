@@ -85,14 +85,14 @@ def index() -> str:
 
 
 def schema() -> dict:
+    topic = {"type": "string", "description": "Тема из базы знаний Knowledge/"}
+    stems = [p.stem for p in _topics()]
+    if stems:                       # пустой enum провайдеры отвергают
+        topic["enum"] = stems
     return {
         "type": "object",
         "properties": {
-            "topic": {
-                "type": "string",
-                "enum": [p.stem for p in _topics()],
-                "description": "Тема из базы знаний Knowledge/",
-            },
+            "topic": topic,
             "query": {
                 "type": "string",
                 "description": "Подстрока поиска — обязательна для файлов больше 20 KB",
@@ -106,8 +106,7 @@ def _resolve(topic: str) -> Path | None:
     """Путь собирается от KNOWLEDGE_DIR + расширение; topic приходит от модели —
     граница доверия, поэтому итог обязан лежать ВНУТРИ каталога (resolve +
     сравнение), иначе "../../.env" утечёт файлом."""
-    import re
-    if not re.fullmatch(r"[\w\- ]+", topic):
+    if not isinstance(topic, str) or not topic or any(c in topic for c in "/\\\0") or ".." in topic:
         return None
     # Файл обязан лежать ПРЯМО в своём каталоге, а не где-то внутри: иначе
     # topic "personal/<чужой id>/protocol" прочитал бы чужие личные документы.
@@ -247,6 +246,20 @@ if __name__ == "__main__":
         assert "СЕКРЕТ" not in leaked, "traversal utёк за пределы KNOWLEDGE_DIR!"
         assert "не найдена" in leaked
         print("OK: '../secret' отбивается, файл вне каталога не читается")
+
+        # --- пунктуация в имени темы допустима, разделители пути и None - нет ---
+        (kdir / "topic, with (punct).md").write_text("ПУНКТ", encoding="utf-8")
+        assert read("topic, with (punct)") == "ПУНКТ"
+        assert _resolve("a/b") is None and _resolve("..") is None and _resolve(None) is None
+        print("OK: тема с запятой находится, '/', '..', None отбиваются")
+
+        # --- пустой каталог -> schema() без enum ---
+        _kd = KNOWLEDGE_DIR
+        KNOWLEDGE_DIR = _P(tmp) / "empty_kb"
+        KNOWLEDGE_DIR.mkdir()
+        assert "enum" not in schema()["properties"]["topic"]
+        KNOWLEDGE_DIR = _kd
+        print("OK: schema() без тем не отдаёт пустой enum")
 
         # --- неизвестная тема — строка, не исключение ---
         unknown = read("no_such_topic")

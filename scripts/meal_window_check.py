@@ -6,7 +6,8 @@
 
 Какое окно проверять определяется САМИМ скриптом по местному времени каждого
 человека (health_core.config.user_now + его личные/общие health_core.chrono.
-meal_windows) — окно, чей конец наступил не раньше schedule.grace_minutes назад.
+meal_windows) — окно, чей конец попал между предыдущим и текущим слотом
+schedule.jobs для этого скрипта.
 Реальный вызов из dispatch (`--script meal_window_check.py`) идёт без окна
 аргументом, всегда с `--user`, как в §11 (`--script meal_window_check.py`). Для
 ручного прогона/самопроверки можно задать окно явно:
@@ -16,6 +17,7 @@ meal_windows) — окно, чей конец наступил не раньше
 """
 import argparse
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -29,21 +31,44 @@ from health_core.watch import steps_on, step_goal
 from math import ceil
 
 _MEAL_NAMES = ("breakfast", "lunch", "dinner")
+_DOW = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _LABELS = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин"}
 
 
-def _just_ended_window(conn, user_id: int) -> str | None:
-    """Имя окна (breakfast/lunch/dinner), чей конец наступил в последние
-    schedule.grace_minutes минут по местному времени этого человека, иначе None."""
-    grace = (load().get("schedule") or {}).get("grace_minutes", 25)
+def _just_ended_windows(conn, user_id: int) -> list[tuple[str, str]]:
+    """[(окно, дата конца)] — окна, чей конец попал в (предыдущий слот задачи, текущий слот]
+    по местному времени человека. Слоты — schedule.jobs с script=meal_window_check: каждый
+    конец окна, в том числе личный (не совпадающий со слотом), уходит с первым же слотом
+    после него, а интервалы соседних слотов не пересекаются — дублей нет."""
+    cfg = load().get("schedule") or {}
     local = user_now(conn, user_id)
+    slots = []
+    for back in (2, 1, 0):
+        day = local - timedelta(days=back)
+        for job in cfg.get("jobs") or []:
+            if job["script"] != "meal_window_check":
+                continue
+            if job.get("days") and _DOW[day.weekday()] not in job["days"]:
+                continue
+            hh, mm = map(int, job["at"].split(":"))
+            slot = day.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if slot <= local:
+                slots.append(slot)
+    slots.sort()
+    if not slots:
+        return []
+    cur = slots[-1]
+    prev = slots[-2] if len(slots) > 1 else cur - timedelta(days=1)
     windows = meal_windows(conn, user_id)
-    for name in _MEAL_NAMES:
-        end_h, end_m = map(int, windows[name]["end"].split(":"))
-        end_dt = local.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-        if 0 <= (local - end_dt).total_seconds() / 60 < grace:
-            return name
-    return None
+    out = []
+    for back in (1, 0):
+        day = local - timedelta(days=back)
+        for name in _MEAL_NAMES:
+            end_h, end_m = map(int, windows[name]["end"].split(":"))
+            end_dt = day.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+            if prev < end_dt <= cur:
+                out.append((name, f"{end_dt:%Y-%m-%d}"))
+    return out
 
 
 def steps_prompt(steps: int | None, goal: int | None) -> str | None:
@@ -93,27 +118,26 @@ def main() -> int:
         today = user_today(conn, u["id"])
         if sick.is_sick(conn, u["id"], today):
             continue  # болен — напоминаний о еде не шлём
-        name = args.window or _just_ended_window(conn, u["id"])
-        if name is None:
-            continue  # для этого человека сейчас не конец ни одного его окна — тихий тик
-        n = conn.execute(
-            "SELECT COUNT(*) c FROM food_log WHERE user_id=? AND date(eaten_at)=? AND meal_slot=?",
-            (u["id"], today, name),
-        ).fetchone()["c"]
-        if n == 0:
-            lines.append(f"{_LABELS[name]} не записан.")
-        # Steps prompt for lunch window
-        if name == "lunch":
-            steps = steps_on(conn, u["id"], today)
-            goal = step_goal(conn, u["id"], today)
-            prompt = steps_prompt(steps, goal)
-            if prompt:
-                if n == 0:
-                    # Combine with meal reminder into one message
-                    lines[-1] = lines[-1] + " " + prompt
-                else:
-                    # Meal is logged, send steps text alone
-                    lines.append(prompt)
+        ended = [(args.window, today)] if args.window else _just_ended_windows(conn, u["id"])
+        for name, day in ended:  # пусто — для этого человека конец ни одного окна не попал в интервал, тихий тик
+            n = conn.execute(
+                "SELECT COUNT(*) c FROM food_log WHERE user_id=? AND date(eaten_at)=? AND meal_slot=?",
+                (u["id"], day, name),
+            ).fetchone()["c"]
+            if n == 0:
+                lines.append(f"{_LABELS[name]} не записан.")
+            # Steps prompt for lunch window
+            if name == "lunch":
+                steps = steps_on(conn, u["id"], day)
+                goal = step_goal(conn, u["id"], day)
+                prompt = steps_prompt(steps, goal)
+                if prompt:
+                    if n == 0:
+                        # Combine with meal reminder into one message
+                        lines[-1] = lines[-1] + " " + prompt
+                    else:
+                        # Meal is logged, send steps text alone
+                        lines.append(prompt)
     conn.close()
 
     if lines:

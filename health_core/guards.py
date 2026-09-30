@@ -85,6 +85,8 @@ def check_lbm_ratio(conn: sqlite3.Connection, user_id: int):
     ratio, d_weight, d_lean, n = res
     if n < cfg["lbm_ratio_min_points"]:
         return None
+    if -d_weight < load()["policy"]["lean_share_min_loss_kg"]:
+        return None  # вес не падает или потеря меньше минимума (как energy.lean_share): доли нет
     if d_lean >= 0:
         # Тощая масса не снижается — это не потеря мышц (набор/рекомпозиция), а
         # гардрейл про риск катаболизма мышц. Направление важнее модуля дельты.
@@ -122,6 +124,8 @@ def check_lbm_drift(conn: sqlite3.Connection, user_id: int):
             f"меньше {cfg['lbm_ratio_min_points']} для уверенного дрейфа.",
             n, cfg["lbm_ratio_min_points"],
         )
+    if -d_weight < load()["policy"]["lean_share_min_loss_kg"]:
+        return None  # см. check_lbm_ratio
     if d_lean >= 0:
         # См. check_lbm_ratio: тощая масса растёт или не меняется — не сигнал катаболизма.
         return None
@@ -394,8 +398,13 @@ def check_rate_high(conn: sqlite3.Connection, user_id: int):
     if weight_delta >= 0:
         return None  # only fire on loss, not gain
 
-    kg_per_week = abs(weight_delta) * 7 / days_covered
-    pct_per_week = (abs(weight_delta) / first_med) * 100 * 7 / days_covered
+    # Медианы лежат в строках k//2 и -1-k//2, а не на краях окна: темп делим на
+    # расстояние между ними, иначе он занижен.
+    span = (_parse(rows[-1 - k // 2]["measured_at"]).date() - _parse(rows[k // 2]["measured_at"]).date()).days
+    if span < 5:  # при <6 точках окна пересекаются, медианы почти рядом - темп шумный
+        return None
+    kg_per_week = abs(weight_delta) * 7 / span
+    pct_per_week = (abs(weight_delta) / first_med) * 100 * 7 / span
     threshold = min(cfg["weight_rate_kg_week_max"], first_med * cfg["weight_rate_pct_week_max"] / 100)
     if kg_per_week > threshold:
         return _alert(
@@ -876,16 +885,16 @@ def record(conn: sqlite3.Connection, user_id: int, alerts: list[dict]) -> None:
     today = now.strftime("%Y-%m-%d")
     ts = now.strftime("%Y-%m-%d %H:%M:%S")
     # Один и тот же гард срабатывает на КАЖДОМ логировании за день (каждый вызов
-    # check_all+record из хендлеров). Пишем правило не чаще раза в день, иначе
-    # таблица распухает и дашборд показывает N копий одного предупреждения.
+    # check_all+record из хендлеров). Пропускаем только то же правило с тем же
+    # текстом, иначе таблица распухает; эскалация или новый текст пишется заново.
     already = {
-        r[0]
+        (r[0], r[1])
         for r in conn.execute(
-            "SELECT rule FROM alerts WHERE user_id=? AND date(created_at)=?",
+            "SELECT rule, message FROM alerts WHERE user_id=? AND date(created_at)=?",
             (user_id, today),
         )
     }
-    fresh = [(user_id, ts, a["code"], a["message"]) for a in alerts if a["code"] not in already]
+    fresh = [(user_id, ts, a["code"], a["message"]) for a in alerts if (a["code"], a["message"]) not in already]
     if not fresh:
         return
     conn.executemany(
@@ -1513,10 +1522,10 @@ if __name__ == "__main__":
             # (116.0 вместо ~119) — median(последних 3) гасит его, наивная разница
             # эндпоинтов дала бы 5 кг/13 дн = 2.7 кг/нед и ложно сработала бы
             add_metric(u_rate_outlier, 13, 121.0, 78.0)
-            add_metric(u_rate_outlier, 10, 120.6, 78.0)
-            add_metric(u_rate_outlier, 8, 120.3, 78.0)
-            add_metric(u_rate_outlier, 5, 119.0, 78.0)
-            add_metric(u_rate_outlier, 2, 118.8, 78.0)
+            add_metric(u_rate_outlier, 10, 120.8, 78.0)
+            add_metric(u_rate_outlier, 8, 120.5, 78.0)
+            add_metric(u_rate_outlier, 5, 119.6, 78.0)
+            add_metric(u_rate_outlier, 2, 119.3, 78.0)
             add_metric(u_rate_outlier, 0, 116.0, 78.0)
             conn.commit()
             alerts_rate_outlier = check_all(conn, u_rate_outlier)
@@ -1553,6 +1562,26 @@ if __name__ == "__main__":
             alerts_rate_gain = check_all(conn, u_rate_gain)
             rate_fired_gain = [a for a in alerts_rate_gain if a["code"] == "RATE_HIGH"]
             assert not rate_fired_gain, f"RATE_HIGH должен молчать на приросте, получили {alerts_rate_gain}"
+
+            # Темп делится на расстояние между строками с медианами (день 9 -> день 4 = 5 дней),
+            # а не на покрытие окна (13 дней): 1.8 кг за 5 дней = 2.5 кг/нед, старая формула давала 0.97
+            u_rate_span = make_user(164, height_cm=185, created_days_ago=30)
+            add_metric(u_rate_span, 13, 100.0, 78.0)
+            add_metric(u_rate_span, 9, 99.0, 78.0)
+            add_metric(u_rate_span, 4, 97.2, 78.0)
+            add_metric(u_rate_span, 0, 95.36, 78.0)
+            conn.commit()
+            rate_fired_span = [a for a in check_all(conn, u_rate_span) if a["code"] == "RATE_HIGH"]
+            assert rate_fired_span and rate_fired_span[0]["value"] > 2.0, f"RATE_HIGH по медианам за 5 дней: {rate_fired_span}"
+
+            # Вес растёт или почти не меняется при падении FFM: доли потери нет, LBM_* молчат
+            for tg, wts in ((164 + 1, (100.0, 100.2, 100.5, 100.8)), (164 + 2, (100.0, 99.9, 99.8, 99.7))):
+                u_flat = make_user(tg, height_cm=185, created_days_ago=30)
+                for da, w, f in zip((13, 9, 4, 0), wts, (80.0, 79.5, 79.0, 78.6)):
+                    add_metric(u_flat, da, w, f)
+                conn.commit()
+                lbm_flat = [a for a in check_all(conn, u_flat) if a["code"] in ("LBM_RATIO", "LBM_DRIFT")]
+                assert not lbm_flat, f"LBM_* не должны срабатывать без потери веса (вес {wts}): {lbm_flat}"
 
             print("OK: WHR_HIGH срабатывает; RATE_HIGH молчит на коротком покрытии и на одиночном "
                   "выбросе, срабатывает на реальном темпе без упоминания сухой массы, молчит на приросте")
