@@ -314,6 +314,14 @@ async def send_long(message: Message, text: str) -> None:
                      message.chat.id, sent.message_id)
 
 
+async def _answer_md(message: Message, text: str, kb: InlineKeyboardMarkup | None = None) -> None:
+    try:
+        await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    except TelegramBadRequest as e:
+        log.warning("разметка отвергнута (%s), шлём без неё", e)
+        await message.answer(text, reply_markup=kb, parse_mode=None)
+
+
 def _plain(raw: str) -> str:
     """Инструменты отдают JSON — человеку он не нужен. Достаём текстовое поле,
     а нет его — показываем как есть: молча проглотить ответ хуже."""
@@ -1346,13 +1354,13 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
                 providers = list((current_cfg.get("bot") or {}).get("providers", []))
                 kb = _model_keyboard(providers)
                 msg_text = _format_models_message(providers)
-                await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+                await _answer_md(message, msg_text, kb)
                 return
 
         if cmd_name in ("target", "calibrate"):
             cmd_args = text[1:].partition(" ")[2].strip()
             msg_text, kb = await asyncio.to_thread(_format_target_interactive, uid, cmd_args)
-            await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await _answer_md(message, msg_text, kb)
             return
 
         if cmd_name == "balance":
@@ -1370,13 +1378,13 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
         if cmd_name == "plateau":
             cmd_args = text[1:].partition(" ")[2].strip()
             msg_text, kb = await asyncio.to_thread(_format_plateau_interactive, uid, cmd_args)
-            await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await _answer_md(message, msg_text, kb)
             return
 
         if cmd_name == "forecast":
             cmd_args = text[1:].partition(" ")[2].strip()
             msg_text, kb = await asyncio.to_thread(_format_forecast_interactive, uid, cmd_args)
-            await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await _answer_md(message, msg_text, kb)
             return
 
         # Хендлеры команд синхронные и лезут в sqlite — в поток, чтобы не
@@ -1593,7 +1601,7 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             except TelegramBadRequest:
                 try:
                     if callback.message:
-                        await callback.message.edit_text(new_text, reply_markup=new_kb)
+                        await callback.message.edit_text(new_text, reply_markup=new_kb, parse_mode=None)
                 except Exception:
                     pass
             except Exception:
@@ -1611,7 +1619,7 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             except TelegramBadRequest:
                 try:
                     if callback.message:
-                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                        await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=None)
                 except Exception:
                     pass
             except Exception:
@@ -1633,7 +1641,7 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             except TelegramBadRequest:
                 try:
                     if callback.message:
-                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                        await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=None)
                 except Exception:
                     pass
             except Exception:
@@ -1650,7 +1658,7 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             except TelegramBadRequest:
                 try:
                     if callback.message:
-                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                        await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=None)
                 except Exception:
                     pass
             except Exception:
@@ -1667,7 +1675,7 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             except TelegramBadRequest:
                 try:
                     if callback.message:
-                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                        await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=None)
                 except Exception:
                     pass
             except Exception:
@@ -1684,7 +1692,7 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             except TelegramBadRequest:
                 try:
                     if callback.message:
-                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                        await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=None)
                 except Exception:
                     pass
             except Exception:
@@ -1710,7 +1718,7 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             except TelegramBadRequest:
                 try:
                     if callback.message:
-                        await callback.message.edit_text(msg_text, reply_markup=kb)
+                        await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode=None)
                 except Exception:
                     pass
             except Exception:
