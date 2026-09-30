@@ -23,7 +23,7 @@ MARKERS = {
         "label": "инсулин",
         "unit": "мкЕд/мл",
         "lo": 0.5,
-        "hi": 300.0,
+        "hi": 150.0,
         "aliases": ("инсулин", "insulin"),
     },
     "hba1c": {
@@ -113,14 +113,14 @@ MARKERS = {
     "ft4": {
         "label": "свободный Т4",
         "unit": "пмоль/л",
-        "lo": 1.0,
+        "lo": 3.0,
         "hi": 100.0,
         "aliases": ("свободный т4", "свт4", "ft4"),
     },
     "ft3": {
         "label": "свободный Т3",
         "unit": "пмоль/л",
-        "lo": 0.5,
+        "lo": 1.5,
         "hi": 50.0,
         "aliases": ("свободный т3", "свт3", "ft3"),
     },
@@ -200,6 +200,12 @@ def _reject_reason(canon, value, meta):
         return f"похоже на мг/дл, нужны {unit}"
     if canon == "apob" and value > hi:
         return f"похоже на мг/дл, нужны {unit}"
+    if canon == "insulin" and value > hi:
+        return f"похоже на пмоль/л, нужны {unit}"
+    if canon == "ft4" and value < lo:
+        return f"похоже на нг/дл, нужны {unit}"
+    if canon == "ft3" and value < lo:
+        return f"похоже на пг/мл, нужны {unit}"
     return f"вне допустимого диапазона ({lo}–{hi} {unit})"
 
 
@@ -509,6 +515,12 @@ if __name__ == "__main__":
     assert "glucose" in res["rejected"]
     assert "glucose" not in res["saved"]
     assert res["rejected"]["glucose"] == "похоже на мг/дл, нужны ммоль/л"
+
+    # --- перепутанные единицы гормонов ---
+    res = save(conn, uid, "2026-09-01", {"insulin": 400, "ft4": 1.2, "ft3": 1.0})
+    assert res["rejected"]["insulin"] == "похоже на пмоль/л, нужны мкЕд/мл", res
+    assert res["rejected"]["ft4"] == "похоже на нг/дл, нужны пмоль/л", res
+    assert res["rejected"]["ft3"] == "похоже на пг/мл, нужны пмоль/л", res
 
     # --- upsert: same user/date/marker keeps ONE row with the new value ---
     save(conn, uid, "2026-09-01", {"glucose": 5.0})

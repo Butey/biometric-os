@@ -142,11 +142,9 @@ def status(conn: sqlite3.Connection, user_id: int, today) -> dict:
 
     if in_break:
         # Найти первый день текущего блока рефида
-        block_start = today_s
         check = today
         while (check - timedelta(days=1)).isoformat() in marked:
             check -= timedelta(days=1)
-            block_start = check.isoformat()
 
         # Последний день рефида?
         tomorrow = (today + timedelta(days=1)).isoformat()

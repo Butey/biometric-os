@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import os
 import sys
+import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -61,7 +62,10 @@ def main() -> int:
                     load_env_file()
                     token = os.environ.get("TELEGRAM_BOT_TOKEN")
                     if tg_row and tg_row["telegram_user_id"] and token:
-                        notify.send(token, str(tg_row["telegram_user_id"]), result["text"])
+                        try:
+                            notify.send(token, str(tg_row["telegram_user_id"]), result["text"])
+                        except (urllib.error.URLError, TimeoutError, OSError) as send_err:
+                            print(f"не доставлен совет {u['id']}: {send_err}", file=sys.stderr)
                 except ValueError:
                     pass  # уже собирался за последние 21 день или уже идёт — не спамим
         except Exception as e:

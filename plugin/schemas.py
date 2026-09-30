@@ -279,7 +279,7 @@ refeed_schema = {
         "action": {"type": "string", "enum": ["status", "schedule", "clear"],
                    "description": "status — фаза сегодня и уведомления; schedule — назначить рефид (по умолчанию разовый на 4 дня с причиной); clear — снять будущие"},
         "start": {"type": "string", "description": "Дата старта YYYY-MM-DD, по умолчанию сегодня или завтра"},
-        "days": {"type": "integer", "description": "Длительность рефида в днях (по умолчанию 4)"},
+        "days": {"type": "integer", "description": "Длительность рефида в днях, 1..14 (по умолчанию 4)"},
         "reason": {"type": "string", "enum": ["plateau", "recovery_low", "council", "manual"],
                    "description": "Причина: plateau (плато), recovery_low (восстановление), council (консилиум), manual (вручную)"},
         "horizon_weeks": {"type": "integer", "description": "УСТАРЕЛО: цикл MATADOR на N недель (не рекомендуется)"},
@@ -564,7 +564,7 @@ pharma_schema = {
         "route": {"type": "string", "enum": ["injection", "oral", "topical"], "description": "Путь введения"},
         "every_days": {"type": "integer", "description": "Каденция: раз в N дней (7 = еженедельно)"},
         "next_at": {"type": "string", "description": "Следующая доза, ISO дата-время"},
-        "stock_doses": {"type": "number", "description": "Остаток в дозах (задать при schedule)"},
+        "stock_doses": {"type": "number", "description": "Остаток в дозах (задать при schedule; 0 = не задан, пополнение только через restock)"},
         "add_doses": {"type": "number", "description": "Сколько доз добавить (для restock)"},
         "notes": {"type": "string", "description": "Заметка"},
         "user_id": {"type": "integer", "description": "ID пользователя"}

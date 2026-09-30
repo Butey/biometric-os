@@ -5,7 +5,7 @@ alert messages, device strings, the lot. That is the entire XSS defense for a
 panel serving personal medical data, so it is applied without exception.
 """
 import html
-from datetime import date, datetime, timezone as _tz_module
+from datetime import datetime, timezone as _tz_module
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _UTC = _tz_module.utc  # timezone-aware UTC sentinel для replace(tzinfo=...)
@@ -388,7 +388,6 @@ def _user_selector_html(users: list[dict] | None, selected_user_id, current_path
     the existing theme-toggle inline script."""
     if not users or len(users) < 2:
         return ""
-    base_path = current_path.split("?", 1)[0] or "/"
     opts = []
     for u in users:
         label = f"#{u['id']} · tg {u['telegram_user_id']}"
@@ -2208,8 +2207,7 @@ _REORDER_SCRIPT = """<script>
     var rows = tbody.querySelectorAll('.model-row');
     var order = [];
     rows.forEach(function(row, index) {
-      var m = row.getAttribute('data-model');
-      order.push(m);
+      order.push(parseInt(row.getAttribute('data-idx'), 10));
       var badgeCell = row.querySelector('.priority-cell');
       if (badgeCell) {
         if (index === 0) {
@@ -2257,8 +2255,6 @@ def keys_page(
     groq_keys = keys_dict.get("GROQ_API_KEY", [])
     openrouter_keys = keys_dict.get("OPENROUTER_API_KEY", [])
     openai_keys = keys_dict.get("OPENAI_API_KEY", [])
-
-    total_keys = len(google_keys) + len(groq_keys) + len(openrouter_keys) + len(openai_keys)
 
     # Статистика
     stats_html = "".join([
@@ -2314,7 +2310,7 @@ def keys_page(
     for idx, p in enumerate(providers_list, 1):
         m = p.get("model", "—")
         sel = " selected" if idx == 1 else ""
-        model_options.append(f'<option value="{html.escape(m)}"{sel}>{"🟢 " if idx==1 else ""}{idx}. {html.escape(m)}</option>')
+        model_options.append(f'<option value="{idx-1}"{sel}>{"🟢 " if idx==1 else ""}{idx}. {html.escape(m)}</option>')
 
     quick_select_html = (
         '<form method="post" action="/keys" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;'
@@ -2322,7 +2318,7 @@ def keys_page(
         f'{_csrf_field(csrf_token)}'
         '<input type="hidden" name="action" value="set_primary">'
         '<span style="font-weight:600;font-size:13px">Быстро назначить основную модель (#1):</span>'
-        f'<select name="model" style="padding:6px 10px;font-size:13px;border-radius:8px;background:var(--bg2);color:var(--fg)">{"".join(model_options)}</select>'
+        f'<select name="provider_idx" style="padding:6px 10px;font-size:13px;border-radius:8px;background:var(--bg2);color:var(--fg)">{"".join(model_options)}</select>'
         '<button type="submit" style="padding:6px 14px;font-size:13px">⚡ Сделать основной</button>'
         '</form>'
     )

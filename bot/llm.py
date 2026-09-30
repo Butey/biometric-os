@@ -20,6 +20,8 @@ from typing import Any, Callable, TypedDict
 
 import aiohttp
 
+from bot.history import clean_message
+
 log = logging.getLogger(__name__)
 
 _COOLDOWN_NOT_FOUND_S = 86400   # 24 ч — модель не найдена / удалена
@@ -271,7 +273,7 @@ def _build_clean_messages(messages: list[dict], is_google: bool = False, force_t
     clean = []
     for m in source:
         if m.get("role") == "assistant":
-            c = dict(m)
+            c = clean_message(m)
             if m.get("content") is not None:
                 c["content"] = m["content"]
             elif not m.get("tool_calls"):
@@ -502,7 +504,7 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
 
     for _ in range(max_iters):
         message = await chat(session, messages, tools, providers, timeout_s=timeout_s)
-        messages.append(message)
+        messages.append(clean_message(message))  # reasoning и пр. в историю не тащим
 
         tool_calls = message.get("tool_calls") or []
         if message.get("content"):
@@ -527,7 +529,7 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
         results = []
         for call in tool_calls:
             results.append(await _run_one(call, dispatch))
-        for call, result in zip(tool_calls, results):
+        for call, result in zip(tool_calls, results, strict=True):
             messages.append({
                 "role": "tool",
                 "tool_call_id": call["id"],
@@ -752,6 +754,8 @@ if __name__ == "__main__":
                 "tool_calls": [tc_with_ts],
                 "thought_signature": "gemini_ts_msg_token",
                 "extra_content": "some_extra_data",
+                "reasoning": "внутренние мысли",
+                "refusal": None,
             }
             payloads_received = []
 
@@ -767,6 +771,7 @@ if __name__ == "__main__":
                 assert sent_assistant["thought_signature"] == "gemini_ts_msg_token", sent_assistant
                 assert sent_assistant["extra_content"] == "some_extra_data", sent_assistant
                 assert sent_assistant["tool_calls"][0]["thought_signature"] == "gemini_ts_token_123", sent_assistant
+                assert "reasoning" not in sent_assistant and "refusal" not in sent_assistant, sent_assistant
             print("OK: 9) thought_signature и extra_content сохраняются в clean_messages")
 
             # --- 10. Bug 2: конвертация чужих tool_calls без thought_signature перед запросом к Google ---

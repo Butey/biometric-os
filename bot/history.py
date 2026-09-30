@@ -4,12 +4,20 @@
 Соединение приходит снаружи (health_core.db.connect(), row_factory=Row).
 """
 import json
-from datetime import datetime
 
 from health_core.config import load as _load_config, local_now
 
 _DEFAULT_WINDOW = 20
 _DEFAULT_CHARS = 8000
+
+# Поля, которые понимают все провайдеры + thought_signature/extra_content (Gemini 3.x,
+# без них она отвергает историю). Остальное (reasoning, refusal, annotations...) строгие
+# провайдеры отвергают с 400.
+_KEEP_KEYS = ("role", "content", "tool_calls", "tool_call_id", "name", "thought_signature", "extra_content")
+
+
+def clean_message(m: dict) -> dict:
+    return {k: v for k, v in m.items() if k in _KEEP_KEYS}
 
 
 def _now_iso() -> str:
@@ -63,7 +71,7 @@ def append(conn, telegram_id: str, message: dict) -> None:
     conn.execute(
         "INSERT INTO chat_history(telegram_user_id, ts, role, content) VALUES (?, ?, ?, ?)",
         (str(telegram_id), _now_iso(), message.get("role", ""),
-         json.dumps(message, ensure_ascii=False)),
+         json.dumps(clean_message(message), ensure_ascii=False)),
     )
     conn.commit()
 
@@ -83,6 +91,7 @@ if __name__ == "__main__":
         import health_core.db as db
         db.DB_PATH = Path(os.environ["HEALTH_DB"])
         conn = db.connect()
+        db.migrate(conn)  # chat_history создаётся миграцией
 
         # --- round-trip: tool_calls переживают append -> load ---
         append(conn, "1", {"role": "user", "content": "привет"})
@@ -98,6 +107,21 @@ if __name__ == "__main__":
         assert hist[1]["tool_calls"][0]["function"]["name"] == "log_food", "tool_calls не пережили round-trip"
         assert hist[2]["tool_call_id"] == "c1"
         print("OK: tool_calls переживают append -> load")
+
+        # --- whitelist: reasoning/refusal отсекаются, thought_signature/extra_content остаются ---
+        append(conn, "5", {"role": "user", "content": "q"})
+        append(conn, "5", {
+            "role": "assistant", "content": None, "reasoning": "думаю", "reasoning_content": "думаю",
+            "refusal": None, "annotations": [], "thought_signature": "sig", "extra_content": {"google": 1},
+            "tool_calls": [{"id": "c9", "type": "function", "thought_signature": "tcsig",
+                            "function": {"name": "noop", "arguments": "{}"}}],
+        })
+        h5 = load(conn, "5")[1]
+        assert not ({"reasoning", "reasoning_content", "refusal", "annotations"} & set(h5)), h5
+        assert h5["thought_signature"] == "sig" and h5["extra_content"] == {"google": 1}, h5
+        assert h5["tool_calls"][0]["thought_signature"] == "tcsig", h5
+        print("OK: whitelist истории: reasoning отсечён, thought_signature сохранён")
+        clear(conn, "5")
 
         # --- clear чистит только своего пользователя ---
         append(conn, "2", {"role": "user", "content": "чужое сообщение"})

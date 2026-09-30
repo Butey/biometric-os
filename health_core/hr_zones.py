@@ -8,7 +8,7 @@
 
 from datetime import datetime
 
-from health_core.config import load, local_now, user_now
+from health_core.config import load, user_now
 
 
 def hr_max(age: int) -> float:

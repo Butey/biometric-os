@@ -22,7 +22,7 @@ import sys
 import tempfile
 import traceback
 import urllib.parse
-from datetime import date, datetime, timezone as _tz
+from datetime import datetime, timezone as _tz
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -36,7 +36,7 @@ _connect = connect
 from health_core.energy import daily_target
 from health_core.export import backup_db, export_all
 from health_core.guards import check_all, get_guards_status
-from health_core.report import status_bar, trends, day_summary, meals_of_day, baseline_weight
+from health_core.report import trends, day_summary, meals_of_day, baseline_weight
 from plugin.tools import _admin_set, handle_set_milestone
 
 SESSIONS = auth.SessionStore()
@@ -251,7 +251,10 @@ def _import_scale_upload(conn, user_id: int, filename: str, data: bytes) -> tupl
                     extract_dir.mkdir(parents=True, exist_ok=True)
                     extract_dir_resolved = extract_dir.resolve()
                     with zipfile.ZipFile(tmp_path, "r") as zf:
-                        for member in zf.infolist():
+                        members = zf.infolist()
+                        if len(members) > 10000 or sum(m.file_size for m in members) > 500 * 1024 * 1024:
+                            return False, "Архив слишком большой (больше 500 МБ после распаковки или 10000 файлов), отклонён."
+                        for member in members:
                             member_path = (extract_dir / member.filename).resolve()
                             if not member_path.is_relative_to(extract_dir_resolved):
                                 continue  # zip slip: entry would escape extract_dir — skip it
@@ -986,6 +989,12 @@ class Handler(BaseHTTPRequestHandler):
                 "OPENAI_API_KEY": oa_keys[0] if oa_keys else "",
                 "OPENAI_API_KEYS": ",".join(oa_keys) if oa_keys else "",
             }
+            # bot/llm.py get_provider_keys also merges <VAR>_LIST and <VAR>_1.._19: clear them
+            # too, else a revoked key keeps working
+            for var in ("GOOGLE_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+                updates[var + "_LIST"] = None
+                for i in range(1, 20):
+                    updates[f"{var}_{i}"] = None
             auth.update_env_vars(updates)
             auth.load_env_file(force=True)
             message = f"API-ключи успешно сохранены (Google: {len(g_keys)} шт., Groq: {len(groq_keys)} шт.). Ротация активна."
@@ -1007,36 +1016,34 @@ class Handler(BaseHTTPRequestHandler):
         elif action == "reorder_providers":
             raw_order = form.get("model_order", "")
             try:
-                model_names = json.loads(raw_order)
-                if not isinstance(model_names, list) or not model_names:
+                order = json.loads(raw_order)
+                if not isinstance(order, list) or not order:
                     raise ValueError("Список моделей пуст.")
                 cfg = load_config()
                 current_providers = list((cfg.get("bot") or {}).get("providers", []))
 
-                by_model = {p["model"]: p for p in current_providers}
+                # order = data-idx values (positions in the current chain), not model names:
+                # two providers may share a model with different base_url
+                remaining = dict(enumerate(current_providers))
                 new_providers = []
-                for m_name in model_names:
-                    if m_name in by_model:
-                        new_providers.append(by_model.pop(m_name))
-                for p in by_model.values():
-                    new_providers.append(p)
+                for i in order:
+                    if isinstance(i, int) and i in remaining:
+                        new_providers.append(remaining.pop(i))
+                new_providers.extend(remaining.values())
 
                 _update_providers_in_config(new_providers)
                 message = f"Приоритет моделей успешно обновлён! Основная модель: {new_providers[0].get('model')}."
             except Exception as exc:
                 error = f"Ошибка изменения порядка моделей: {exc}"
         elif action == "set_primary":
-            target_model = form.get("model", "").strip()
             try:
-                if not target_model:
-                    raise ValueError("Модель не указана.")
                 cfg = load_config()
                 current_providers = list((cfg.get("bot") or {}).get("providers", []))
-                match = [p for p in current_providers if p.get("model") == target_model]
-                if not match:
-                    raise ValueError(f"Модель {target_model} не найдена в цепочке.")
-                other = [p for p in current_providers if p.get("model") != target_model]
-                new_providers = [match[0]] + other
+                idx = int(form.get("provider_idx", ""))
+                if not 0 <= idx < len(current_providers):
+                    raise ValueError("Провайдер не найден в цепочке.")
+                target_model = current_providers[idx].get("model")
+                new_providers = [current_providers[idx]] + current_providers[:idx] + current_providers[idx + 1:]
                 _update_providers_in_config(new_providers)
                 message = f"Основная модель успешно изменена на {target_model}!"
             except Exception as exc:
@@ -1100,7 +1107,7 @@ class Handler(BaseHTTPRequestHandler):
                 selected_date = query.get("date", [None])[0]
                 # Validate date format: YYYY-MM-DD
                 if selected_date:
-                    datetime.strptime(selected_date, "%Y-%m-%d")
+                    selected_date = datetime.strptime(selected_date, "%Y-%m-%d").date().isoformat()
             except (ValueError, IndexError):
                 selected_date = None
 
@@ -1179,13 +1186,18 @@ class Handler(BaseHTTPRequestHandler):
 
             if not date_str or not kind or not body:
                 return self._error_page(400, "Заполните все обязательные поля (дата, тип, текст плана).")
+            try:
+                date_str = datetime.strptime(date_str, "%Y-%m-%d").date().isoformat()
+            except ValueError:
+                return self._error_page(400, "Неверная дата, ожидается YYYY-MM-DD.")
+            if kind not in ("workout", "meal"):
+                return self._error_page(400, "Неверный тип плана.")
 
-            from datetime import datetime
             now_iso = datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
             conn.execute(
                 "INSERT INTO plan_log(user_id, date, kind, body, rationale, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, date, kind) DO UPDATE SET "
-                "body=excluded.body, rationale=COALESCE(excluded.rationale,rationale), "
+                "body=excluded.body, rationale=excluded.rationale, "
                 "created_at=excluded.created_at",
                 (user_id, date_str, kind, body, rationale, now_iso),
             )
@@ -1845,7 +1857,6 @@ def _cmd_self_check() -> int:
     """Проверка удаления персоны на временной базе. Главное здесь — не то, что
     целевая персона исчезла, а что данные ВТОРОЙ персоны целы: удаление,
     задевающее соседа, — единственный по-настоящему страшный отказ этой страницы."""
-    import sqlite3
     import tempfile
     from pathlib import Path as _Path
 

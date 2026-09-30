@@ -715,7 +715,8 @@ def weekly_summary(conn: sqlite3.Connection, user_id: int, end_date: str | None 
         if planned_days == 0:
             plan_line = "**📐 План/факт** — план задан, но на дни этой недели шаблона нет"
         else:
-            sign = MINUS if worst[1] < 0 else "+"
+            # delta = план - факт: отрицательный значит перебор, показываем как "+"
+            sign = "+" if worst[1] < 0 else MINUS
             worst_str = f"{worst[0][8:10]}.{worst[0][5:7]} {sign}{abs(worst[1]):.0f} ккал"
             plan_line = (f"**📐 План/факт** — совпало {matched}/{planned_days} дн (±10% ккал) · "
                          f"макс. отклонение {worst_str}")
@@ -832,6 +833,15 @@ if __name__ == "__main__":
             assert "UNDEREATING" in summary4
             assert alerts_before == alerts_after, "weekly_summary не должен писать в alerts"
             print("OK: weekly_summary рендерится с данными и не пишет в БД")
+
+            # --- макс. отклонение: перебор над планом (2000 против 1700) печатается с "+" ---
+            from health_core.plans import set_meal_plan
+            for days_ago in [5, 3, 1]:
+                dow = (_now() - timedelta(days=days_ago)).weekday()
+                set_meal_plan(conn, u4, dow, "lunch", kcal=1700)
+            summary4p = weekly_summary(conn, u4)
+            assert "макс. отклонение" in summary4p and "+300 ккал" in summary4p, summary4p
+            print("OK: weekly_summary показывает перебор плана как +300, а не -300")
 
             # --- weekly_summary: пустой пользователь не падает ---
             u5 = make_user(205)

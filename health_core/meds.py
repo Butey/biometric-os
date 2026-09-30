@@ -181,10 +181,10 @@ def stock_runs_out(conn, user_id: int) -> list[dict]:
     pharma status) не нужно повторять порог."""
     from datetime import datetime, timedelta
 
-    from health_core.config import load, local_now
+    from health_core.config import load, user_now
 
     warn_days = load()["guards"]["stock_warn_days"]
-    now = local_now()
+    now = user_now(conn, user_id)
     rows = conn.execute(
         "SELECT substance, every_days, next_at, stock_doses FROM med_schedule "
         "WHERE user_id=? AND every_days IS NOT NULL AND next_at IS NOT NULL AND stock_doses IS NOT NULL",
@@ -267,7 +267,9 @@ if __name__ == "__main__":
     from datetime import datetime as _dt
 
     _orig_local_now = _cfg_mod.local_now
+    _orig_user_now = _cfg_mod.user_now
     _cfg_mod.local_now = lambda: _dt(2026, 9, 14, 8, 0, 0)
+    _cfg_mod.user_now = lambda conn, user_id: _dt(2026, 9, 14, 8, 0, 0)
     try:
         conn.execute("ALTER TABLE med_schedule ADD COLUMN every_days INTEGER")
         conn.execute("DELETE FROM med_schedule")
@@ -286,6 +288,7 @@ if __name__ == "__main__":
         )
     finally:
         _cfg_mod.local_now = _orig_local_now
+        _cfg_mod.user_now = _orig_user_now
 
     print("meds: ok", len(a), "алиасов;", "stock_runs_out: пример/0/5 доз проверены")
     sys.exit(0)

@@ -20,7 +20,9 @@ MIN_PASSWORD_LEN = 12
 
 ENV_PATH = Path.home() / ".hermes" / ".env"
 
-SESSION_TIMEOUT_SEC = int(os.environ.get("ADMIN_SESSION_TIMEOUT_MIN", "60")) * 60
+def _session_timeout_sec() -> int:
+    # Read lazily: load_env_file() runs in main(), after this module is imported.
+    return int(os.environ.get("ADMIN_SESSION_TIMEOUT_MIN", "60")) * 60
 
 # Same message for "wrong password" and "IP/globally locked" — a different
 # message would let an attacker distinguish the two and time a retry.
@@ -179,11 +181,16 @@ class RateLimiter:
             self._prune(self._global, now)
             ip_times = self._per_ip.get(ip, [])
             self._prune(ip_times, now)
+            if not ip_times:
+                self._per_ip.pop(ip, None)
             return len(ip_times) >= self.max_per_ip or len(self._global) >= self.global_max
 
     def record_failure(self, ip: str) -> None:
         now = time.time()
         with self._lock:
+            # ponytail: O(n) scan of per-IP keys per failure; fine at this scale
+            for k in [k for k, v in self._per_ip.items() if not v or v[-1] < now - self.window_sec]:
+                del self._per_ip[k]
             self._per_ip.setdefault(ip, []).append(now)
             self._global.append(now)
 
@@ -197,14 +204,22 @@ class SessionStore:
     — an admin-panel restart logging everyone out is an acceptable trade for a
     single-operator personal tool."""
 
-    def __init__(self, timeout_sec: int = SESSION_TIMEOUT_SEC):
-        self.timeout_sec = timeout_sec
+    def __init__(self, timeout_sec: int | None = None):
+        self._timeout_sec = timeout_sec
         self._sessions: dict[str, dict] = {}
         self._lock = threading.Lock()
+
+    @property
+    def timeout_sec(self) -> int:
+        return self._timeout_sec if self._timeout_sec is not None else _session_timeout_sec()
 
     def create(self, authed: bool = False) -> str:
         token = secrets.token_urlsafe(32)
         with self._lock:
+            # ponytail: O(n) scan of all sessions per create; index by expiry if n ever matters
+            now = time.time()
+            for t in [t for t, s in self._sessions.items() if s["expires"] < now]:
+                del self._sessions[t]
             self._sessions[token] = {
                 "expires": time.time() + self.timeout_sec,
                 "csrf": secrets.token_urlsafe(32),

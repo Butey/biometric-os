@@ -10,7 +10,9 @@ import tarfile
 import hashlib
 import tempfile
 from pathlib import Path
-import os
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from health_core.db import DB_PATH  # noqa: E402
 
 
 def get_project_root():
@@ -50,7 +52,7 @@ def should_exclude(rel_path_str, with_metrics=False):
         return Path(rel_path_str).suffix.lower() not in METRICS_DATA_EXT
 
     # Исключаемые имена в любой части пути
-    excluded_dirs = {".venv", "__pycache__", ".git", ".pytest_cache", "dist"}
+    excluded_dirs = {".venv", "__pycache__", ".git", ".pytest_cache", "dist", ".claude"}
 
     # Проверить, содержится ли исключаемая директория в пути
     for part in path_parts:
@@ -65,8 +67,13 @@ def should_exclude(rel_path_str, with_metrics=False):
     if rel_path_str.endswith((".pyc", ".log")):
         return True
 
-    # Исключить .env файлы (только реальные, не шаблоны)
-    if rel_path_str.endswith(".env") and not rel_path_str.endswith("env.template"):
+    # Исключить БД файлы
+    if rel_path_str.endswith((".db", ".db-wal", ".db-shm")) or ".sqlite" in rel_path_str:
+        return True
+
+    # Исключить .env* файлы (любые .env-подобные)
+    filename = Path(rel_path_str).name
+    if filename.startswith(".env") and not rel_path_str.endswith("env.template"):
         return True
 
     return False
@@ -173,8 +180,7 @@ def build_release(with_metrics=False):
                     file_count += 1
 
             # 2. Добавить снимок БД если она существует
-            db_home = Path.home() / ".hermes" / "health.db"
-            if copy_db_to_archive(tar, db_home, "data/health.db"):
+            if copy_db_to_archive(tar, DB_PATH, "data/health.db"):
                 file_count += 1
 
             # 3. Добавить готовый env.template
@@ -245,8 +251,7 @@ def verify_archive(archive_path, with_metrics=False):
                     has_env_file = True
 
         # Проверка 2: health.db если база была
-        db_home = Path.home() / ".hermes" / "health.db"
-        if db_home.exists():
+        if DB_PATH.exists():
             assert has_health_db, "data/health.db должна быть в архиве если база существует"
 
         # Проверка 3: install.sh должен быть

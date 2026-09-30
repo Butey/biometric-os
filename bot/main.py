@@ -15,6 +15,7 @@ except ImportError:
 import asyncio
 import base64
 import contextlib
+import hashlib
 import io
 import json
 import logging
@@ -271,6 +272,7 @@ def _chunks(text: str, limit: int) -> list[str]:
     посередине строки делает их нечитаемыми."""
     if len(text) <= limit:
         return [text]
+    limit -= 8                            # запас под закрывающий/открывающий ``` на стыках
     out, cur = [], ""
     for para in text.split("\n\n"):
         if cur and len(cur) + len(para) + 2 > limit:
@@ -282,6 +284,14 @@ def _chunks(text: str, limit: int) -> list[str]:
         cur = f"{cur}\n\n{para}" if cur else para
     if cur:
         out.append(cur)
+    # граница внутри ``` блока: закрываем в конце куска и открываем в начале следующего
+    in_fence = False
+    for i, chunk in enumerate(out):
+        reopen = in_fence
+        for line in chunk.split("\n"):
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
+        out[i] = ("```\n" if reopen else "") + chunk + ("\n```" if in_fence else "")
     return out
 
 
@@ -357,6 +367,12 @@ def _format_models_message(providers: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _provider_id(p: dict) -> str:
+    # короткий хэш: имя модели может повторяться, а callback_data <= 64 байт
+    raw = f"{p.get('model')}|{p.get('base_url')}|{p.get('api_key_env')}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:10]
+
+
 def _model_keyboard(providers: list[dict]) -> InlineKeyboardMarkup:
     buttons = []
     for i, p in enumerate(providers):
@@ -364,7 +380,7 @@ def _model_keyboard(providers: list[dict]) -> InlineKeyboardMarkup:
         short_name = m_name.split("/")[-1]
         prefix = "🟢 " if i == 0 else ""
         text = f"{prefix}{i+1}. {short_name}"
-        buttons.append([InlineKeyboardButton(text=text, callback_data=f"switch_model:{i}")])
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"switch_model:{_provider_id(p)}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -896,12 +912,19 @@ async def _flush_pending_notifications(bot: Bot) -> None:
             log.exception("не удалось уведомить пользователя %s", target)
 
 
+def _set_user_tz(conn, user_id: int) -> None:
+    # reserve()/execute() пишут started_at/finished_at через local_now(), а он зависит от ContextVar пояса
+    row = conn.execute("SELECT timezone FROM users WHERE id=?", (user_id,)).fetchone()
+    config.set_tz(row["timezone"] if row else None)
+
+
 async def _run_council_task(bot: Bot, telegram_uid: str, user_id: int, run_id: int, reason: str) -> None:
     """Сама работа консилиума (минуты) — отдельной asyncio-задачей, не держит
     ход разговора. Своё соединение с БД: то, что открыл тул-хендлер, уже
     закрыто registry.release_connections к моменту, когда эта задача стартует."""
     conn = connect()
     try:
+        _set_user_tz(conn, user_id)
         result = await council.execute(conn, user_id, run_id, reason)
     except Exception:
         log.exception("консилиум упал целиком, run_id=%s", run_id)
@@ -909,6 +932,11 @@ async def _run_council_task(bot: Bot, telegram_uid: str, user_id: int, run_id: i
             council._finish(conn, run_id, "failed", 0, "Консилиум не состоялся: внутренняя ошибка.")
         except Exception:
             log.exception("не удалось пометить run_id=%s как failed", run_id)
+        try:
+            await bot.send_message(int(telegram_uid), "Консилиум не состоялся: внутренняя ошибка. Попробуйте позже.",
+                                   parse_mode=None)
+        except Exception:
+            log.exception("не удалось сообщить пользователю %s о сбое консилиума", telegram_uid)
         return
     finally:
         conn.close()
@@ -1332,6 +1360,8 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
         log.error("все провайдеры недоступны: %s", e)
         await message.answer("Не смог связаться с моделью. Повтори через минуту.")
         return
+    finally:
+        await _flush_pending_council(message.bot)  # см. _handle_turn
 
     await asyncio.to_thread(_close_turn, uid, full[len(prefix):])
     await _flush_pending_notifications(message.bot)
@@ -1454,6 +1484,12 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
         log.error("все провайдеры недоступны: %s", e)
         await message.answer("Не смог связаться с моделью. Записи в базе не потеряны, повтори через минуту.")
         return
+    finally:
+        # Инструмент council мог зарезервировать фоновый прогон (plugin/tools.py::
+        # handle_council) — запускаем его задачей цикла бота, не блокируя обработку
+        # следующих сообщений. В finally: если run_loop упал ПОСЛЕ резерва, заявка
+        # иначе зависла бы в очереди, а run — в running до часового сброса.
+        await _flush_pending_council(message.bot)
 
     await asyncio.to_thread(_close_turn, uid, full[len(prefix):])
     # drug_card_draft save (plugin/tools.py) ставит уведомление админам в ту же
@@ -1461,10 +1497,6 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
     # только после run_command, потому что модель зовёт этот тул из обычного
     # хода диалога, не только из слэш-команды.
     await _flush_pending_notifications(message.bot)
-    # Инструмент council мог зарезервировать фоновый прогон (plugin/tools.py::
-    # handle_council) — запускаем его задачей цикла бота ПОСЛЕ ответа модели,
-    # не блокируя обработку следующих сообщений.
-    await _flush_pending_council(message.bot)
     await send_long(message, answer)
 
 
@@ -1605,17 +1637,14 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             if cb_uid not in admin_user_ids():
                 await callback.answer("⚠ Только для администраторов.", show_alert=True)
                 return
-            try:
-                idx_str = (callback.data or "").split(":", 1)[1]
-                idx = int(idx_str)
-            except (IndexError, ValueError):
-                await callback.answer("Неверные данные.")
-                return
+            pid = (callback.data or "").split(":", 1)[1]
 
             current_cfg = load_config()
             providers = list((current_cfg.get("bot") or {}).get("providers", []))
-            if not (0 <= idx < len(providers)):
-                await callback.answer("Модель не найдена.", show_alert=True)
+            # список переставляется после каждого переключения: ищем по стабильному id, не по позиции
+            idx = next((i for i, p in enumerate(providers) if _provider_id(p) == pid), -1)
+            if idx < 0:
+                await callback.answer("Модель не найдена, обновите список (/model).", show_alert=True)
                 return
 
             if idx == 0:
@@ -1680,6 +1709,9 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             msg_text, kb = await asyncio.to_thread(_apply_target, cb_uid, kcal_val)
             if msg_text == _NOT_REGISTERED:
                 await callback.answer(_NOT_REGISTERED, show_alert=True)
+                return
+            if kb is None:  # _apply_target вернул ошибку, ничего не записано
+                await callback.answer(msg_text[:200], show_alert=True)
                 return
             await callback.answer(f"✅ Цель {kcal_val:.0f} ккал зафиксирована!")
             try:
@@ -1793,6 +1825,7 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
                 if user_id is None:
                     await callback.answer(_NOT_REGISTERED, show_alert=True)
                     return
+                _set_user_tz(conn, user_id)
                 try:
                     run_id = council.reserve(conn, user_id, "plateau")
                 except ValueError as e:
@@ -1801,7 +1834,9 @@ async def _run_polling(bot: Bot, dp: Dispatcher, cfg: dict) -> int:
             finally:
                 conn.close()
 
-            asyncio.create_task(_run_council_task(callback.bot, cb_uid, user_id, run_id, "plateau"))
+            task = asyncio.create_task(_run_council_task(callback.bot, cb_uid, user_id, run_id, "plateau"))
+            _COUNCIL_TASKS.add(task)
+            task.add_done_callback(_COUNCIL_TASKS.discard)
             await callback.answer("🩺 Консилиум запущен в фоне. Результат придёт в чат по готовности.", show_alert=True)
 
         log.info("бот запущен, разрешено пользователей: %d", len(allowed_users()))

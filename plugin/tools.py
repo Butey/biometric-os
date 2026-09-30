@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from health_core.db import connect, migrate
 from health_core.guards import check_all, record
 from health_core.energy import daily_target, bmr_floor, bmr_katch, bmr_mifflin
-from health_core.nutrition import day_macros, plate_balance
+from health_core.nutrition import plate_balance
 from health_core.report import (baseline_weight, status_bar, day_summary, trends, evening_report, whr, meals_of_day,
                                mark_achieved_milestones, weekly_summary, training_efficiency, weight_series, MINUS)
 from health_core.ingest.scale import import_export
@@ -188,13 +188,31 @@ def _now_iso(conn: sqlite3.Connection | None = None, user_id: int | None = None)
     return config.local_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+_TS_OFFSET_RE = re.compile(r"(Z|[+-]\d{2}(:?\d{2})?)$", re.IGNORECASE)
+
+
 def _norm_ts(value: str | None) -> str | None:
     """Граница доверия: метку времени присылает модель, а она пишет ISO с 'T'.
-    Приводим к формату схемы. Неразбираемое — наверх ошибкой, не молча."""
+    Приводим к формату схемы. Неразбираемое — наверх ошибкой, не молча.
+
+    Суффикс пояса ('Z', '+03:00') раньше просто отрезался, и UTC ложился в базу
+    как местное время. Теперь переводим в пояс человека (config._TZ, его выставляет
+    _get_user_id при вызове с conn); пояса нет — отказ, пусть пришлёт местное."""
     if value is None:
         return None
     v = value.strip().replace("T", " ")
-    if len(v) == 10:                      # только дата — доклеиваем полночь
+    if len(v) > 11 and _TS_OFFSET_RE.search(v[11:]):
+        name = config._TZ.get()
+        try:
+            tz = ZoneInfo(name) if name else None
+        except (ZoneInfoNotFoundError, ValueError):
+            tz = None
+        if tz is None:
+            raise ValueError(f"Метка времени {value!r} с часовым поясом: пришли местное время без суффикса пояса")
+        if v[-1] in "zZ":
+            v = v[:-1] + "+00:00"
+        return datetime.fromisoformat(v).astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+    if len(v) == 10:                     # только дата — доклеиваем полночь
         v += " 00:00:00"
     if len(v) == 16:                      # без секунд
         v += ":00"
@@ -691,7 +709,9 @@ def handle_food_lookup(params: dict) -> str:
         conn.close()
         if row is None:
             return json.dumps({"found": False}, ensure_ascii=False)
-        return json.dumps({"found": True, **_product_row(row)}, ensure_ascii=False)
+        extra = foods.extra_words(row["display_name"], name)
+        return json.dumps({"found": True, **_product_row(row), **({"extra": extra} if extra else {})},
+                          ensure_ascii=False)
 
     if action == "search":
         name = (params.get("name") or "").strip()
@@ -720,7 +740,9 @@ def handle_food_lookup(params: dict) -> str:
         # Числа не даны, но есть код OFF — код сам подтягивает состав по коду
         # (та же единая точка сети, что у search()), а не заставляет модель
         # переспрашивать то, что уже показал предыдущий search().
-        if nums["kcal"] is None and off_code:
+        # 0 рядом с кодом OFF — автозаполнитель модели, а не ккал продукта
+        if (nums["kcal"] is None or nums["kcal"] == 0) and off_code:
+            nums["kcal"] = None
             fetched = foods.fetch_by_code(off_code)
             if fetched.get("error"):
                 conn.close()
@@ -779,7 +801,7 @@ def handle_log_water(params: dict) -> str:
     # ── Удаление ошибочной записи воды ──
     if action == "delete":
         date_str = params.get("date") or _today_iso()
-        clear_day = bool(params.get("clear_day") or params.get("all"))
+        clear_day = bool(params.get("clear_day"))
         water_id = params.get("water_id")
 
         if clear_day:
@@ -1029,8 +1051,9 @@ def handle_log_sleep(params: dict) -> str:
     sleep_id = sleep_row["id"] if sleep_row else None
 
     avg = conn.execute(
-        "SELECT AVG(duration_min) d, COUNT(*) n FROM sleep_log WHERE user_id=? AND night_date >= date(?, '-6 day')",
-        (user_id, night),
+        "SELECT AVG(duration_min) d, COUNT(*) n FROM sleep_log WHERE user_id=? AND night_date >= date(?, '-6 day') "
+        "AND night_date <= ?",
+        (user_id, night, night),
     ).fetchone()
     conn.close()
     out = {"sleep_id": sleep_id,
@@ -1139,22 +1162,20 @@ def handle_log_glucose(params: dict) -> str:
     alerts = check_all(conn, user_id)
     record(conn, user_id, alerts)
 
-    # Get last few readings for trend
-    rows = conn.execute(
-        "SELECT mmol_l, at FROM glucose_log WHERE user_id=? ORDER BY at DESC LIMIT 2",
-        (user_id,),
-    ).fetchall()
+    # Тренд: против ближайшего предыдущего по времени замера, а не по порядку вставки
+    prev = conn.execute(
+        "SELECT mmol_l FROM glucose_log WHERE user_id=? AND at<? ORDER BY at DESC, id DESC LIMIT 1",
+        (user_id, at),
+    ).fetchone()
 
-    trend = None
-    if len(rows) >= 2:
-        trend = round(rows[1]["mmol_l"] - rows[0]["mmol_l"], 2)
+    trend = round(mmol_l - prev["mmol_l"], 2) if prev else None
 
     conn.close()
 
     return json.dumps(
         {
             "glucose_id": glucose_id,
-            "confirmed": True,
+            "confirmed": bool(confirmed),
             "mmol_l": mmol_l,
             "trend": trend,
             "alerts": alerts,
@@ -1998,7 +2019,7 @@ def handle_log_workout(params: dict) -> str:
 
     started_at = _norm_event_ts(params.get("started_at"), conn, user_id) or _now_iso(conn, user_id)
     notes = (params.get("notes") or "").strip() or None
-    source = params.get("source") or "manual"
+    source = "manual"
 
     # Синтетический hash для ручных записей (гарантия уникальности и соответствия DDL)
     import hashlib
@@ -2139,6 +2160,9 @@ def handle_import_scale_export(params: dict) -> str:
     alerts = check_all(conn, user_id)
     record(conn, user_id, alerts)
 
+    # Импорт весов может закрыть веху так же, как log_weight
+    achieved = mark_achieved_milestones(conn, user_id)
+
     conn.close()
 
     # added/skipped всегда явные числа в ответе — молчаливое "готово" на нулевом
@@ -2149,6 +2173,7 @@ def handle_import_scale_export(params: dict) -> str:
             "skipped": result.get("skipped", 0),
             "bursts": result.get("bursts", 0),
             "alerts": alerts,
+            "achieved_milestones": achieved,
             "activity": result.get("activity"),
         },
         ensure_ascii=False,
@@ -3225,7 +3250,6 @@ def handle_query_metrics(params: dict) -> str:
             {"error": f"metric должен быть одним из {sorted(_METRIC_MAP)}, получено {metric!r}"},
             ensure_ascii=False)
 
-    from datetime import datetime, timedelta
     since = (config.local_now() - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
 
     # Query historical data
@@ -3261,8 +3285,14 @@ def handle_query_food(params: dict) -> str:
     conn = connect()
     migrate(conn)
     user_id = _get_user_id(params, conn)
-    start_date = params.get("start_date")
-    end_date = params.get("end_date")
+    # Пропуск = один день (сегодня); метку со временем режем до даты, иначе
+    # BETWEEN по date() съедает первый день
+    try:
+        end_date = (_norm_ts(params.get("end_date") or None) or _today_iso(conn, user_id))[:10]
+        start_date = (_norm_ts(params.get("start_date") or None) or end_date)[:10]
+    except ValueError as e:
+        conn.close()
+        return json.dumps({"error": f"start_date/end_date должны быть YYYY-MM-DD: {e}"}, ensure_ascii=False)
 
     # Query food logs
     rows = conn.execute(
@@ -3565,6 +3595,14 @@ def handle_pharma(params: dict) -> str:
         # если dose в этом вызове не задаётся (COALESCE с NULL оставит как было).
         dose_by_doctor_val = (1 if by_doctor else 0) if dose_param is not None else None
 
+        # 0 от модели = "не задано" (иначе COALESCE затирает сохранённое). Остаток 0
+        # осознанно тоже unset: схема задаёт остаток через restock, а не schedule.
+        every_days = params.get("every_days") or None
+        stock_doses = params.get("stock_doses") or None
+        if every_days is not None and every_days < 0:
+            conn.close()
+            return json.dumps({"error": "every_days должен быть положительным"}, ensure_ascii=False)
+
         conn.execute(
             "INSERT INTO med_schedule(user_id, substance, dose, unit, route, every_days, next_at, "
             "stock_doses, notes, dose_by_doctor, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
@@ -3575,7 +3613,7 @@ def handle_pharma(params: dict) -> str:
             "notes=COALESCE(excluded.notes,notes), dose_by_doctor=COALESCE(excluded.dose_by_doctor,dose_by_doctor), "
             "updated_at=excluded.updated_at",
             (user_id, substance, dose_param, params.get("unit"), params.get("route"),
-             params.get("every_days"), _norm_ts(params.get("next_at")), params.get("stock_doses"),
+             every_days, _norm_ts(params.get("next_at") or None), stock_doses,
              params.get("notes"), dose_by_doctor_val, _now_iso()),
         )
         conn.commit()
@@ -3747,6 +3785,17 @@ def handle_plans(params: dict) -> str:
         conn.close()
         return json.dumps({"plans": _render_plan_vs(diff, date_str)}, ensure_ascii=False)
 
+    # Запись с дальним днём раньше падала на _PHARMA_DOW[dow] уже после записи в базу
+    if action in ("set_meal", "set_workout") and dow is not None:
+        try:
+            ok_dow = 0 <= int(dow) <= 6
+        except (TypeError, ValueError):
+            ok_dow = False
+        if not ok_dow:
+            conn.close()
+            return json.dumps({"error": f"day_of_week должен быть 0..6 (0=Пн), получено {dow!r}"},
+                              ensure_ascii=False)
+
     if action == "set_meal":
         slot = params.get("meal_slot")
         if dow is None or slot not in _MEAL_SLOTS:
@@ -3864,7 +3913,7 @@ def handle_plan_day(params: dict) -> str:
     if kind not in ("workout", "meal"):
         conn.close()
         return json.dumps({"error": "kind должен быть workout или meal"}, ensure_ascii=False)
-    ds = _norm_ts(params.get("date"))
+    ds = _norm_ts(params.get("date") or None)
     ds = ds[:10] if ds else _today_iso()
 
     if action == "list":
@@ -3906,7 +3955,7 @@ def handle_plan_day(params: dict) -> str:
         conn.execute(
             "INSERT INTO plan_log(user_id, date, kind, body, rationale, created_at) "
             "VALUES (?,?,?,?,?,?) ON CONFLICT(user_id, date, kind) DO UPDATE SET "
-            "body=excluded.body, rationale=COALESCE(excluded.rationale,rationale), "
+            "body=excluded.body, rationale=excluded.rationale, "
             "created_at=excluded.created_at",
             (user_id, ds, kind, body, params.get("rationale"), _now_iso()),
         )
@@ -4014,7 +4063,7 @@ def handle_refeed(params: dict) -> str:
         return json.dumps(st, ensure_ascii=False)
 
     if action in ("schedule", "schedule_once"):
-        start = _norm_ts(params.get("start"))
+        start = _norm_ts(params.get("start") or None)
         start = start[:10] if start else today
         reason = params.get("reason") or "manual"
         # Если явно передан horizon_weeks и не указан days — legacy MATADOR цикл
@@ -4025,7 +4074,13 @@ def handle_refeed(params: dict) -> str:
                 weeks = 12
             res = _refeed.schedule(conn, user_id, start, weeks)
         else:
-            days = int(params.get("days") or 4)
+            try:
+                days = int(params.get("days") or 4)
+            except (TypeError, ValueError):
+                days = 0
+            if not 1 <= days <= 14:
+                conn.close()
+                return json.dumps({"error": "days — число дней перерыва 1..14"}, ensure_ascii=False)
             res = _refeed.schedule_once(conn, user_id, start, days=days, reason=reason)
         conn.close()
         res["note"] = ("В первые дни перерыва вес прибавит 1.5-2.5 кг — это гликоген "
@@ -4058,7 +4113,7 @@ def handle_sick(params: dict) -> str:
         return json.dumps(st, ensure_ascii=False)
 
     if action == "start":
-        days = params.get("days")
+        days = params.get("days") or None
         if days is not None:
             try:
                 days = int(days)
@@ -4200,7 +4255,7 @@ def handle_pantry(params: dict) -> str:
             conn.close()
             return json.dumps({"error": f"'{name}' нет в холодильнике"}, ensure_ascii=False)
         try:
-            amount = _qty_or_none()
+            amount = _qty_or_none() or None   # 0 от модели = "не задано" -> убрать целиком
         except (TypeError, ValueError):
             conn.close()
             return json.dumps({"error": "Количество должно быть числом"}, ensure_ascii=False)
@@ -4323,7 +4378,7 @@ def handle_explain_target(params: dict) -> str:
     conn = connect()
     migrate(conn)
     user_id = _get_user_id(params, conn)
-    date_str = params.get("date", _today_iso())
+    date_str = params.get("date") or _today_iso(conn, user_id)
 
     # Строка на сегодня могла устареть — пересчитываем при чтении
     if date_str == _today_iso(conn, user_id):
@@ -4844,7 +4899,6 @@ def _admin_denial(caller_id: str, is_admin_caller: bool) -> str | None:
 def handle_admin_cmd(params: dict) -> str:
     """Admin command handler. Real telegram_user_id from Hermes gateway, never from params."""
     import yaml
-    import shutil
     from pathlib import Path
 
     # Get REAL caller identity from gateway ContextVar, NOT from params
@@ -4893,7 +4947,7 @@ def handle_admin_cmd(params: dict) -> str:
             return json.dumps({"error": "milestone: requires add|del <name> ..."}, ensure_ascii=False)
         action = parts[1]
         if action == "add":
-            if len(parts) < 4:
+            if len(parts) < 5:
                 return json.dumps({"error": "milestone add: requires <name> <metric> <threshold> [deadline]"}, ensure_ascii=False)
             name, metric, threshold = parts[2], parts[3], parts[4]
             deadline = parts[5] if len(parts) > 5 else None
@@ -4915,7 +4969,10 @@ def handle_admin_cmd(params: dict) -> str:
     elif subcmd == "backup":
         return _admin_backup()
     elif subcmd == "alerts":
-        n = int(parts[1]) if len(parts) > 1 else 10
+        try:
+            n = int(parts[1]) if len(parts) > 1 else 10
+        except ValueError:
+            return json.dumps({"error": "alerts: usage alerts [n], n - целое число"}, ensure_ascii=False)
         return _admin_alerts(n)
     else:
         valid = ["mode", "status", "guards", "targets", "set", "milestone", "milestones", "recalc", "export", "backup", "alerts"]
@@ -6463,6 +6520,13 @@ if __name__ == "__main__":
         print(f"OK: Status command succeeded")
         print(f"Output:\n{result['text']}")
 
+        # milestone add без threshold раньше падал IndexError на parts[4]; alerts abc — сырой ValueError
+        _short = json.loads(handler({"command": "milestone add m1 weight_kg"}))
+        assert "requires" in _short.get("error", ""), f"milestone add без threshold: usage-ошибка, получили {_short}"
+        _badn = json.loads(handler({"command": "alerts abc"}))
+        assert "usage" in _badn.get("error", ""), f"alerts abc: usage-ошибка, получили {_badn}"
+        print("OK: milestone add с нехваткой аргументов и alerts с мусором дают usage-ошибку")
+
         print("\n" + "="*60)
         print("TEST 19: admin_cmd set on unknown key")
         print("="*60)
@@ -6909,6 +6973,8 @@ if __name__ == "__main__":
             "register_user": {"height_cm": 180.0, "birth_date": "1990-01-01", "sex": "m"},
             "log_med": {"drug": "Тест", "dose": "1", "route": "oral"},
             "log_workout": {"sport": "Бег", "duration_min": 30, "kcal": 250},
+            # даты 'x' дамми-заглушки query_food теперь справедливо отклоняются
+            "query_food": {"start_date": "2026-09-01", "end_date": "2026-09-07"},
             # action=fetch бьёт в сеть (openFDA/ClinicalTrials.gov) — самотесты сеть
             # не трогают (см. TEST в card_drafts.py, где HTTP подменяется). save не
             # сетевой, им и проверяем контракт полей.
@@ -7064,6 +7130,47 @@ if __name__ == "__main__":
         vs = _pl(action="vs_actual", date="2026-08-24")["plans"]  # 24.08.2026 = понедельник
         assert "План vs факт" in vs and "Еда: план 350" in vs, vs
         print("OK: pharma schedule/restock/remove + log_med списывает и двигает дозу; plans set/show/vs_actual")
+
+        # set_meal с днём вне 0..6: раньше писало строку и падало IndexError на ответе
+        assert "error" in _pl(action="set_meal", day_of_week=9, meal_slot="lunch", name="X")
+        assert "error" in _pl(action="set_workout", day_of_week=-1, name="X")
+        assert conn.execute("SELECT COUNT(*) c FROM meal_plan WHERE user_id=? AND day_of_week=9",
+                            (rx_uid,)).fetchone()["c"] == 0, "мусорный день не должен писаться"
+
+        # refeed days вне 1..14 отклоняется, а не пишет год перерывов
+        _rf = lambda **kw: json.loads(handle_refeed({"user_id": rx_uid, "action": "schedule", **kw}))
+        assert "error" in _rf(days=365) and "error" in _rf(days=-3)
+        assert "error" not in _rf(days=3, start=""), "start='' - не задан"
+
+        # глюкоза: тренд против ближайшего предыдущего по времени замера, а не по порядку вставки
+        _gl = lambda **kw: json.loads(handle_log_glucose({"user_id": rx_uid, **kw}))
+        _gl(mmol_l=5.0, at="2026-09-20 08:00:00")
+        _gl(mmol_l=7.0, at="2026-09-20 12:00:00")
+        _back = _gl(mmol_l=6.0, at="2026-09-20 10:00:00")   # вставка задним числом между двумя
+        assert _back["trend"] == 1.0 and _back["confirmed"] is False, _back
+        assert _gl(mmol_l=4.0, at="2026-09-19 08:00:00")["trend"] is None, "раньше всех - сравнивать не с чем"
+        assert _gl(mmol_l=4.5, at="2026-09-19 09:00:00", confirmed=True)["confirmed"] is True
+
+        # сон: среднее за 7 дней не заглядывает в ночи позже вставляемой
+        _sl = lambda **kw: json.loads(handle_log_sleep({"user_id": rx_uid, **kw}))
+        _sl(night_date="2026-09-25", duration_min=600)
+        assert _sl(night_date="2026-09-22", duration_min=300)["avg_7d_min"] == 300, "будущая ночь не входит в среднее"
+
+        # метка с поясом: без пояса пользователя отказ, с поясом - перевод в местное
+        assert "error" in json.loads(handle_log_water({"user_id": rx_uid, "ml": 100, "at": "2026-09-20T08:00:00Z"}))
+        config.set_tz("Europe/Moscow")
+        try:
+            assert _norm_ts("2026-09-20T08:00:00Z") == "2026-09-20 11:00:00"
+            assert _norm_ts("2026-09-20 08:00:00+03:00") == "2026-09-20 08:00:00"
+            assert _norm_ts("2026-09-20") == "2026-09-20 00:00:00"
+        finally:
+            config.set_tz(None)
+
+        # query_food: дата со временем не съедает первый день, пропуск - не "ничего не найдено"
+        assert json.loads(handle_query_food({"user_id": rx_uid, "start_date": "2026-09-20 00:00:00",
+                                             "end_date": "2026-09-20T23:59:59"}))["start_date"] == "2026-09-20"
+        assert "error" in json.loads(handle_query_food({"user_id": rx_uid, "start_date": "junk"}))
+        print("OK: plans day_of_week, refeed days, glucose trend, sleep avg, _norm_ts tz, query_food dates")
 
         print("\n" + "="*60)
         print("TEST 28: _goal_progress — доля пути старт→цель в обе стороны")

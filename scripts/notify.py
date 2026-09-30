@@ -66,18 +66,18 @@ def send(token: str, chat_id: str, text: str) -> None:
                 print(f"telegram отказал для {chat_id}: {body}", file=sys.stderr)
                 
     for mf in media_files:
-        import os
-        import subprocess
         if not os.path.exists(mf):
             print(f"Файл {mf} не найден", file=sys.stderr)
             continue
         cmd = [
-            "curl", "-s",
+            "curl", "-s", "-m", "120", "--fail",
             "-F", f"chat_id={chat_id}",
             "-F", f"document=@{mf}",
             f"https://api.telegram.org/bot{token}/sendDocument"
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise OSError(f"sendDocument failed: {res.stderr}")
         try:
             body = json.loads(res.stdout)
             if not body.get("ok"):

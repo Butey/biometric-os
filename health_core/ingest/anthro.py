@@ -63,7 +63,11 @@ def import_anthro(conn, user_id: int, records: list[dict]) -> dict:
         if site not in SITES:
             skipped += 1
             continue
-        value = _parse_value(r["value"])
+        try:
+            value = _parse_value(r["value"])
+        except ValueError:
+            skipped += 1
+            continue
         cur = conn.execute(
             "INSERT INTO anthropometry(user_id, measured_on, site, value_cm) VALUES (?, ?, ?, ?) "
             "ON CONFLICT(user_id, measured_on, site) DO NOTHING",

@@ -16,7 +16,7 @@ DIARY_DIR = Path(__file__).resolve().parent.parent.parent / "Nutrition"
 _DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 _MEAL_RE = re.compile(r"^#{1,4}\s*\*{0,2}[^\w\n]*([А-Яа-яЁё\s]+?)\s*\((\d{1,2}:\d{2})\)", re.M)
 _WATER_RE = re.compile(r"\*\*(\d{1,2}:\d{2})\*\*\s*[—–-]\s*[^\n|]*?(\d+)\s*мл")
-_SLOTS = {"завтрак": "breakfast", "обед": "lunch", "ужин": "dinner", "перекус": "snack"}
+_SLOTS = {"перекус": "snack", "завтрак": "breakfast", "обед": "lunch", "ужин": "dinner"}
 
 
 def _clean(cell: str) -> str:

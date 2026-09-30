@@ -494,11 +494,11 @@ def calibrate(
                     weight_at_cur_deadline = proj["end"]
 
         kg_diff = start_weight - target_kg
-        if deficit > 0 and kg_diff > 0:
+        # Срок из динамической модели (как forecast_reach); 7700 - только запасной путь.
+        aligned_deadline = fr.get("expected")
+        if aligned_deadline is None and deficit > 0 and kg_diff > 0:
             aligned_days = max(1, round(kg_diff * 7700.0 / deficit))
             aligned_deadline = (today + timedelta(days=aligned_days)).isoformat()
-        else:
-            aligned_deadline = fr.get("expected")
 
         applied = False
         applied_message = None
@@ -714,7 +714,6 @@ def plateau_forecast(
     4. Клинические рекомендации по преодолению плато (рефид, консилиум, замеры талии).
     """
     from health_core.energy import daily_expenditure, kcal_floor
-    from health_core.config import targets_for
 
     u = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
     if u is None:
@@ -794,9 +793,12 @@ def plateau_forecast(
     slowdown_weight = None
     if "trajectory" in proj:
         traj = proj["trajectory"]
+        was_falling = False
         for i in range(7, len(traj)):
             weekly_drop = traj[i - 7]["mid"] - traj[i]["mid"]
-            if weekly_drop < 0.10:
+            if weekly_drop > 0.10:
+                was_falling = True
+            elif was_falling:
                 slowdown_date = traj[i]["date"]
                 slowdown_weight = traj[i]["mid"]
                 break
@@ -835,10 +837,12 @@ def plateau_forecast(
                     f"Вес колеблется в пределах {weight_spread_10d} кг за 10 дней, но талия уменьшилась "
                     f"на {abs(waist_change_21d)} см. Жир сгорает, застой на весах вызван задержкой воды/гликогена."
                 )
-            elif len(rows_w) >= 6 and (today - date.fromisoformat(rows_w[0]["d"])).days >= 18:
+            elif (len(rows_w) >= 6 and (today - date.fromisoformat(rows_w[0]["d"])).days >= 18
+                  and max(r["w"] for r in rows_w) - min(r["w"] for r in rows_w) <= 0.5):
+                spread_all = round(max(r["w"] for r in rows_w) - min(r["w"] for r in rows_w), 2)
                 stagnation_verdict = "истинное плато"
                 stagnation_details = (
-                    f"Вес зафиксирован более 18 дней (размах всего {weight_spread_10d} кг), объемы не падают. "
+                    f"Вес зафиксирован более 18 дней (размах всего {spread_all} кг), объемы не падают. "
                     f"Это метаболическая адаптация: рекомендуется плановый рефид или консилиум."
                 )
             else:
@@ -958,6 +962,11 @@ if __name__ == "__main__":
     p_flat = project(conn, 1, 30, intake_kcal=bmr * 1.20)
     assert abs(p_flat["end"]["mid"] - 122.0) < 0.15, p_flat["end"]
     print(f"OK: приход на уровне расхода держит массу ({p_flat['end']['mid']} кг за 30 дней)")
+
+    # Поддержание: вес не падал, "замедления" быть не должно.
+    pf = plateau_forecast(conn, 1, intake_kcal=bmr * 1.20)
+    assert pf["metabolic_equilibrium"]["slowdown_date"] is None, pf["metabolic_equilibrium"]
+    print("OK: на поддержании замедление снижения не объявляется")
 
     p_up = project(conn, 1, 30, intake_kcal=4000)
     assert p_up["end"]["mid"] > 122.0, p_up["end"]

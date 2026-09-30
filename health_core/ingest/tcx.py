@@ -71,9 +71,9 @@ def import_tcx(conn, user_id: int, path: str) -> dict:
     if not summary["started_at"]:
         return {"added": 0, "skipped": 1}  # битый файл — не помечаем как импортированный
 
-    started_at = datetime.strptime(
-        summary["started_at"], "%Y-%m-%dT%H:%M:%S.%fZ"
-    ).strftime("%Y-%m-%d %H:%M:%S")
+    started_at = datetime.fromisoformat(
+        summary["started_at"].replace("Z", "+00:00")
+    ).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
     duration_min = summary["duration_sec"] / 60 if summary["duration_sec"] else None
     sport = _sport_from_filename(path)
 

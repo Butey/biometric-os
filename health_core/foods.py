@@ -110,12 +110,12 @@ def fetch_by_code(off_code: str) -> dict:
 # casefold -> скобки с содержимым долой -> из остатка берём только слова из
 # букв (числа и единицы вроде "г"/"мл"/"шт"/"кг" сами не попадают в этот
 # список ИЛИ короче 3 букв — либо то, либо другое) -> служебные слова долой ->
-# каждое слово обрезаем до первых 5 букв (грубая основа) -> отсортированное
-# множество основ.
+# каждое слово обрезаем до первых 6 букв (грубая основа; при 5 "творог" и
+# "творожный" сливались) -> отсортированное множество основ.
 _PAREN_RE = re.compile(r"\([^)]*\)")
 _WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 _STOPWORDS = {"для", "без", "при", "над", "под", "или"}
-_STEM_LEN = 5
+_STEM_LEN = 6
 _MIN_WORD_LEN = 3
 
 
@@ -127,6 +127,16 @@ def name_stems(name: str) -> set[str]:
             continue
         stems.add(w[:_STEM_LEN])
     return stems
+
+
+def extra_words(saved_name: str, query: str) -> list[str]:
+    """Слова запроса, которых нет в сохранённом продукте: «чай» по запросу
+    «чай с молоком и сахаром» -> ['молоком', 'сахаром']. Сохранённый продукт —
+    ровно то, что сохранено; добавки — отдельные позиции."""
+    saved = name_stems(saved_name)
+    s = _PAREN_RE.sub(" ", (query or "").casefold())
+    return [w for w in _WORD_RE.findall(s)
+            if len(w) >= _MIN_WORD_LEN and w not in _STOPWORDS and w[:_STEM_LEN] not in saved]
 
 
 def name_key(name: str) -> str:
@@ -153,13 +163,18 @@ def find_mine(conn, user_id: int, name: str):
     q_stems = name_stems(name)
     if not q_stems:
         return None
-    best, best_n = None, -1
+    best, best_key = None, None
     for r in conn.execute(
         "SELECT * FROM my_products WHERE user_id=? ORDER BY id", (user_id,)
     ).fetchall():
-        saved = set((r["name_key"] or "").split())
-        if saved and saved <= q_stems and len(saved) > best_n:
-            best, best_n = r, len(saved)
+        # Основы по display_name, а не по сохранённому name_key: строки, записанные
+        # при прежней длине основы (5), иначе перестали бы находиться.
+        saved = name_stems(r["display_name"])
+        # Строка с 0 ккал (сбой автозаполнения) не должна перебивать нормальную запись
+        # того же продукта: по ней модель видит «найден, но 0» и уходит в оценку.
+        key = (bool(r["kcal_100g"]), len(saved))
+        if saved and saved <= q_stems and (best_key is None or key > best_key):
+            best, best_key = r, key
     return best
 
 
@@ -174,6 +189,10 @@ def remember(conn, user_id: int, name: str, *, source: str, off_code=None,
     key = name_key(display_name)
     if not display_name or not key:
         raise ValueError("Название продукта пустое")
+    # Строка с ключом прежней длины основы (5) - переводим на новый ключ, иначе UPSERT даст дубль.
+    for r in conn.execute("SELECT id, name_key, display_name FROM my_products WHERE user_id=?", (user_id,)).fetchall():
+        if r["name_key"] != key and name_key(r["display_name"]) == key:
+            conn.execute("UPDATE OR IGNORE my_products SET name_key=? WHERE id=?", (key, r["id"]))
     conn.execute(
         "INSERT INTO my_products(user_id, name_key, display_name, off_code, kcal_100g, "
         "protein_100g, fat_100g, carbs_100g, fiber_100g, source, created_at) "
@@ -253,7 +272,7 @@ if __name__ == "__main__":
     # ---- name_stems/keys_match: самопроверка из ТЗ ----
     a = foods_mod.name_stems("Хлеб Бородинский 80 г (в тостере)")
     b = foods_mod.name_stems("бородинский хлеб")
-    assert a == b == {"хлеб", "бород"}, (a, b)
+    assert a == b == {"хлеб", "бороди"}, (a, b)
     print("OK: 'Хлеб Бородинский 80 г (в тостере)' и 'бородинский хлеб' -> один ключ")
 
     saved_key = foods_mod.name_key("бородинский")
@@ -265,6 +284,17 @@ if __name__ == "__main__":
     assert not foods_mod.keys_match(saved_key2, "творог 5%"), \
         "'творог 5%' не должен совпадать с сохранённым 'творожный сыр'"
     print("OK: 'творог 5%' не совпадает с сохранённым 'творожный сыр'")
+
+    # Обратная коллизия: "творог" и "творожный" раньше сливались в одну основу.
+    assert not foods_mod.keys_match(foods_mod.name_key("творог"), "творожный сыр"), \
+        "сохранённый 'творог' не должен совпадать с 'творожный сыр'"
+    assert not foods_mod.keys_match(foods_mod.name_key("творожный сыр"), "творог"), \
+        "сохранённый 'творожный сыр' не должен совпадать с 'творог'"
+    print("OK: 'творог' и 'творожный сыр' — разные продукты")
+
+    assert foods_mod.extra_words("чай", "чай с молоком и сахаром") == ["молоком", "сахаром"]
+    assert foods_mod.extra_words("бородинский хлеб", "хлеб бородинский 80 г") == []
+    print("OK: extra_words — добавки к сохранённому продукту видны отдельно")
 
     # ---- my_products: remember/find_mine/list_mine/forget на временной БД ----
     conn = connect()
@@ -278,6 +308,12 @@ if __name__ == "__main__":
     row = foods_mod.find_mine(conn, uid, "Бородинские тосты сухие")
     assert row is not None and row["id"] == pid and row["kcal_100g"] == 208, row
     print("OK: remember() -> find_mine() находит по другой формулировке")
+
+    foods_mod.remember(conn, uid, "творог", source="label", kcal_100g=121)
+    assert foods_mod.find_mine(conn, uid, "творожный сыр") is None
+    assert foods_mod.find_mine(conn, uid, "творог 5%")["kcal_100g"] == 121
+    assert foods_mod.forget(conn, uid, "творог") is True
+    print("OK: find_mine() не путает 'творог' и 'творожный сыр'")
 
     # remember того же продукта другой формулировкой -> апдейт, не дубликат
     pid2 = foods_mod.remember(conn, uid, "бородинский хлеб (обновлено)", source="off",

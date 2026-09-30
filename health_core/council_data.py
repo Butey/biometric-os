@@ -10,7 +10,7 @@ from datetime import timedelta
 
 from health_core.config import local_now, latest_ffm, user_now
 from health_core.energy import daily_expenditure, kcal_floor, fat_mass_kg, lean_share
-from health_core.report import whr, trends
+from health_core.report import trends
 from health_core.nutrition import day_macros
 from health_core.meds import stock_runs_out
 from health_core import glp1

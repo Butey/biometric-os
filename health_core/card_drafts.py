@@ -167,7 +167,16 @@ _CARD_FIELD_LINES = (
 
 
 _LADDER_RE = re.compile(r"\d+(?:\.\d+)?(?:\s*,\s*\d+(?:\.\d+)?)*(?:\s*(?:мг|mg))?", re.I)
-_NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)(?:\s*[a-zа-яё.]+)?", re.I)
+_NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)(?:\s*([a-zа-яё.]+))?", re.I)
+# meds._num единицы игнорирует ("160 ч" в сутках прочлось бы как 160 суток),
+# поэтому единица допустима только своя для поля.
+_DAY_UNITS = {"сут", "дн", "день", "дня", "дней"}
+_FIELD_UNITS = {
+    "min_weeks": {"нед", "неделя", "недели", "недель"},
+    "interval_days": _DAY_UNITS,
+    "half_life_days": _DAY_UNITS,
+    "tmax_h": {"ч", "час", "часа", "часов"},
+}
 
 
 def _one_line(value) -> str:
@@ -194,6 +203,9 @@ def _checked_fields(substance: str, synonyms: str, fields: dict) -> tuple[str, s
         m = _NUMBER_RE.fullmatch(clean[key]) if clean[key] else None
         if clean[key] and (m is None or float(m.group(1)) <= 0 or (integer and "." in m.group(1))):
             problems.append(f"{key} — {'целое ' if integer else ''}положительное число")
+        elif m and m.group(2) and m.group(2).casefold().rstrip(".") not in _FIELD_UNITS[key]:
+            problems.append(f"{key} — единица «{m.group(2)}» не подходит, допустимо: "
+                            f"без единицы или {'/'.join(sorted(_FIELD_UNITS[key]))}")
     if problems:
         raise ValueError("Черновик не прошёл проверку: " + "; ".join(problems))
     return substance, synonyms, clean
@@ -411,6 +423,9 @@ if __name__ == "__main__":
             {"status": "одобрен"},
             {"min_weeks": "2.5"},
             {"half_life_days": "долго"},
+            {"half_life_days": "160 ч"},
+            {"tmax_h": "2 сут"},
+            {"interval_days": "7 ч"},
         ):
             try:
                 cd.approve(conn, bad, bad_fields)

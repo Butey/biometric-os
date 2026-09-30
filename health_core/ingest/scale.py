@@ -170,11 +170,12 @@ def import_export(conn, user_id: int, path: str) -> dict:
         else:
             skipped += 1
 
-    conn.execute(
-        "INSERT INTO import_log(user_id, imported_at, file_hash) VALUES (?, ?, ?) "
-        "ON CONFLICT(file_hash) DO NOTHING",
-        (user_id, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), file_hash),
-    )
+    if len(bursts) > 0:
+        conn.execute(
+            "INSERT INTO import_log(user_id, imported_at, file_hash) VALUES (?, ?, ?) "
+            "ON CONFLICT(file_hash) DO NOTHING",
+            (user_id, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), file_hash),
+        )
     conn.commit()
     return {"added": added, "skipped": skipped, "bursts": len(bursts)}
 
