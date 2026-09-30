@@ -3907,12 +3907,13 @@ def handle_forecast(params: dict) -> str:
     user_id = _get_user_id(params, conn)
     action = (params.get("action") or "project").lower()
 
+    # Модель шлёт незаданные поля как 0 / "" — это "не задано", не сценарий на 0 ккал.
     intake = params.get("intake_kcal")
-    intake = float(intake) if intake is not None else None
+    intake = float(intake) if intake else None
 
     if action == "reach":
         target = params.get("target_kg")
-        if target is None:
+        if not target:
             conn.close()
             return json.dumps({"error": "Для reach нужен target_kg"}, ensure_ascii=False)
         res = _fc.reach(conn, user_id, float(target), intake)
@@ -3937,9 +3938,9 @@ def handle_forecast(params: dict) -> str:
 
     if action == "calibrate":
         target = params.get("target_kg")
-        target = float(target) if target is not None else None
-        deadline = params.get("deadline")
-        target_kcal = params.get("target_kcal") if params.get("target_kcal") is not None else intake
+        target = float(target) if target else None
+        deadline = params.get("deadline") or None
+        target_kcal = params.get("target_kcal") or intake
         apply = bool(params.get("apply", False))
         res = _fc.calibrate(
             conn, user_id, target_kg=target, deadline=deadline,
