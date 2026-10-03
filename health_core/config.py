@@ -1,5 +1,6 @@
 """Три уровня настроек (§03): config.yaml (политика) -> users/user_targets (профиль)
 -> milestones (вехи, задаёт и правит сам пользователь)."""
+import os
 import sqlite3
 from contextvars import ContextVar
 from datetime import datetime
@@ -30,6 +31,10 @@ def load() -> dict:
     if _config_cache is None or mtime != _config_mtime:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             _config_cache = yaml.safe_load(f)
+        # Админы задаются окружением (~/.hermes/.env), а не config.yaml: id не должен лежать в git.
+        admin_ids = os.environ.get("HEALTH_ADMIN_IDS", "").replace(",", " ").split()
+        if admin_ids:
+            _config_cache.setdefault("admin", {})["telegram_admin_ids"] = [int(i) for i in admin_ids]
         _config_mtime = mtime
     return _config_cache
 

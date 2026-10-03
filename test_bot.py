@@ -23,6 +23,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 _TMP = tempfile.mkdtemp(prefix="health_bot_test_")
 os.environ["HEALTH_DB"] = str(Path(_TMP) / "health.db")   # до импорта health_core.db
 os.environ["TELEGRAM_ALLOWED_USERS"] = "111,222"
+os.environ["HEALTH_ADMIN_IDS"] = "900000001"   # админ для тестов, реальный id в git не хранится
 
 from bot import history, knowledge, llm, main, registry   # noqa: E402
 from health_core.db import connect, migrate               # noqa: E402
@@ -326,7 +327,7 @@ def test_slash_commands_run_without_model():
 
 
 def test_admin_switch_model():
-    admin_id = "374939064"
+    admin_id = "900000001"
     out = main.run_command(admin_id, "/model")
     assert "Цепочка моделей" in out, out
 

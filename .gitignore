@@ -4,3 +4,7 @@ __pycache__/
 *.egg-info/
 config.bak
 .claude/scheduled_tasks.lock
+Knowledge/personal/
+Metrics/
+Nutrition/
+test_output.txt
