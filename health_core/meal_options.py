@@ -18,17 +18,24 @@ _PIECE_G = (("яйц", 60), ("тунец", 185), ("макрел", 185), ("гор
             ("сардин", 185), ("шпрот", 185), ("скумбр", 185))
 
 
-def _grams(qty, unit, name=""):
-    """(граммы, предположен ли вес). Единица - масса/объём - точно; штуки и банки -
-    по таблице типовых весов, иначе None."""
+def grams_per_unit(unit, name=""):
+    """(граммов в одной единице запаса, предположен ли вес). Масса/объём - точно;
+    штуки и банки - по таблице типовых весов, иначе (None, False)."""
     k = _UNIT_G.get((unit or "").strip().lower().rstrip("."))
-    if qty and k:
-        return qty * k, False
+    if k:
+        return k, False
     low = name.lower()
-    for key, g in _PIECE_G:
-        if qty and key in low and (unit or "").strip().lower() in ("шт", "банка", "банки", "банок", "уп", ""):
-            return qty * g, True
+    if (unit or "").strip().lower() in ("шт", "банка", "банки", "банок", "уп", ""):
+        for key, g in _PIECE_G:
+            if key in low:
+                return g, True
     return None, False
+
+
+def _grams(qty, unit, name=""):
+    """(граммы всего запаса, предположен ли вес) или (None, False)."""
+    g, assumed = grams_per_unit(unit, name)
+    return (qty * g, assumed) if qty and g else (None, False)
 
 
 def _round5(x: float) -> int:

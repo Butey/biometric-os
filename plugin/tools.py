@@ -655,6 +655,7 @@ def handle_log_food(params: dict) -> str:
             {"error": f"Записано {_written} позиций из {len(items)} — приём отменён"},
             ensure_ascii=False)
     conn.commit()
+    pantry_done, pantry_skipped = _pantry_deduct(conn, user_id, items)
 
     # Check guards and record alerts
     alerts = check_all(conn, user_id)
@@ -666,11 +667,44 @@ def handle_log_food(params: dict) -> str:
 
     return json.dumps(
         {"status_bar": bar, "alerts": alerts, "meal_slot": meal_slot,
+         **({"pantry_deducted": pantry_done} if pantry_done else {}),
+         **({"pantry_not_deducted": pantry_skipped} if pantry_skipped else {}),
          # source по каждой позиции — видно, откуда взят состав (CONTEXT.md
          # «Состав продукта»): off/my_product/label — из базы, estimate/NULL — оценка.
          "items": [{"name": i["name"], "kcal": i.get("kcal"), "source": i.get("source")} for i in items]},
         ensure_ascii=False,
     )
+
+
+def _pantry_deduct(conn, user_id: int, items: list) -> tuple[list, list]:
+    """Съеденное списывается из запаса само: позиция запаса находится по названию
+    (_pantry_find), граммы переводятся в единицы запаса. Возвращает (списано,
+    не списано из-за неизвестного веса единицы). Позиции, которых нет в запасе, молчат."""
+    from health_core.meal_options import grams_per_unit
+    done, skipped = [], []
+    for it in items:
+        try:
+            grams = float(it.get("grams"))
+        except (TypeError, ValueError):
+            continue
+        row = _pantry_find(conn, user_id, it.get("name") or "", loose=True) if grams > 0 else None
+        if row is None or row["qty"] is None:
+            continue
+        pu = conn.execute("SELECT unit FROM pantry WHERE id=?", (row["id"],)).fetchone()["unit"]
+        gpu, _ = grams_per_unit(pu, row["name"])
+        if gpu is None:
+            skipped.append(row["name"])
+            continue
+        take = grams / gpu
+        left = row["qty"] - take
+        if left <= 1e-6:
+            conn.execute("DELETE FROM pantry WHERE id=?", (row["id"],))
+            left = 0.0
+        else:
+            conn.execute("UPDATE pantry SET qty=?, updated_at=? WHERE id=?", (round(left, 3), _now_iso(), row["id"]))
+        done.append({"name": row["name"], "took": round(take, 2), "unit": pu, "left": round(left, 2)})
+    conn.commit()
+    return done, skipped
 
 
 def _product_row(r) -> dict:
@@ -7198,6 +7232,22 @@ if __name__ == "__main__":
             "добавление в другом регистре не должно плодить дубль"
         assert "ok" in _pan(action="remove", name="Творог Анфискино 5%", qty=100), "списание по уточнённому названию"
         assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name='Творог'", (p_uid,)).fetchone()["qty"] == 200.0
+        # log_food сам списывает съеденное из запаса: граммы, штуки по типовому весу, неизвестный вес - отдельно
+        _pan(action="add", name="Куриное филе", qty=400, unit="г", category="Белковые")
+        _pan(action="add", name="Яйца СВ XXL", qty=10, unit="шт", category="Белковые")
+        _lf = json.loads(handle_log_food({"user_id": p_uid, "meal_slot": "lunch", "items": [
+            {"name": "куриное филе", "grams": 150, "kcal": 170, "protein_g": 34, "fat_g": 3, "carbs_g": 0},
+            {"name": "Яйца СВ", "grams": 120, "kcal": 188, "protein_g": 15, "fat_g": 14, "carbs_g": 1},
+            {"name": "Огурец", "grams": 100, "kcal": 15, "protein_g": 1, "fat_g": 0, "carbs_g": 3},
+            {"name": "Банан", "grams": 100, "kcal": 90, "protein_g": 1, "fat_g": 0, "carbs_g": 22}]}))
+        _took = {d["name"]: d for d in _lf["pantry_deducted"]}
+        assert _took["Куриное филе"]["left"] == 250 and _took["Яйца СВ XXL"]["took"] == 2 and _took["Яйца СВ XXL"]["left"] == 8, _lf
+        assert _lf["pantry_not_deducted"] == ["Огурец"], "шт без известного веса не списываем наугад"
+        assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name='Огурец'", (p_uid,)).fetchone()["qty"] == 2
+        _lf2 = json.loads(handle_log_food({"user_id": p_uid, "meal_slot": "dinner", "items": [
+            {"name": "куриное филе", "grams": 900, "kcal": 1000, "protein_g": 100, "fat_g": 20, "carbs_g": 0}]}))
+        assert _lf2["pantry_deducted"][0]["left"] == 0, _lf2
+        assert conn.execute("SELECT COUNT(*) c FROM pantry WHERE user_id=? AND name='Куриное филе'", (p_uid,)).fetchone()["c"] == 0
         print("OK: pantry list/add/remove — сумма при пополнении, декремент, удаление на нуле, ошибка на отсутствующем, группировка")
 
         print("\n" + "="*60)
