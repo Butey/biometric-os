@@ -18,9 +18,11 @@ _PIECE_G = (("яйц", 60), ("тунец", 185), ("макрел", 185), ("гор
             ("сардин", 185), ("шпрот", 185), ("скумбр", 185))
 
 
-def grams_per_unit(unit, name=""):
+def grams_per_unit(unit, name="", piece_g=None):
     """(граммов в одной единице запаса, предположен ли вес). Масса/объём - точно;
     штуки и банки - по таблице типовых весов, иначе (None, False)."""
+    if piece_g:
+        return piece_g, False
     k = _UNIT_G.get((unit or "").strip().lower().rstrip("."))
     if k:
         return k, False
@@ -32,9 +34,9 @@ def grams_per_unit(unit, name=""):
     return None, False
 
 
-def _grams(qty, unit, name=""):
+def _grams(qty, unit, name="", piece_g=None):
     """(граммы всего запаса, предположен ли вес) или (None, False)."""
-    g, assumed = grams_per_unit(unit, name)
+    g, assumed = grams_per_unit(unit, name, piece_g)
     return (qty * g, assumed) if qty and g else (None, False)
 
 
@@ -53,13 +55,13 @@ def build(conn: sqlite3.Connection, user_id: int, slot: str | None = None, n: in
     from health_core.report import day_summary
     now = user_now(conn, user_id)
     slot = slot if slot in _SHARE else meal_slot(conn, user_id, now)
-    rows = conn.execute("SELECT name, qty, unit, category FROM pantry WHERE user_id=? ORDER BY name", (user_id,)).fetchall()
+    rows = conn.execute("SELECT name, qty, unit, category, piece_g FROM pantry WHERE user_id=? ORDER BY name", (user_id,)).fetchall()
     if not rows:
         return {"slot": slot, "options": [], "note": "Запасы пусты. Запиши покупки (фото чека добавит их само)."}
 
     items, no_macros, uncounted = [], [], []
     for r in rows:
-        grams, assumed = _grams(r["qty"], r["unit"], r["name"])
+        grams, assumed = _grams(r["qty"], r["unit"], r["name"], r["piece_g"])
         if grams is None:
             uncounted.append(f"{r['name']} ({r['qty'] if r['qty'] is not None else '?'} {r['unit'] or ''})".strip())
             continue

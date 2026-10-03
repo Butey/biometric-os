@@ -496,6 +496,22 @@ def handle_log_food(params: dict) -> str:
     # обязательных КБЖУ ниже — старый формат (модель сама прислала числа) через
     # этот блок просто не проходит (per_100g отсутствует) и работает как раньше.
     _ITEM_SOURCES = ("off", "my_product", "label", "estimate")
+    # pieces (кусочки нарезки): граммы считает код по сохранённому весу кусочка продукта
+    for i in items:
+        if i.get("pieces") and not i.get("grams"):
+            try:
+                n_pieces = _as_float("pieces", i["pieces"])
+            except ValueError as e:
+                conn.close()
+                return json.dumps({"error": f"{i['name']}: {e}"}, ensure_ascii=False)
+            from health_core import foods as _foods
+            prod = _foods.find_mine(conn, user_id, i["name"])
+            if prod is None or not prod["piece_g"]:
+                conn.close()
+                return json.dumps({"error": f"{i['name']}: вес одного кусочка неизвестен. Спроси у человека, сколько граммов в кусочке, "
+                                            f"сохрани food_lookup action=piece (name, piece_g) и повтори запись; либо запиши в граммах."},
+                                  ensure_ascii=False)
+            i["grams"] = n_pieces * prod["piece_g"]
     for i in items:
         per100 = i.get("per_100g")
         src = i.get("source")
@@ -685,14 +701,14 @@ def _pantry_restore(conn, user_id: int, item_ids: list) -> list:
     (позиция запаса могла уйти в ноль и быть удалена - тогда создаётся заново)."""
     back = []
     for item_id in item_ids:
-        for d in conn.execute("SELECT id, name, qty, unit, category FROM pantry_deductions WHERE food_item_id=? AND user_id=?",
+        for d in conn.execute("SELECT id, name, qty, unit, category, piece_g FROM pantry_deductions WHERE food_item_id=? AND user_id=?",
                               (item_id, user_id)).fetchall():
             row = _pantry_find(conn, user_id, d["name"], loose=False)
             if row is not None:
                 conn.execute("UPDATE pantry SET qty=COALESCE(qty,0)+?, updated_at=? WHERE id=?", (d["qty"], _now_iso(), row["id"]))
             else:
-                conn.execute("INSERT INTO pantry(user_id, name, qty, unit, category, updated_at) VALUES (?,?,?,?,?,?)",
-                             (user_id, d["name"], d["qty"], d["unit"], d["category"] or "Прочее", _now_iso()))
+                conn.execute("INSERT INTO pantry(user_id, name, qty, unit, category, updated_at, piece_g) VALUES (?,?,?,?,?,?,?)",
+                             (user_id, d["name"], d["qty"], d["unit"], d["category"] or "Прочее", _now_iso(), d["piece_g"]))
             conn.execute("DELETE FROM pantry_deductions WHERE id=?", (d["id"],))
             back.append({"name": d["name"], "returned": round(d["qty"], 2), "unit": d["unit"]})
     return back
@@ -712,15 +728,15 @@ def _pantry_deduct(conn, user_id: int, items: list, item_ids: list) -> tuple[lis
         row = _pantry_find(conn, user_id, it.get("name") or "", loose=True) if grams > 0 else None
         if row is None or row["qty"] is None:
             continue
-        meta = conn.execute("SELECT unit, category FROM pantry WHERE id=?", (row["id"],)).fetchone()
+        meta = conn.execute("SELECT unit, category, piece_g FROM pantry WHERE id=?", (row["id"],)).fetchone()
         pu = meta["unit"]
-        gpu, _ = grams_per_unit(pu, row["name"])
+        gpu, _ = grams_per_unit(pu, row["name"], meta["piece_g"])
         if gpu is None:
             skipped.append(row["name"])
             continue
         take = min(grams / gpu, row["qty"])  # вернуть можно только то, что реально списали
-        conn.execute("INSERT INTO pantry_deductions(user_id, food_item_id, name, qty, unit, category) VALUES (?,?,?,?,?,?)",
-                     (user_id, item_id, row["name"], take, pu, meta["category"]))
+        conn.execute("INSERT INTO pantry_deductions(user_id, food_item_id, name, qty, unit, category, piece_g) VALUES (?,?,?,?,?,?,?)",
+                     (user_id, item_id, row["name"], take, pu, meta["category"], meta["piece_g"]))
         left = row["qty"] - take
         if left <= 1e-6:
             conn.execute("DELETE FROM pantry WHERE id=?", (row["id"],))
@@ -737,6 +753,7 @@ def _product_row(r) -> dict:
         "product_id": r["id"], "name": r["display_name"], "off_code": r["off_code"],
         "kcal_100g": r["kcal_100g"], "protein_100g": r["protein_100g"], "fat_100g": r["fat_100g"],
         "carbs_100g": r["carbs_100g"], "fiber_100g": r["fiber_100g"], "source": r["source"],
+        "piece_g": r["piece_g"],
     }
 
 
@@ -784,6 +801,22 @@ def handle_food_lookup(params: dict) -> str:
         conn.close()
         return json.dumps({"products": [_product_row(r) for r in rows]}, ensure_ascii=False)
 
+    if action == "piece":
+        name = (params.get("name") or "").strip()
+        try:
+            pg = _as_float("piece_g", params.get("piece_g"))
+        except ValueError as e:
+            conn.close()
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+        if not name or pg <= 0:
+            conn.close()
+            return json.dumps({"error": "Нужны name и piece_g > 0 (вес одного кусочка в граммах)"}, ensure_ascii=False)
+        saved = foods.set_piece(conn, user_id, name, pg)
+        conn.close()
+        if saved is None:
+            return json.dumps({"error": f"Продукта «{name}» нет в моих продуктах: сначала сохрани состав (remember)"}, ensure_ascii=False)
+        return json.dumps({"ok": True, "product": saved, "piece_g": pg}, ensure_ascii=False)
+
     if action == "remember":
         name = (params.get("name") or "").strip()
         source = params.get("source")
@@ -827,7 +860,7 @@ def handle_food_lookup(params: dict) -> str:
 
     conn.close()
     return json.dumps(
-        {"error": f"Неизвестное действие: {action}. Допустимо: match, search, remember, list, forget"},
+        {"error": f"Неизвестное действие: {action}. Допустимо: match, search, remember, piece, list, forget"},
         ensure_ascii=False)
 
 
@@ -4310,6 +4343,9 @@ def handle_sick(params: dict) -> str:
     return json.dumps({"error": f"Неизвестное действие {action!r}. Допустимо: start, stop, status"}, ensure_ascii=False)
 
 
+_SLICE_UNITS = ("кусок", "кусочек", "кусочка", "кусочков", "куска", "ломтик", "ломтика", "ломтиков", "ломоть", "слайс", "слайсов")
+
+
 def _pantry_find(conn, user_id: int, name: str, loose: bool):
     """Позиция запаса по названию без учёта регистра и формулировки (основы слов,
     как у моих продуктов). Точное совпадение основ; при loose, если его нет, -
@@ -4405,7 +4441,21 @@ def handle_pantry(params: dict) -> str:
         # (яйцо, рыбные консервы) допустим; иначе просим спросить человека. Отказался -
         # no_weight, тогда остаётся в штуках.
         unit_in = (params.get("unit") or "").strip().lower().rstrip(".")
-        if qty is not None and unit_in in ("", "шт", "банка", "банки", "банок", "уп", "пачка", "пачки", "бутылка", "бутылки", "пакет", "пакеты"):
+        piece_g = None
+        if qty is not None and unit_in in _SLICE_UNITS:
+            # нарезка считается кусочками: вес кусочка из параметра или из продукта, запас остаётся в кусочках
+            from health_core import foods as _foods
+            pw = params.get("piece_weight_g")
+            prod = _foods.find_mine(conn, user_id, name)
+            piece_g = float(pw) if pw and float(pw) > 0 else (prod["piece_g"] if prod and prod["piece_g"] else None)
+            if piece_g is None and not params.get("no_weight"):
+                conn.close()
+                return json.dumps({"need_weight": True, "name": name,
+                                   "ask": f"Спроси человека, сколько граммов в одном кусочке «{name}». Назвал - повтори add с piece_weight_g. "
+                                          f"Не знает или не хочет - повтори add с no_weight=true."}, ensure_ascii=False)
+            if pw and float(pw) > 0 and prod is not None:
+                _foods.set_piece(conn, user_id, name, float(pw))
+        elif qty is not None and unit_in in ("", "шт", "банка", "банки", "банок", "уп", "пачка", "пачки", "бутылка", "бутылки", "пакет", "пакеты"):
             from health_core.meal_options import grams_per_unit
             pw = params.get("piece_weight_g")
             if pw and float(pw) > 0:
@@ -4427,13 +4477,14 @@ def handle_pantry(params: dict) -> str:
             # сторон означает «без счёта», тогда просто сохраняем что есть.
             new_qty = existing["qty"] if qty is None else (existing["qty"] or 0.0) + qty
             conn.execute(
-                "UPDATE pantry SET qty=?, unit=COALESCE(?,unit), category=COALESCE(?,category), updated_at=? WHERE id=?",
-                (new_qty, params.get("unit"), params.get("category"), _now_iso(), existing["id"]),
+                "UPDATE pantry SET qty=?, unit=COALESCE(?,unit), category=COALESCE(?,category), updated_at=?, "
+                "piece_g=COALESCE(?,piece_g) WHERE id=?",
+                (new_qty, params.get("unit"), params.get("category"), _now_iso(), piece_g, existing["id"]),
             )
         else:
             conn.execute(
-                "INSERT INTO pantry(user_id, name, qty, unit, category, updated_at) VALUES (?,?,?,?,?,?)",
-                (user_id, name, qty, params.get("unit"), params.get("category") or "Прочее", _now_iso()),
+                "INSERT INTO pantry(user_id, name, qty, unit, category, updated_at, piece_g) VALUES (?,?,?,?,?,?,?)",
+                (user_id, name, qty, params.get("unit"), params.get("category") or "Прочее", _now_iso(), piece_g),
             )
         conn.commit()
         conn.close()
@@ -7317,6 +7368,28 @@ if __name__ == "__main__":
         assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name='Куриное филе'", (p_uid,)).fetchone()["qty"] == 400
         assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name='Яйца СВ XXL'", (p_uid,)).fetchone()["qty"] == 10
         assert conn.execute("SELECT COUNT(*) c FROM pantry_deductions WHERE user_id=?", (p_uid,)).fetchone()["c"] == 0
+        # нарезка кусочками: вес кусочка у продукта, запас в кусочках, еда через pieces, возврат при удалении
+        _fl = lambda **kw: json.loads(handle_food_lookup({"user_id": p_uid, **kw}))
+        assert "error" in _fl(action="piece", name="Хлеб бородинский Смак", piece_g=30), "вес кусочка - только у сохранённого продукта"
+        _fl(action="remember", name="Хлеб бородинский Смак", source="label", kcal_100g=210, protein_100g=7, fat_100g=1.5, carbs_100g=42)
+        assert _fl(action="piece", name="Хлеб бородинский Смак", piece_g=30)["ok"]
+        assert _fl(action="match", name="бородинский смак")["piece_g"] == 30
+        assert "ok" in _pan(action="add", name="Хлеб бородинский Смак", qty=12, unit="кусочек", category="Сложные углеводы"), "вес кусочка известен из продукта"
+        _br = conn.execute("SELECT qty, unit, piece_g FROM pantry WHERE user_id=? AND name LIKE 'Хлеб%'", (p_uid,)).fetchone()
+        assert (_br["qty"], _br["unit"], _br["piece_g"]) == (12, "кусочек", 30), dict(_br)
+        _pc = json.loads(handle_log_food({"user_id": p_uid, "meal_slot": "snack", "items": [
+            {"name": "Хлеб бородинский Смак", "pieces": 2, "per_100g": {"kcal": 210, "protein_g": 7, "fat_g": 1.5, "carbs_g": 42},
+             "source": "my_product"}]}))
+        assert _pc["pantry_deducted"][0]["took"] == 2 and _pc["pantry_deducted"][0]["left"] == 10, _pc
+        assert conn.execute("SELECT grams, kcal FROM food_items WHERE food_log_id=?", (_lid("snack"),)).fetchone()["grams"] == 60
+        _dp = json.loads(handle_log_food({"user_id": p_uid, "action": "delete", "food_log_id": _lid("snack")}))
+        assert _dp["pantry_restored"][0]["returned"] == 2
+        assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name LIKE 'Хлеб%'", (p_uid,)).fetchone()["qty"] == 12
+        assert "error" in json.loads(handle_log_food({"user_id": p_uid, "items": [
+            {"name": "Сыр нарезка", "pieces": 3, "per_100g": {"kcal": 350, "protein_g": 25, "fat_g": 27, "carbs_g": 0}}]})), \
+            "кусочки без известного веса - ошибка, не выдумываем вес"
+        assert _pan(action="add", name="Сыр нарезка", qty=10, unit="ломтик", category="Молочка/Сыры").get("need_weight")
+        assert "ok" in _pan(action="add", name="Сыр нарезка", qty=10, unit="ломтик", category="Молочка/Сыры", no_weight=True)
         print("OK: pantry list/add/remove — сумма при пополнении, декремент, удаление на нуле, ошибка на отсутствующем, группировка")
 
         print("\n" + "="*60)

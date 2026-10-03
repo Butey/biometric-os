@@ -237,6 +237,16 @@ def remember(conn, user_id: int, name: str, *, source: str, off_code=None,
     ).fetchone()["id"]
 
 
+def set_piece(conn, user_id: int, name: str, piece_g: float):
+    """Вес одного кусочка/штуки своего продукта. None, если такого продукта нет."""
+    row = find_mine(conn, user_id, name)
+    if row is None:
+        return None
+    conn.execute("UPDATE my_products SET piece_g=? WHERE id=?", (piece_g, row["id"]))
+    conn.commit()
+    return row["display_name"]
+
+
 def list_mine(conn, user_id: int):
     return conn.execute(
         "SELECT * FROM my_products WHERE user_id=? ORDER BY display_name", (user_id,)

@@ -44,6 +44,7 @@ log_food_schema = {
                 "properties": {
                     "name": {"type": "string", "description": "Название блюда"},
                     "grams": {"type": "number", "description": "Вес в граммах; обязателен вместе с per_100g"},
+                    "pieces": {"type": "number", "description": "Вместо grams для нарезки: сколько кусочков съедено; граммы посчитает код по сохранённому весу кусочка (food_lookup piece). Не умножай сам"},
                     "kcal": {"type": "number", "description": "Ккал; обязательно без per_100g. Не знаешь точно — оцени сам, человека не переспрашивай"},
                     "protein_g": {"type": "number", "description": "Белки, г; обязательно без per_100g — при незнании оценка"},
                     "fat_g": {"type": "number", "description": "Жиры, г; обязательно без per_100g — при незнании оценка, влияет на LIPID_GUARD"},
@@ -94,8 +95,8 @@ food_lookup_schema = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["match", "search", "remember", "list", "forget"],
-            "description": "match (умолчание) — найти свой сохранённый продукт; search — до 5 кандидатов из Open Food Facts; remember — сохранить/обновить свой продукт; list — список своих продуктов; forget — убрать"
+            "enum": ["match", "search", "remember", "piece", "list", "forget"],
+            "description": "match (умолчание) — найти свой сохранённый продукт; search — до 5 кандидатов из Open Food Facts; remember — сохранить/обновить свой продукт; piece — записать вес одного кусочка продукта (name, piece_g); list — список своих продуктов; forget — убрать"
         },
         "name": {"type": "string", "description": "Название продукта. Нужно для match/search/remember/forget"},
         "off_code": {"type": "string", "description": "Для remember: код из результата search (candidate.off_code) — код сам подтянет состав по нему"},
@@ -104,6 +105,7 @@ food_lookup_schema = {
         "fat_100g": {"type": "number", "description": "Для remember: жиры на 100 г"},
         "carbs_100g": {"type": "number", "description": "Для remember: углеводы на 100 г"},
         "fiber_100g": {"type": "number", "description": "Для remember: клетчатка на 100 г"},
+        "piece_g": {"type": "number", "description": "Для piece: вес одного кусочка/ломтика в граммах"},
         "source": {
             "type": "string",
             "enum": ["off", "label", "estimate"],
@@ -640,7 +642,7 @@ pantry_schema = {
         },
         "name": {"type": "string", "description": "Название продукта (для add/remove)"},
         "qty": {"type": "number", "description": "Количество или вес. Для remove без qty — списать позицию целиком."},
-        "unit": {"type": "string", "description": "Единица: г, шт, мл и т.п."},
+        "unit": {"type": "string", "description": "Единица: г, шт, мл и т.п. Нарезку (хлеб, сыр, колбасу) считаем в кусочках: unit=кусочек + piece_weight_g"},
         "piece_weight_g": {"type": "number", "description": "Для add в штуках/банках: вес (мл для жидкостей) ОДНОЙ штуки или банки - код сам переведёт запас в граммы. Спроси у человека, не выдумывай."},
         "no_weight": {"type": "boolean", "description": "true только если человек на вопрос о весе ответил, что не знает или не хочет называть: тогда запас останется в штуках"},
         "category": {"type": "string", "enum": ["Белковые", "Молочка/Сыры", "Овощи/Фрукты", "Сложные углеводы", "Прочее"], "description": "Категория продукта"},

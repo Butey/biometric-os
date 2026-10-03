@@ -5,7 +5,7 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -195,6 +195,7 @@ CREATE TABLE IF NOT EXISTS pantry (
     unit TEXT,
     category TEXT,
     updated_at TEXT,
+    piece_g REAL,  -- вес одной единицы запаса (кусочка) в граммах, если запас считается кусочками
     UNIQUE(user_id, name)
 );
 
@@ -452,6 +453,7 @@ CREATE TABLE IF NOT EXISTS my_products (
     fiber_100g REAL,
     source TEXT CHECK(source IN ('off','label','estimate')),
     created_at TEXT NOT NULL,
+    piece_g REAL,  -- вес одного кусочка/штуки в граммах (нарезка: 1 кусочек бородинского = 30 г)
     UNIQUE(user_id, name_key)
 );
 
@@ -485,7 +487,8 @@ CREATE TABLE IF NOT EXISTS pantry_deductions (
     name TEXT NOT NULL,
     qty REAL NOT NULL,
     unit TEXT,
-    category TEXT
+    category TEXT,
+    piece_g REAL
 );
 CREATE INDEX IF NOT EXISTS idx_pantry_deductions_item ON pantry_deductions(food_item_id);
 
@@ -717,6 +720,13 @@ def _migrate_v28_to_v29(conn: sqlite3.Connection) -> None:
     _add_column(conn, "daily_targets", "kcal_floor", "REAL")
 
 
+def _migrate_v29_to_v30(conn: sqlite3.Connection) -> None:
+    """v29->v30: вес кусочка - у продукта, запаса и записи списания."""
+    _add_column(conn, "my_products", "piece_g", "REAL")
+    _add_column(conn, "pantry", "piece_g", "REAL")
+    _add_column(conn, "pantry_deductions", "piece_g", "REAL")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
     conn.execute("""
@@ -782,6 +792,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             _migrate_v27_to_v28(conn)
         if row["version"] < 29:
             _migrate_v28_to_v29(conn)
+        if row["version"] < 30:
+            _migrate_v29_to_v30(conn)
         conn.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
     conn.commit()
 
