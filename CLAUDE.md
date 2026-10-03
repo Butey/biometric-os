@@ -33,3 +33,9 @@
 - Plain hyphens and straight quotes only.
 - Natural language characters (accented letters, CJK, etc.) are fine when the content requires them.
 - Code output must be copy-paste safe.
+
+## Workflow
+- Work in the dev worktree `/opt/webapps/health_agent_dev` (branch `dev`), never in the live directory `/opt/webapps/health_agent_system`.
+- Commit to `dev`. Merge into `main` only on the user's explicit command.
+- "Merge" means: all checks green on `dev`, merge, restart bot and admin panel, verify both came up.
+- Tests never write to the live DB: set `HEALTH_DB` to a temp path before importing anything that pulls in `health_core.db`.

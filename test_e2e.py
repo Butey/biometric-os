@@ -460,7 +460,7 @@ try:
             stage("export_all", False, f"export_all failed: {export_result}")
         else:
             # Раскладка §13, а не выдуманные имена: дерево повторяет структуру ТЗ.
-            bm = export_dir / "Metrics" / "body_metrics.csv"
+            bm = export_dir / "Metrics" / "Body composition" / "body_metrics.csv"
             sugar = export_dir / "Metrics" / "Sugar" / "sugar_log.csv"
             missing = [str(p) for p in (bm, sugar) if not p.exists()]
             if missing:

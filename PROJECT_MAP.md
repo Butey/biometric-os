@@ -11,7 +11,7 @@
   - Язык и среда: Python 3.13, виртуальное окружение `.venv/bin/python`
   - Telegram-транспорт: `aiogram 3`
   - База данных: SQLite (`health.db`), чистый SQL без тяжелых ORM
-  - Панель администратора: FastAPI, Uvicorn, Jinja2/HTML
+  - Панель администратора: stdlib `http.server` application with HTML built in `admin/pages.py`
   - Фоновые службы: `systemd` (сервисы и таймеры для пользователя)
   - LLM-интеграция: асинхронный клиент на `aiohttp`, цепочка OpenAI-совместимых провайдеров (Gemini, Groq, Nvidia, DeepSeek) с fallback-логикой и Prompt Caching.
 
@@ -31,7 +31,7 @@ health_agent_system/
 ├── bot/                 # Собственный цикл агента (aiogram 3, вызовы LLM, история диалога)
 ├── plugin/              # Спецификации и хендлеры 35 инструментов (tools.py, schemas.py)
 ├── scripts/             # Cron-скрипты автоматических расписаний (--no-agent) и notify.py
-├── admin/               # Веб-панель управления на FastAPI
+├── admin/               # Веб-панель управления (stdlib http.server)
 ├── Core/                # Системный промпт Telegram-бота (персона, тон, правила)
 ├── Knowledge/           # Статьи доказательной базы знаний для RAG-инструмента knowledge
 ├── Metrics/             # Хранилище входящих данных (выгрузки весов, TCX, CSV)
@@ -99,7 +99,7 @@ health_agent_system/
 - `export_backup.py`: создание ночного бэкапа базы данных.
 
 ### 2.5. Веб-панель администратора (`admin/`)
-- `server.py`: веб-приложение FastAPI.
+- `server.py`: веб-приложение на stdlib `http.server`.
 - `pages.py`: HTML-страницы (управление пользователями, графики метрик, верификация черновиков карт лекарств `/drafts`, управление базой знаний `/knowledge`).
 - `auth.py`: сессионная авторизация администратора по паролю.
 - `upload.py`: загрузка файлов весов, тренировок и анализов через веб-интерфейс.
@@ -222,9 +222,9 @@ Always verify changes with:
 | Словарь терминов и решения | `CONTEXT.md` (глоссарий), `Docs/` |
 
 ### Как запускать проверки
-- `.venv/bin/python test_bot.py` (46 тестов, пишет в живую БД намеренно)
+- `.venv/bin/python test_bot.py` (49 тестов, работает на временной БД, не трогает живую БД)
 - `.venv/bin/python -m bot.history` - история и compact
-- `.venv/bin/python -m health_core.guards` - гарды. Известная проблема: упорный assert формата `status_bar` (ожидает цель 2209 ккал) падает независимо от правок; для прогона остальных блоков он обходится подменой `re.match`.
+- `.venv/bin/python -m health_core.guards` - гарды.
 
 ### Гарды глюкозы и пульса (кратко)
 - `GLUCOSE_VOLATILITY` (код оставлен, смысл сменился): 3 последних замера натощак подряд выше своей медианы за 28 дней на 0.3 ммоль/л и больше; замеры не натощак и после сна <6 ч не считаются; severity `info`; в тексте уверенность, точки сигнала, «наблюдать динамику».
@@ -235,4 +235,3 @@ Always verify changes with:
 - `find_mine(loose=True)` по умолчанию; `forget` обязан звать с `loose=False`, иначе удалит не тот продукт.
 - Тесты, которые пишут в БД, должны ставить `HEALTH_DB` ДО импорта модулей, тянущих `health_core.db` (иначе пишут в живую `/root/.hermes/health.db`). У `meal_options.py` это учтено отложенным импортом `report`.
 - Файлы с CRLF (`guards.py`, `report.py`, `export.py`, `schemas.py`, `registry.py`, `system_promt.md`): править с сохранением окончаний строк, иначе дифф на тысячи строк.
-- Существующие падения вне этих задач: `python -m health_core.guards` (assert формата `status_bar`), `test_e2e.py::export_all` (путь `Metrics/body_metrics.csv`).
