@@ -326,6 +326,22 @@ def test_slash_commands_run_without_model():
     assert "только администраторам" in main.run_command("111", "/model")
 
 
+def test_plan_talk_is_not_logged_as_eaten():
+    """Обсуждение плана/вопрос без «съел» не должно превращаться в запись еды."""
+    for t in ("Тунец можем добавить к яйцам", "а если вместо хлеба гречка", "собери завтрак", "что на ужин?",
+              "давай запланируем творог на завтра"):
+        assert main.is_plan_only(t), t
+    for t in ("съел тунец 100г", "яичница 2 яйца СВ XXL, кабачок 290г", "+30 белка", "да", "можем записать: я съел яйца",
+              "выпил 0.5 воды", "запиши завтрак: творог 120г"):
+        assert not main.is_plan_only(t), t
+    main._PLAN_ONLY.set(True)
+    try:
+        out = json.loads(main.dispatch("log_food", {"items": [{"name": "тунец", "grams": 100}]}))
+        assert "error" in out and "НЕ записывай" in out["error"], out
+    finally:
+        main._PLAN_ONLY.set(False)
+
+
 def test_admin_switch_model():
     admin_id = "900000001"
     out = main.run_command(admin_id, "/model")

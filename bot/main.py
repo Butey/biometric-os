@@ -15,6 +15,7 @@ except ImportError:
 import asyncio
 import base64
 import contextlib
+import contextvars
 import hashlib
 import io
 import json
@@ -193,6 +194,22 @@ def strip_panels(text: str) -> str:
 
 
 
+# Сообщение обсуждает план/вариант или задаёт вопрос, и в нём нет слов «съел/выпил/запиши».
+# Тогда log_food(add) отклоняется кодом: правило промпта «записывать только съеденное»
+# модель нарушала («тунец можем добавить к яйцам» -> завтрак записан как съеденный).
+_PLAN_RE = re.compile(
+    r"можем|можно|давай|может\b|предлаг|планир|план\b|собери|придума|что\s+(на|если|взять|приготов)|"
+    r"а\s+если|стоит\s+ли|как\s+насчёт|вариант|собираюсь|хочу|хотел|буду|будем|завтра|\?", re.IGNORECASE)
+_EATEN_RE = re.compile(
+    r"съел|поел|позавтракал|пообедал|поужинал|перекусил|выпил|доел|\bел[а]?\b|\bпил[а]?\b|записыв|запиши|записал|внеси",
+    re.IGNORECASE)
+_PLAN_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar("plan_only", default=False)
+
+
+def is_plan_only(text: str) -> bool:
+    return bool(_PLAN_RE.search(text)) and not _EATEN_RE.search(text)
+
+
 def dispatch(name: str, args: dict) -> str:
     """Единая точка исполнения инструмента. knowledge живёт не в плагине,
     поэтому маршрутизируется здесь, а не внутри registry. Дергается только
@@ -200,6 +217,9 @@ def dispatch(name: str, args: dict) -> str:
     registry.dispatch напрямую и правил инструментов не видят."""
     if name == "knowledge":
         result = knowledge.read(args.get("topic", ""), args.get("query"))
+    elif name == "log_food" and (args.get("action") or "add") == "add" and _PLAN_ONLY.get():
+        return json.dumps({"error": "Сообщение человека - обсуждение плана или вопрос, а не «съел». НЕ записывай приём пищи. "
+                                    "Ответь по сути и спроси одной строкой: записать как съеденное?"}, ensure_ascii=False)
     else:
         result = registry.dispatch(name, args)
     return with_tool_rules(name, result)
@@ -1407,6 +1427,7 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
 
     # Use _open_turn_vision with special image content
     registry.set_caller(uid)
+    _PLAN_ONLY.set(False)
     prefix = await asyncio.to_thread(_open_turn_vision, uid, content, caption or "[фото]")
 
     load_env_file()
@@ -1473,6 +1494,7 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
     # Личность звонящего выставляем до любого исполнения: без неё инструменты
     # отработают над user_id=1, кто бы ни прислал сообщение.
     registry.set_caller(uid)
+    _PLAN_ONLY.set(is_plan_only(text))
 
     if text.startswith("/"):
         cmd_name = text[1:].partition(" ")[0].split("@")[0].lower()
