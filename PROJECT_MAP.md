@@ -222,7 +222,7 @@ Always verify changes with:
 | Словарь терминов и решения | `CONTEXT.md` (глоссарий), `Docs/` |
 
 ### Как запускать проверки
-- `.venv/bin/python test_bot.py` (49 тестов, работает на временной БД, не трогает живую БД)
+- `.venv/bin/python test_bot.py` (52 теста, работает на временной БД, не трогает живую БД)
 - `.venv/bin/python -m bot.history` - история и compact
 - `.venv/bin/python -m health_core.guards` - гарды.
 
