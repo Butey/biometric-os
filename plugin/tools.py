@@ -734,6 +734,9 @@ def _pantry_restore(conn, user_id: int, item_ids: list) -> list:
     return back
 
 
+_MASS_UNITS = ("г", "гр", "g", "кг", "kg", "мл", "ml", "л", "l")
+
+
 def _pantry_deduct(conn, user_id: int, items: list, item_ids: list) -> tuple[list, list]:
     """Съеденное списывается из запаса само: позиция запаса находится по названию
     (_pantry_find), граммы переводятся в единицы запаса. Возвращает (списано,
@@ -754,7 +757,13 @@ def _pantry_deduct(conn, user_id: int, items: list, item_ids: list) -> tuple[lis
         if gpu is None:
             skipped.append(row["name"])
             continue
-        take = min(grams / gpu, row["qty"])  # вернуть можно только то, что реально списали
+        # grams и pieces вместе: ккал по граммам, из запаса - ровно названные штуки (не граммы / типовой вес)
+        try:
+            pcs = float(it.get("pieces"))
+        except (TypeError, ValueError):
+            pcs = 0
+        counted = pcs > 0 and (pu or "").strip().lower().rstrip(".") not in _MASS_UNITS
+        take = min(pcs if counted else grams / gpu, row["qty"])  # вернуть можно только то, что реально списали
         conn.execute("INSERT INTO pantry_deductions(user_id, food_item_id, name, qty, unit, category, piece_g) VALUES (?,?,?,?,?,?,?)",
                      (user_id, item_id, row["name"], take, pu, meta["category"], meta["piece_g"]))
         left = row["qty"] - take
@@ -7415,6 +7424,14 @@ if __name__ == "__main__":
         assert conn.execute("SELECT grams, kcal FROM food_items WHERE food_log_id=?", (_lid("snack"),)).fetchone()["grams"] == 60
         _dp = json.loads(handle_log_food({"user_id": p_uid, "action": "delete", "food_log_id": _lid("snack")}))
         assert _dp["pantry_restored"][0]["returned"] == 2
+        # граммы и штуки вместе: ккал по граммам (150 г), из запаса ровно 3 штуки, а не 150 / 60 г = 2.5
+        _eg = json.loads(handle_log_food({"user_id": p_uid, "meal_slot": "breakfast", "items": [
+            {"name": "Яйца СВ XXL", "grams": 150, "pieces": 3, "per_100g": {"kcal": 157, "protein_g": 12.7, "fat_g": 11.5, "carbs_g": 0.7},
+             "source": "my_product"}]}))
+        assert _eg["pantry_deducted"][0]["took"] == 3 and _eg["pantry_deducted"][0]["left"] == 7, _eg
+        assert round(conn.execute("SELECT kcal FROM food_items WHERE food_log_id=?", (_lid("breakfast"),)).fetchone()["kcal"]) == 236
+        json.loads(handle_log_food({"user_id": p_uid, "action": "delete", "food_log_id": _lid("breakfast")}))
+        assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name='Яйца СВ XXL'", (p_uid,)).fetchone()["qty"] == 10
         assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name LIKE 'Хлеб%'", (p_uid,)).fetchone()["qty"] == 12
         assert "error" in json.loads(handle_log_food({"user_id": p_uid, "items": [
             {"name": "Сыр нарезка", "pieces": 3, "per_100g": {"kcal": 350, "protein_g": 25, "fat_g": 27, "carbs_g": 0}}]})), \
