@@ -71,11 +71,14 @@ def bmr_floor(conn: sqlite3.Connection, user_id: int) -> float:
 
     # FFM не снят этими весами -> последний известный замер (см. config.latest_ffm):
     # вес тела вместо FFM завышает Katch и роняет/поднимает цель на сотни ккал.
-    ffm = metric["ffm_kg"] or latest_ffm(conn, user_id) or metric["weight_kg"]
+    ffm = metric["ffm_kg"] or latest_ffm(conn, user_id)
     age = _age_years(user["birth_date"], metric["measured_at"])
-    katch = bmr_katch(ffm)
     mifflin = bmr_mifflin(metric["weight_kg"], user["height_cm"], age, user["sex"] or "m")
-    return max(katch, mifflin)
+    if ffm is None:
+        # Замера состава тела не было ни разу: Katch от веса тела считал бы жир
+        # тощей массой и завышал BMR на сотни ккал. Остаётся один Mifflin.
+        return mifflin
+    return max(bmr_katch(ffm), mifflin)
 
 
 def fat_mass_kg(conn: sqlite3.Connection, user_id: int) -> float | None:
