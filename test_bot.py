@@ -141,6 +141,47 @@ def test_log_water_pace_only_when_behind():
         conn.close()
 
 
+def test_water_reminder_only_when_a_portion_behind():
+    """Напоминание о воде: пусто при норме и вне 08-20, текст с недостающим объёмом при отставании."""
+    from unittest.mock import patch
+    from datetime import datetime as _dt
+    import sys as _sys
+    _sys.path.insert(0, str(ROOT / "scripts"))
+    import water_reminder as _wr
+    registry.set_caller("986")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM users WHERE id=986")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(986,'986',180,'1990-01-01',"
+            "'male','UTC',75,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+        today = _dt.now().strftime("%Y-%m-%d")
+
+        def _at(clock):
+            return patch.object(_wr, "user_now", lambda *a, **k: _dt.fromisoformat(f"{today} {clock}"))
+
+        with _at("15:00:00"), patch.object(_wr, "user_today", lambda *a, **k: today):
+            msg = _wr.reminder(conn, 986)
+            assert msg and "Добери" in msg, msg
+            conn.execute("INSERT INTO water_log(user_id, at, volume_ml) VALUES (986, ?, 5000)", (f"{today} 14:00:00",))
+            conn.commit()
+            assert _wr.reminder(conn, 986) is None, "норма выполнена - тишина"
+        conn.execute("DELETE FROM water_log WHERE user_id=986")
+        conn.commit()
+        with _at("20:30:00"), patch.object(_wr, "user_today", lambda *a, **k: today):
+            assert _wr.reminder(conn, 986) is None, "после 20:00 тишина"
+        with _at("08:30:00"), patch.object(_wr, "user_today", lambda *a, **k: today):
+            assert _wr.reminder(conn, 986) is None, "в 08:30 отставание меньше порции"
+    finally:
+        conn.execute("DELETE FROM water_log WHERE user_id=986")
+        conn.execute("DELETE FROM users WHERE id=986")
+        conn.commit()
+        conn.close()
+
+
 def test_system_prompt_moved_rules_out():
     """Core/system_promt.md больше не тащит тела шести перенесённых секций —
     они переехали в Core/tool_rules.md и приезжают только с результатом

@@ -38,6 +38,18 @@ def _time_tag(hour: int) -> str:
     return "вечером"
 
 
+def water_pace(water_ml: float, target_ml: float | None, now: datetime) -> dict | None:
+    """Темп воды: цель равномерно растёт с 08:00 до 20:00. Отставание - когда выпито
+    меньше 85% нормы к этому часу. Один расчёт для ответа log_water и для напоминаний.
+    ponytail: линейный график и порог 15% - литералы, менять по опыту."""
+    if not target_ml or not 8 <= now.hour < 20:
+        return None
+    expected = target_ml * (now.hour + now.minute / 60 - 8) / 12
+    if water_ml < expected * 0.85:
+        return {"expected_ml": round(expected), "behind_ml": round(expected - water_ml)}
+    return None
+
+
 def _water_target_ml(conn: sqlite3.Connection, user_id: int) -> float | None:
     """Профиль (user_targets) важнее политики по умолчанию (§03: уровень 2 над уровнем 1)."""
     row = conn.execute(
