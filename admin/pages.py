@@ -299,11 +299,21 @@ label{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--m
   .stats{grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px}
   .stat{padding:10px 12px}
   .stat .v{font-size:20px}
-  .grid{grid-template-columns:1fr;gap:12px}
+  .grid{grid-template-columns:1fr!important;gap:12px}
+  .guard-form-grid{grid-template-columns:1fr}
   .row{flex-direction:column;align-items:stretch}
   .row>div{width:100%}
   .nav-top{padding:8px 12px 6px}
   .nav-links{padding:4px 10px 6px}
+  .table-responsive>table{min-width:100%!important}
+  .meal-items{min-width:100%!important}
+  :not(.table-responsive)>table{display:block;overflow-x:auto;max-width:100%}
+  .reorder-table th{width:auto!important}
+  input:not([type=checkbox]):not([type=radio]),select,textarea{width:100%!important;max-width:100%;font-size:16px;box-sizing:border-box}
+  button{min-height:44px}
+  body{overflow-wrap:anywhere}
+  pre,code{white-space:pre-wrap;word-break:break-word}
+  svg,img,canvas{max-width:100%;height:auto}
 }
 """
 
