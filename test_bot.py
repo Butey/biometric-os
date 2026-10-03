@@ -336,7 +336,7 @@ def test_plan_talk_is_not_logged_as_eaten():
         assert not main.is_plan_only(t), t
     main._PLAN_ONLY.set(True)
     try:
-        out = json.loads(main.dispatch("log_food", {"items": [{"name": "тунец", "grams": 100}]}))
+        out = json.loads(main.strip_tool_rules(main.dispatch("log_food", {"items": [{"name": "тунец", "grams": 100}]})))
         assert "error" in out and "НЕ записывай" in out["error"], out
     finally:
         main._PLAN_ONLY.set(False)
@@ -491,10 +491,10 @@ def test_log_food_without_meal_slot_assigns_by_window():
 
     registry.set_caller("779")  # предыдущий тест оставляет свой caller_id в ContextVar
     try:
-        out = json.loads(main.dispatch("log_food", {
+        out = json.loads(main.strip_tool_rules(main.dispatch("log_food", {
             "eaten_at": "2026-09-10 13:00:00",
             "items": [{"name": "Суп", "kcal": 300, "protein_g": 15, "fat_g": 10, "carbs_g": 30}],
-        }))
+        })))
         assert "error" not in out, f"log_food без meal_slot не должен быть ошибкой: {out}"
         assert out.get("meal_slot") == "lunch", f"13:00 без meal_slot должно дать lunch, получили {out}"
     finally:
@@ -573,26 +573,26 @@ def test_food_lookup_remember_match_and_log_food_per_100g():
             "'f','UTC',65,'2026-01-01','2026-01-01 00:00:00')")
         conn.commit()
 
-        remembered = json.loads(main.dispatch("food_lookup", {
+        remembered = json.loads(main.strip_tool_rules(main.dispatch("food_lookup", {
             "action": "remember", "name": "бородинский", "source": "off", "off_code": "111",
             "kcal_100g": 208, "protein_100g": 6.8, "fat_100g": 1.3, "carbs_100g": 40.7,
-        }))
+        })))
         assert remembered.get("ok") is True and remembered.get("product_id"), remembered
 
-        found = json.loads(main.dispatch("food_lookup", {
+        found = json.loads(main.strip_tool_rules(main.dispatch("food_lookup", {
             "action": "match", "name": "Бородинские тосты сухие",
-        }))
+        })))
         assert found.get("found") is True, f"match по другой формулировке должен найти: {found}"
         assert found["kcal_100g"] == 208 and found["source"] == "off", found
 
-        result = json.loads(main.dispatch("log_food", {
+        result = json.loads(main.strip_tool_rules(main.dispatch("log_food", {
             "items": [{
                 "name": "Бородинские тосты сухие", "grams": 80,
                 "per_100g": {"kcal": found["kcal_100g"], "protein_g": found["protein_100g"],
                              "fat_g": found["fat_100g"], "carbs_g": found["carbs_100g"]},
                 "source": "my_product",
             }],
-        }))
+        })))
         assert "error" not in result, result
         item = result["items"][0]
         assert item["source"] == "my_product", item
@@ -607,35 +607,35 @@ def test_food_lookup_remember_match_and_log_food_per_100g():
         assert row["source"] == "my_product", dict(row)
 
         # GPT заполняет необязательные поля нулями: kcal модели не затирается.
-        result = json.loads(main.dispatch("log_food", {
+        result = json.loads(main.strip_tool_rules(main.dispatch("log_food", {
             "items": [{
                 "name": "Перец болгарский", "grams": 0, "kcal": 39,
                 "protein_g": 1.3, "fat_g": 0.4, "carbs_g": 7.5, "source": "estimate",
                 "per_100g": {"kcal": 0, "protein_g": 0, "fat_g": 0, "carbs_g": 0},
             }],
-        }))
+        })))
         assert "error" not in result, result
         assert result["items"][0]["kcal"] == 39, result
 
         # per_100g.kcal==0 легитимен для реального продукта (вода) и не
         # должен требовать прямого kcal — не путать с "не передано".
-        result = json.loads(main.dispatch("log_food", {
+        result = json.loads(main.strip_tool_rules(main.dispatch("log_food", {
             "items": [{
                 "name": "Вода", "grams": 300, "source": "off",
                 "per_100g": {"kcal": 0, "protein_g": 0, "fat_g": 0, "carbs_g": 0},
             }],
-        }))
+        })))
         assert "error" not in result, result
         assert result["items"][0]["kcal"] == 0, result
 
         # Модель шлёт fiber_g=0 рядом с per_100g.fiber_g — этикетка побеждает ноль.
-        result = json.loads(main.dispatch("log_food", {
+        result = json.loads(main.strip_tool_rules(main.dispatch("log_food", {
             "items": [{
                 "name": "Хлеб Дарницкий", "grams": 100, "fiber_g": 0, "source": "label",
                 "per_100g": {"kcal": 216, "protein_g": 7, "fat_g": 1, "carbs_g": 46,
                              "fiber_g": 5},
             }],
-        }))
+        })))
         assert "error" not in result, result
         fib = conn.execute(
             "SELECT fiber_g FROM food_items fi JOIN food_log fl ON fl.id=fi.food_log_id "
@@ -644,12 +644,12 @@ def test_food_lookup_remember_match_and_log_food_per_100g():
         assert abs(fib - 5.0) < 1e-6, f"клетчатка из per_100g затёрта нулём модели: {fib}"
 
         # Отрицательные grams через per_100g не должны дать отрицательные kcal/БЖУ.
-        result = json.loads(main.dispatch("log_food", {
+        result = json.loads(main.strip_tool_rules(main.dispatch("log_food", {
             "items": [{
                 "name": "Перец болгарский", "grams": -100, "source": "estimate",
                 "per_100g": {"kcal": 30, "protein_g": 1.0, "fat_g": 0.2, "carbs_g": 6.0},
             }],
-        }))
+        })))
         assert "error" in result, f"отрицательные grams должны быть отклонены: {result}"
     finally:
         conn.execute("DELETE FROM alerts WHERE user_id=881")
@@ -1632,6 +1632,129 @@ def test_check_stale_calib_streak():
         conn.execute("DELETE FROM users WHERE id IN (991, 992)")
         conn.commit()
         conn.close()
+
+
+def _water_user(uid: int):
+    conn = connect()
+    conn.execute(f"DELETE FROM water_log WHERE user_id={uid}")
+    conn.execute(f"DELETE FROM users WHERE id={uid}")
+    conn.execute(
+        "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+        "base_weight_kg,base_weight_date,created_at) VALUES(?,?,170,'1990-01-01',"
+        "'f','UTC',65,'2026-01-01','2026-01-01 00:00:00')", (uid, str(uid)))
+    conn.commit()
+    conn.close()
+    registry.set_caller(str(uid))
+
+
+def _water_rows(uid: int) -> int:
+    conn = connect()
+    n = conn.execute("SELECT COUNT(*) n FROM water_log WHERE user_id=?", (uid,)).fetchone()["n"]
+    conn.execute("DELETE FROM water_log WHERE user_id=?", (uid,))
+    conn.execute("DELETE FROM alerts WHERE user_id=?", (uid,))
+    conn.execute("DELETE FROM users WHERE id=?", (uid,))
+    conn.commit()
+    conn.close()
+    return n
+
+
+def test_failure_after_commit_is_saved_with_warning():
+    """Исключение после conn.commit() не должно выглядеть отказом: запись в базе,
+    а {"error"} заставляет модель повторять вызов (log_water шесть раз за шесть секунд)."""
+    from bot.registry import _tools
+    _water_user(7801)
+    real = _tools.day_summary
+
+    def boom(*a, **kw):
+        raise RuntimeError("summary exploded")
+    _tools.day_summary = boom
+    try:
+        out = json.loads(registry.dispatch("log_water", {"ml": 250}))
+    finally:
+        _tools.day_summary = real
+    rows = _water_rows(7801)
+    assert rows == 1, f"запись должна лежать ровно одна, лежит {rows}"
+    assert out.get("saved") is True and "summary exploded" in out.get("warning", ""), out
+    assert "error" not in out, f"сохранённая запись не должна быть ошибкой: {out}"
+
+
+def test_failure_before_commit_stays_error():
+    from bot.registry import _tools
+    _water_user(7802)
+    real = _tools._norm_event_ts
+
+    def boom(*a, **kw):
+        raise RuntimeError("bad timestamp")
+    _tools._norm_event_ts = boom
+    try:
+        out = json.loads(registry.dispatch("log_water", {"ml": 250}))
+    finally:
+        _tools._norm_event_ts = real
+    rows = _water_rows(7802)
+    assert rows == 0, f"до коммита запись не должна появиться, лежит {rows}"
+    assert "bad timestamp" in out.get("error", "") and "saved" not in out, out
+
+
+def test_food_lookup_off_down_says_no_retry_and_offers_my_product():
+    import urllib.error
+    from health_core import foods
+    _water_user(7803)
+    conn = connect()
+    foods.remember(conn, 7803, "тунец рубленый", source="label", kcal_100g=120, protein_100g=26)
+    conn.commit()
+    conn.close()
+    real = foods._http_get_json
+
+    def down(url):
+        raise urllib.error.HTTPError(url, 503, "Service Temporarily Unavailable", {}, None)
+    foods._http_get_json = down
+    try:
+        mine = json.loads(registry.dispatch("food_lookup", {"action": "search", "name": "тунец рубленый"}))
+        none = json.loads(registry.dispatch("food_lookup", {"action": "search", "name": "неизвестный продукт"}))
+    finally:
+        foods._http_get_json = real
+        conn = connect()
+        conn.execute("DELETE FROM my_products WHERE user_id=7803")
+        conn.commit()
+        conn.close()
+        _water_rows(7803)
+    for out in (mine, none):
+        assert out.get("retry") is False and "estimate" in out.get("instruction", ""), out
+        assert "503" in out.get("error", ""), out
+    assert mine.get("mine", {}).get("kcal_100g") == 120, f"свой продукт должен подсказываться: {mine}"
+    assert "mine" not in none, none
+
+
+def test_log_sleep_quality_zero_is_not_given():
+    _water_user(7804)
+    try:
+        out = json.loads(registry.dispatch("log_sleep", {"night_date": "2026-09-10", "duration_min": 450, "quality": 0}))
+        bad = json.loads(registry.dispatch("log_sleep", {"night_date": "2026-09-11", "duration_min": 450, "quality": 6}))
+        conn = connect()
+        q = conn.execute("SELECT quality FROM sleep_log WHERE user_id=7804 AND night_date='2026-09-10'").fetchone()
+        conn.close()
+    finally:
+        conn = connect()
+        conn.execute("DELETE FROM sleep_log WHERE user_id=7804")
+        conn.commit()
+        conn.close()
+        _water_rows(7804)
+    assert "error" not in out and "quality" not in out, f"quality=0 не ошибка и не запись: {out}"
+    assert q is not None and q["quality"] is None, "в базе должен лечь NULL"
+    assert "1..5" in bad.get("error", ""), f"6 остаётся ошибкой: {bad}"
+
+
+def test_log_food_string_items_is_validation_error():
+    _water_user(7805)
+    try:
+        out = json.loads(registry.dispatch("log_food", {"items": ["яйца СВ", "Тунец рубленый"]}))
+        conn = connect()
+        n = conn.execute("SELECT COUNT(*) n FROM food_log WHERE user_id=7805").fetchone()["n"]
+        conn.close()
+    finally:
+        _water_rows(7805)
+    assert "объектов" in out.get("error", "") and "'str'" not in out["error"], out
+    assert n == 0, "строки в items не должны ничего записывать"
 
 
 if __name__ == "__main__":

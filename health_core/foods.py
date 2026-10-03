@@ -55,6 +55,20 @@ def _candidate(p: dict, fallback_name: str) -> dict | None:
     }
 
 
+def _off_down(e: Exception) -> dict:
+    """OFF лёг (5xx, таймаут, нет сети): повтор в том же ходе даст ту же ошибку.
+    Модель повторяла поиск 12 раз за неделю, поэтому "не повторять" и что делать
+    вместо этого - в самом результате (CONTEXT.md «Состав продукта»: нет в базе - оценка)."""
+    return {
+        "error": f"Open Food Facts недоступен: {e}",
+        "retry": False,
+        "instruction": "Не повторяй запрос к Open Food Facts в этом ходе, он не ответит. "
+                       "Есть поле `mine` - это сохранённый продукт человека, бери его цифры "
+                       "(source my_product). Нет - запиши по своей оценке: source=estimate, "
+                       "и скажи человеку слово «оценка».",
+    }
+
+
 def search(name: str) -> dict:
     """До 5 кандидатов из Open Food Facts по названию. Ошибка сети -> {"error":
     ...}, не исключение: вызывающий (food_lookup) должен ответить человеку
@@ -71,7 +85,7 @@ def search(name: str) -> dict:
     try:
         data = _http_get_json(url)
     except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
-        return {"error": f"Open Food Facts недоступен: {e}"}
+        return _off_down(e)
 
     candidates = []
     for p in (data or {}).get("hits", []):
@@ -95,7 +109,7 @@ def fetch_by_code(off_code: str) -> dict:
     try:
         data = _http_get_json(url)
     except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
-        return {"error": f"Open Food Facts недоступен: {e}"}
+        return _off_down(e)
     p = (data or {}).get("product") or {}
     c = _candidate(p, off_code)
     if c is None:

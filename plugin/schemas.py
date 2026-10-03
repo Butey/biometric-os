@@ -176,7 +176,7 @@ log_sleep_schema = {
         "wake_time": {"type": "string", "description": "Время подъёма HH:MM, если известно"},
         "quality": {
             "type": "integer",
-            "description": "Субъективная оценка 1-5, где 5 — выспался. Спроси человека, если не сказал"
+            "description": "Субъективная оценка 1-5, где 5 — выспался. Человек оценку не назвал — поле НЕ передавай (не 0 и не null); не выдумывай оценку"
         },
         "deep_min": {"type": "integer", "description": "Глубокий сон, мин, только с прибора"},
         "rem_min": {"type": "integer", "description": "REM, мин, только с прибора"},

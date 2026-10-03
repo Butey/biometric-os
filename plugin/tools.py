@@ -11,7 +11,7 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from health_core.db import connect, migrate
+from health_core.db import connect, migrate, commit_count
 from health_core.guards import check_all, record
 from health_core.energy import daily_target, bmr_floor, bmr_katch, bmr_mifflin
 from health_core.nutrition import plate_balance
@@ -369,8 +369,13 @@ def _handler_wrapper(fn):
 
     Молчаливое умолчание на неизвестный ключ уже дало неверную медицинскую
     запись: measured_at вместо at -> глюкоза легла на now() вместо названного
-    времени, значение правдоподобное, сигнала нет. Лучше отказ."""
+    времени, значение правдоподобное, сигнала нет. Лучше отказ.
+
+    Исключение ПОСЛЕ коммита - не отказ: запись уже в базе, а {"error"} заставил
+    модель повторять log_water шесть раз подряд. Такой случай отдаём как
+    saved+warning с текстом исключения (счётчик коммитов - в health_core.db)."""
     def wrapper(params=None, task_id=None, **kwargs):
+        commits_before = commit_count.get()
         try:
             if not isinstance(params, dict):
                 params = {}
@@ -384,6 +389,12 @@ def _handler_wrapper(fn):
                     }, ensure_ascii=False)
             return fn(params)
         except Exception as e:
+            if commit_count.get() > commits_before:
+                return json.dumps({
+                    "saved": True,
+                    "warning": f"Запись сохранена, но следующий шаг не выполнился: {e}. "
+                               "Не вызывай инструмент повторно.",
+                }, ensure_ascii=False)
             return json.dumps({"error": str(e)}, ensure_ascii=False)
     return wrapper
 
@@ -484,6 +495,15 @@ def handle_log_food(params: dict) -> str:
         return json.dumps(
             {"error": "Нужен непустой items[]: приём без позиций не записывается. "
                       "Укажите блюдо, граммы и КБЖУ."},
+            ensure_ascii=False)
+
+    # Модель присылала items строками (["яйца СВ", ...]): граммов в строке нет, гадать не будем
+    if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
+        conn.close()
+        return json.dumps(
+            {"error": "items должен быть списком объектов, например "
+                      '[{"name": "Яйцо", "grams": 120}] (вместо grams можно pieces); '
+                      "строки и числа в items не принимаются."},
             ensure_ascii=False)
 
     for i in items:
@@ -791,10 +811,16 @@ def handle_food_lookup(params: dict) -> str:
 
     if action == "search":
         name = (params.get("name") or "").strip()
-        conn.close()
         if not name:
+            conn.close()
             return json.dumps({"error": "Нужно name"}, ensure_ascii=False)
-        return json.dumps(foods.search(name), ensure_ascii=False)
+        out = foods.search(name)
+        # База недоступна: свой сохранённый продукт - единственный источник цифр без оценки
+        mine = foods.find_mine(conn, user_id, name) if out.get("retry") is False else None
+        conn.close()
+        if mine is not None:
+            out["mine"] = _product_row(mine)
+        return json.dumps(out, ensure_ascii=False)
 
     if action == "list":
         rows = foods.list_mine(conn, user_id)
@@ -1096,6 +1122,8 @@ def handle_log_sleep(params: dict) -> str:
         try:
             quality = int(quality)
         except (TypeError, ValueError):
+            quality = None
+        if quality == 0:           # модель шлёт 0, когда оценки не было: это "не дана", в базу NULL
             quality = None
         if quality is not None and not 1 <= quality <= 5:
             conn.close()

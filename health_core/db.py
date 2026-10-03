@@ -1,4 +1,5 @@
 """SQLite соединение и миграции схемы. Без ORM, сырой sqlite3 + DDL."""
+import contextvars
 import os
 import sqlite3
 from pathlib import Path
@@ -505,9 +506,26 @@ CREATE INDEX IF NOT EXISTS idx_bp_log_user_time ON bp_log(user_id, at);
 """
 
 
+# Счётчик настоящих коммитов (с открытой транзакцией) в текущем контексте.
+# Обёртка хендлеров сравнивает его до и после вызова: исключение после коммита
+# значит "запись сохранена, упал поздний шаг", а не "запись не удалась".
+# Покрыт только conn.commit(). `with conn:` и executescript() коммитят в C-слое
+# мимо этого метода; в plugin/ и health_core/ их нет (executescript только в
+# migrate() на старте, до записей хендлера).
+commit_count: contextvars.ContextVar[int] = contextvars.ContextVar("commit_count", default=0)
+
+
+class _Conn(sqlite3.Connection):
+    def commit(self):
+        # commit() без открытой транзакции ничего не сохраняет (migrate() зовёт его всегда)
+        if self.in_transaction:
+            commit_count.set(commit_count.get() + 1)
+        super().commit()
+
+
 def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, factory=_Conn)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
