@@ -432,6 +432,7 @@ def _delete_food(conn, user_id: int, params: dict) -> str:
         doomed = list(existing)
 
     removed = [{"name": r["name"], "grams": r["grams"], "kcal": r["kcal"]} for r in doomed]
+    pantry_back = _pantry_restore(conn, user_id, [r["id"] for r in doomed])
     conn.executemany("DELETE FROM food_items WHERE id=?", [(r["id"],) for r in doomed])
     # Приём без позиций — это "0 ккал" в сводке при живой строке food_log.
     # Такой пустой остаток убираем, иначе он тихо ломает журнал.
@@ -446,6 +447,7 @@ def _delete_food(conn, user_id: int, params: dict) -> str:
     conn.close()
     return json.dumps({
         "deleted": removed,
+        **({"pantry_restored": pantry_back} if pantry_back else {}),
         "meal_removed": not left,
         "food_log_id": log_id,
         "date": date_str,
@@ -623,6 +625,7 @@ def handle_log_food(params: dict) -> str:
 
     # Insert food items
     _written = 0
+    item_ids = []
     for item in items:
         icur = conn.execute(
             "INSERT INTO food_items(food_log_id, name, grams, kcal, protein_g, fat_g, carbs_g, "
@@ -645,6 +648,7 @@ def handle_log_food(params: dict) -> str:
             ),
         )
         _written += icur.rowcount
+        item_ids.append(icur.lastrowid)
 
     # Запись проверяет собственный эффект. Не сошлось — откатываем ВСЁ вместе с
     # родительской строкой, иначе в базе останется приём-призрак без позиций.
@@ -655,7 +659,7 @@ def handle_log_food(params: dict) -> str:
             {"error": f"Записано {_written} позиций из {len(items)} — приём отменён"},
             ensure_ascii=False)
     conn.commit()
-    pantry_done, pantry_skipped = _pantry_deduct(conn, user_id, items)
+    pantry_done, pantry_skipped = _pantry_deduct(conn, user_id, items, item_ids)
 
     # Check guards and record alerts
     alerts = check_all(conn, user_id)
@@ -676,13 +680,31 @@ def handle_log_food(params: dict) -> str:
     )
 
 
-def _pantry_deduct(conn, user_id: int, items: list) -> tuple[list, list]:
+def _pantry_restore(conn, user_id: int, item_ids: list) -> list:
+    """Обратное к _pantry_deduct: удаляемые позиции еды возвращают списанное в запас
+    (позиция запаса могла уйти в ноль и быть удалена - тогда создаётся заново)."""
+    back = []
+    for item_id in item_ids:
+        for d in conn.execute("SELECT id, name, qty, unit, category FROM pantry_deductions WHERE food_item_id=? AND user_id=?",
+                              (item_id, user_id)).fetchall():
+            row = _pantry_find(conn, user_id, d["name"], loose=False)
+            if row is not None:
+                conn.execute("UPDATE pantry SET qty=COALESCE(qty,0)+?, updated_at=? WHERE id=?", (d["qty"], _now_iso(), row["id"]))
+            else:
+                conn.execute("INSERT INTO pantry(user_id, name, qty, unit, category, updated_at) VALUES (?,?,?,?,?,?)",
+                             (user_id, d["name"], d["qty"], d["unit"], d["category"] or "Прочее", _now_iso()))
+            conn.execute("DELETE FROM pantry_deductions WHERE id=?", (d["id"],))
+            back.append({"name": d["name"], "returned": round(d["qty"], 2), "unit": d["unit"]})
+    return back
+
+
+def _pantry_deduct(conn, user_id: int, items: list, item_ids: list) -> tuple[list, list]:
     """Съеденное списывается из запаса само: позиция запаса находится по названию
     (_pantry_find), граммы переводятся в единицы запаса. Возвращает (списано,
     не списано из-за неизвестного веса единицы). Позиции, которых нет в запасе, молчат."""
     from health_core.meal_options import grams_per_unit
     done, skipped = [], []
-    for it in items:
+    for it, item_id in zip(items, item_ids):
         try:
             grams = float(it.get("grams"))
         except (TypeError, ValueError):
@@ -690,12 +712,15 @@ def _pantry_deduct(conn, user_id: int, items: list) -> tuple[list, list]:
         row = _pantry_find(conn, user_id, it.get("name") or "", loose=True) if grams > 0 else None
         if row is None or row["qty"] is None:
             continue
-        pu = conn.execute("SELECT unit FROM pantry WHERE id=?", (row["id"],)).fetchone()["unit"]
+        meta = conn.execute("SELECT unit, category FROM pantry WHERE id=?", (row["id"],)).fetchone()
+        pu = meta["unit"]
         gpu, _ = grams_per_unit(pu, row["name"])
         if gpu is None:
             skipped.append(row["name"])
             continue
-        take = grams / gpu
+        take = min(grams / gpu, row["qty"])  # вернуть можно только то, что реально списали
+        conn.execute("INSERT INTO pantry_deductions(user_id, food_item_id, name, qty, unit, category) VALUES (?,?,?,?,?,?)",
+                     (user_id, item_id, row["name"], take, pu, meta["category"]))
         left = row["qty"] - take
         if left <= 1e-6:
             conn.execute("DELETE FROM pantry WHERE id=?", (row["id"],))
@@ -5594,7 +5619,7 @@ def cmd_users(raw_args: str) -> str:
 # вехи, стили, холодильник, планы, расписание лекарств) — настройки переживают
 # /wipe. Персона (users) не удаляется вовсе: удаление персоны — web-admin.
 _WIPE_TABLES = (
-    "food_log", "water_log", "glucose_log", "bp_log", "body_metrics", "anthropometry",
+    "food_log", "water_log", "glucose_log", "bp_log", "pantry_deductions", "body_metrics", "anthropometry",
     "activity", "med_log", "alerts", "daily_targets", "import_log",
     "llm_calls", "refeed_days", "sick_days", "lab_results", "plan_log",
     "side_effects", "my_products", "sleep_log", "daily_watch", "council_runs",
@@ -7248,6 +7273,18 @@ if __name__ == "__main__":
             {"name": "куриное филе", "grams": 900, "kcal": 1000, "protein_g": 100, "fat_g": 20, "carbs_g": 0}]}))
         assert _lf2["pantry_deducted"][0]["left"] == 0, _lf2
         assert conn.execute("SELECT COUNT(*) c FROM pantry WHERE user_id=? AND name='Куриное филе'", (p_uid,)).fetchone()["c"] == 0
+        # удаление приёма возвращает списанное: и в существующую позицию, и в уже удалённую (ушла в ноль)
+        _lid = lambda slot: conn.execute("SELECT id FROM food_log WHERE user_id=? AND meal_slot=? ORDER BY id DESC",
+                                         (p_uid, slot)).fetchone()["id"]
+        _d2 = json.loads(handle_log_food({"user_id": p_uid, "action": "delete", "food_log_id": _lid("dinner")}))
+        assert _d2["pantry_restored"][0]["returned"] == 250, _d2
+        assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name='Куриное филе'", (p_uid,)).fetchone()["qty"] == 250
+        _d1 = json.loads(handle_log_food({"user_id": p_uid, "action": "delete", "food_log_id": _lid("lunch")}))
+        _back = {b["name"]: b["returned"] for b in _d1["pantry_restored"]}
+        assert _back == {"Куриное филе": 150, "Яйца СВ XXL": 2}, _d1
+        assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name='Куриное филе'", (p_uid,)).fetchone()["qty"] == 400
+        assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name='Яйца СВ XXL'", (p_uid,)).fetchone()["qty"] == 10
+        assert conn.execute("SELECT COUNT(*) c FROM pantry_deductions WHERE user_id=?", (p_uid,)).fetchone()["c"] == 0
         print("OK: pantry list/add/remove — сумма при пополнении, декремент, удаление на нуле, ошибка на отсутствующем, группировка")
 
         print("\n" + "="*60)

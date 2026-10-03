@@ -58,7 +58,7 @@ PERSONA_TABLES = (
     "daily_targets", "alerts", "med_log", "llm_calls", "import_log",
     "refeed_days", "meal_plan", "workout_plan", "persona_styles", "plan_log",
     "sick_days", "lab_results", "dispatch_log", "side_effects", "my_products",
-    "daily_watch",
+    "daily_watch", "pantry_deductions",
 )
 
 

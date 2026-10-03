@@ -477,6 +477,18 @@ CREATE TABLE IF NOT EXISTS daily_watch (
     UNIQUE(user_id, date)
 );
 
+-- Что log_food списал из запаса под каждую позицию еды: чтобы удаление позиции вернуло запас.
+CREATE TABLE IF NOT EXISTS pantry_deductions (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    food_item_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    qty REAL NOT NULL,
+    unit TEXT,
+    category TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pantry_deductions_item ON pantry_deductions(food_item_id);
+
 CREATE TABLE IF NOT EXISTS bp_log (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id),
@@ -796,13 +808,13 @@ if __name__ == "__main__":
         )}
         expected = {
             "users", "user_targets", "milestones", "body_metrics", "anthropometry",
-            "food_log", "food_items", "water_log", "glucose_log", "bp_log", "activity",
+            "food_log", "food_items", "water_log", "glucose_log", "bp_log", "pantry_deductions", "activity",
             "daily_targets", "alerts", "med_log", "llm_calls", "import_log",
             "refeed_days", "meal_plan", "workout_plan", "persona_styles", "lab_results",
             "sick_days",
         }
         assert expected <= tables, f"missing tables: {expected - tables}"
-        assert len(expected) == 22
+        assert len(expected) == 23
 
         conn.execute(
             "INSERT INTO users(telegram_user_id, created_at) VALUES (1, '2026-08-20 00:00:00')"

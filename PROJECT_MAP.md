@@ -216,7 +216,7 @@ Always verify changes with:
 | Инструменты глюкозы / часов | `plugin/tools.py:1070` `handle_log_glucose`, `:1286` `handle_log_watch_day`; схемы `plugin/schemas.py` |
 | Давление | `health_core/bp.py` (категория, выборка); таблица `bp_log`; инструмент `plugin/tools.py` `handle_log_bp`; гарды `guards.py` `check_bp_high` (critical на 180/120, иначе медиана 7 дней >= 135/85), `check_bp_low`; пороги `config.yaml` `bp_*` |
 | Варианты еды из запасов | `health_core/meal_options.py` `build`; инструмент `handle_meal_options`; веса штук - таблица `_PIECE_G` (допущение, помечается `assumed_weight`) |
-| Запасы | `plugin/tools.py` `handle_pantry`, сопоставление названий `_pantry_find` (по основам слов, не по точной строке); `log_food` сам списывает съеденное через `_pantry_deduct` (модель `pantry remove` на то же не зовёт); единицы - `meal_options.grams_per_unit` |
+| Запасы | `plugin/tools.py` `handle_pantry`, сопоставление названий `_pantry_find` (по основам слов, не по точной строке); `log_food` сам списывает съеденное через `_pantry_deduct` (записи в `pantry_deductions`), удаление приёма возвращает через `_pantry_restore` (модель `pantry remove` на то же не зовёт); единицы - `meal_options.grams_per_unit` |
 | Мои продукты (цифры с этикеток) | `health_core/foods.py` `find_mine` (прямое и нестрогое совпадение), `remember` (оценка не затирает этикетку/базу), `search` (OFF через search.openfoodfacts.org) |
 | Фото: чек -> запас, тонометр | `bot/main.py` `_RECEIPT_RULE`, промпты в `_handle_photo` |
 | Словарь терминов и решения | `CONTEXT.md` (глоссарий), `Docs/` |
