@@ -18,7 +18,8 @@ _TIMEOUT_S = 15
 _USER_AGENT = "health-agent-system/1.0"
 _MAX_CANDIDATES = 5
 
-_OFF_SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
+# Старый cgi/search.pl стабильно отдаёт 503 (сентябрь-октябрь 2026), search-a-licious живой
+_OFF_SEARCH_URL = "https://search.openfoodfacts.org/search"
 _OFF_PRODUCT_URL = "https://world.openfoodfacts.org/api/v2/product"
 _OFF_FIELDS = "code,product_name,brands,nutriments"
 
@@ -62,10 +63,7 @@ def search(name: str) -> dict:
     if not name:
         return {"error": "Нужно название продукта"}
     qs = urllib.parse.urlencode({
-        "search_terms": name,
-        "search_simple": 1,
-        "action": "process",
-        "json": 1,
+        "q": name,
         "page_size": _MAX_CANDIDATES,
         "fields": _OFF_FIELDS,
     })
@@ -76,7 +74,7 @@ def search(name: str) -> dict:
         return {"error": f"Open Food Facts недоступен: {e}"}
 
     candidates = []
-    for p in (data or {}).get("products", []):
+    for p in (data or {}).get("hits", []):
         c = _candidate(p, name)
         if c is not None:
             candidates.append(c)
@@ -156,26 +154,49 @@ def keys_match(saved_key: str, query_name: str) -> bool:
 
 # ── my_products: личный справочник (CONTEXT.md «Мой продукт») ──
 
-def find_mine(conn, user_id: int, name: str):
-    """Свой сохранённый продукт, чей ключ — подмножество основ запроса.
-    Подходит несколько — берём самый специфичный (больше совпавших основ),
-    при равенстве — заведённый раньше."""
+_SOURCE_RANK = {"label": 2, "off": 1, "estimate": 0}
+
+
+def _loose_match(q: set, saved: set) -> bool:
+    """Запрос целиком внутри сохранённого названия, либо общих основ минимум две
+    и они покрывают не меньше 3/4 запроса («тунец консервированный в собственном
+    соку» ~ «Тунец кусочками в собственном соку Лента»). Одно общее слово при
+    многословном запросе не считается: «макрель без сока» - не «в собственном соку»."""
+    shared = q & saved
+    return bool(shared) and (q <= saved or (len(shared) >= 2 and len(shared) / len(q) >= 0.75))
+
+
+def find_mine(conn, user_id: int, name: str, loose: bool = True):
+    """Свой сохранённый продукт. Сначала точнее: ключ продукта - подмножество
+    основ запроса (самый специфичный, при равенстве - заведённый раньше). Если
+    такого нет и loose - запрос короче сохранённого названия («тунец» против
+    «Тунец Лента в собственном соку»): берём из подходящих продукт с лучшим
+    источником цифр (этикетка > база > оценка), затем самый свежий. Иначе
+    сохранённая этикетка не находилась, и модель заводила дубль с оценкой."""
     q_stems = name_stems(name)
     if not q_stems:
         return None
     best, best_key = None, None
+    loose_best, loose_key = None, None
     for r in conn.execute(
         "SELECT * FROM my_products WHERE user_id=? ORDER BY id", (user_id,)
     ).fetchall():
         # Основы по display_name, а не по сохранённому name_key: строки, записанные
         # при прежней длине основы (5), иначе перестали бы находиться.
         saved = name_stems(r["display_name"])
+        if not saved:
+            continue
         # Строка с 0 ккал (сбой автозаполнения) не должна перебивать нормальную запись
         # того же продукта: по ней модель видит «найден, но 0» и уходит в оценку.
-        key = (bool(r["kcal_100g"]), len(saved))
-        if saved and saved <= q_stems and (best_key is None or key > best_key):
-            best, best_key = r, key
-    return best
+        if saved <= q_stems:
+            key = (bool(r["kcal_100g"]), len(saved))
+            if best_key is None or key > best_key:
+                best, best_key = r, key
+        elif loose and r["kcal_100g"] and _loose_match(q_stems, saved):
+            key = (_SOURCE_RANK.get(r["source"], 0), r["id"])
+            if loose_key is None or key > loose_key:
+                loose_best, loose_key = r, key
+    return best or loose_best
 
 
 def remember(conn, user_id: int, name: str, *, source: str, off_code=None,
@@ -201,7 +222,12 @@ def remember(conn, user_id: int, name: str, *, source: str, off_code=None,
         "display_name=excluded.display_name, off_code=excluded.off_code, "
         "kcal_100g=excluded.kcal_100g, protein_100g=excluded.protein_100g, "
         "fat_100g=excluded.fat_100g, carbs_100g=excluded.carbs_100g, "
-        "fiber_100g=excluded.fiber_100g, source=excluded.source",
+        "fiber_100g=excluded.fiber_100g, source=excluded.source "
+        # Оценка не затирает этикетку/базу: хуже источник цифры не пишем поверх лучшего
+        # (нулевая или пустая ккал - сбой автозаполнения, её перезаписываем всегда)
+        "WHERE COALESCE(my_products.kcal_100g, 0) = 0 OR "
+        "(CASE excluded.source WHEN 'label' THEN 2 WHEN 'off' THEN 1 ELSE 0 END) >= "
+        "(CASE my_products.source WHEN 'label' THEN 2 WHEN 'off' THEN 1 ELSE 0 END)",
         (user_id, key, display_name, off_code, kcal_100g, protein_100g, fat_100g,
          carbs_100g, fiber_100g, source, _now_iso()),
     )
@@ -218,7 +244,7 @@ def list_mine(conn, user_id: int):
 
 
 def forget(conn, user_id: int, name: str) -> bool:
-    row = find_mine(conn, user_id, name)
+    row = find_mine(conn, user_id, name, loose=False)
     if row is None:
         return False
     conn.execute("DELETE FROM my_products WHERE id=?", (row["id"],))
@@ -237,8 +263,8 @@ if __name__ == "__main__":
 
     # ---- search(): разбор ответа OFF, отбрасывание кандидатов без калорий ----
     def fake_off(url):
-        assert "search_terms=" in url and "page_size=5" in url
-        return {"products": [
+        assert "q=" in url and "page_size=5" in url
+        return {"hits": [
             {"code": "111", "product_name": "Бородинский хлеб", "brands": "Каравай",
              "nutriments": {"energy-kcal_100g": 208, "proteins_100g": 6.8,
                              "fat_100g": 1.3, "carbohydrates_100g": 40.7, "fiber_100g": 6.7}},
@@ -335,6 +361,19 @@ if __name__ == "__main__":
     assert foods_mod.list_mine(conn, uid) == []
     assert foods_mod.forget(conn, uid, "бородинский") is False
     print("OK: forget() убирает продукт, повторный forget — False")
+
+    # запрос короче сохранённого названия: этикетка находится, оценка её не затирает
+    foods_mod.remember(conn, uid, "Тунец кусочками в собственном соку Лента", source="label",
+                       kcal_100g=72.7, protein_100g=16.2)
+    row = foods_mod.find_mine(conn, uid, "тунец консервированный в собственном соку")
+    assert row is not None and row["kcal_100g"] == 72.7, "короткий запрос должен найти сохранённую этикетку"
+    assert foods_mod.find_mine(conn, uid, "тунец консервированный в собственном соку", loose=False) is None
+    assert foods_mod.find_mine(conn, uid, "тунец в масле") is None, "одно общее слово - не совпадение"
+    foods_mod.remember(conn, uid, "Тунец кусочками в собственном соку Лента", source="estimate", kcal_100g=110)
+    assert foods_mod.find_mine(conn, uid, "тунец")["kcal_100g"] == 72.7, "оценка затёрла этикетку"
+    foods_mod.remember(conn, uid, "Тунец кусочками в собственном соку Лента", source="label", kcal_100g=73)
+    assert foods_mod.find_mine(conn, uid, "тунец")["kcal_100g"] == 73, "новая этикетка должна обновлять"
+    print("OK: короткий запрос находит сохранённую этикетку, оценка её не затирает")
 
     conn.close()
     print("foods: ok")

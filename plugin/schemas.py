@@ -288,6 +288,40 @@ refeed_schema = {
     "required": ["action"]
 }
 
+meal_options_schema = {
+    "type": "object",
+    "properties": {
+        "slot": {
+            "type": "string",
+            "enum": ["breakfast", "lunch", "dinner", "snack"],
+            "description": "Для какого приёма собрать варианты; без него - по текущему времени"
+        },
+        "count": {"type": "integer", "description": "Сколько вариантов (1-5, по умолчанию 3)"},
+        "user_id": {"type": "integer", "description": "ID пользователя"}
+    },
+    "required": []
+}
+
+log_bp_schema = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["add", "delete", "list"],
+            "description": "add (умолчание) - записать замер давления; delete - удалить (bp_id, без него - последний); list - список"
+        },
+        "bp_id": {"type": "integer", "description": "Для action=delete: номер записи"},
+        "systolic": {"type": "integer", "description": "Верхнее (систолическое) давление, мм рт. ст. (60-260)"},
+        "diastolic": {"type": "integer", "description": "Нижнее (диастолическое) давление, мм рт. ст. (30-160)"},
+        "pulse": {"type": "integer", "description": "Пульс с тонометра, уд/мин, если виден (30-220)"},
+        "context": {"type": "string", "description": "Условия замера: утром в покое, после нагрузки, после кофе и т.д."},
+        "at": {"type": "string", "description": "ISO timestamp замера, по умолчанию сейчас"},
+        "limit": {"type": "integer", "description": "Для action=list: сколько последних записей вернуть (по умолчанию 10)"},
+        "user_id": {"type": "integer", "description": "ID пользователя"}
+    },
+    "required": []
+}
+
 log_glucose_schema = {
     "type": "object",
     "properties": {

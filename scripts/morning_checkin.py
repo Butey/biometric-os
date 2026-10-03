@@ -6,21 +6,19 @@
 """
 import argparse
 import sys
-from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")  # VPS-локаль не гарантирована, тут кириллица
 
 from health_core.db import connect, migrate, get_target_users
-from health_core.report import status_bar
+from health_core.report import status_bar, morning_checklist
 from health_core.guards import check_all
 from health_core.chrono import caffeine_cutoff
 from health_core.meds import stock_runs_out
 from health_core import sick
 from health_core import refeed
 from health_core.config import user_today
-from health_core.watch import steps_on, step_goal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # соседние скрипты
 from injection_reminder import injection_block  # noqa: E402
@@ -65,13 +63,7 @@ def main() -> int:
         try:
             block_lines = [status_bar(conn, u["id"])]
             today = user_today(conn, u["id"])
-            # Шаги вчера
-            yesterday_date = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-            steps = steps_on(conn, u["id"], yesterday_date)
-            goal = step_goal(conn, u["id"], yesterday_date)
-            steps_txt = steps_line(steps, goal)
-            if steps_txt:
-                block_lines.append(steps_txt)
+            block_lines.append(morning_checklist(conn, u["id"]))
             # Кофеиновое окно
             cutoff = caffeine_cutoff(conn, u["id"])
             if cutoff is not None:

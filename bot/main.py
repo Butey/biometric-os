@@ -56,6 +56,7 @@ from admin.auth import load_env_file          # тот же .env, что у па
 from bot import council, history, knowledge, llm, registry
 from health_core import config
 from health_core.config import load as load_config
+from health_core.report import morning_checklist
 from health_core.db import connect, migrate
 
 log = logging.getLogger("bot")
@@ -70,6 +71,8 @@ BUILTIN_COMMANDS = {
     "new": "Забыть контекст разговора",
     "help": "Что я умею",
     "status": "Статус-бар: вес, калории, гарды",
+    "checklist": "Утренние замеры: что записано, чего не хватает",
+    "compact": "Сжать историю диалога в краткую сводку",
     "target": "Интерактивный подбор калорийности и вехи",
     "plateau": "Прогноз и разбор плато массы тела",
     "forecast": "Прогноз динамики веса",
@@ -1102,6 +1105,16 @@ def run_command(uid: str, text: str) -> str | None:
         return _plain(registry.dispatch("get_status_bar", {}))
     if name == "help":
         return _plain(registry.dispatch("help", {}))
+    if name == "checklist":
+        conn = connect()
+        try:
+            user_id = _resolve_uid_to_user_id(conn, uid)
+            if user_id is None:
+                return _NOT_REGISTERED
+            _set_user_tz(conn, user_id)
+            return morning_checklist(conn, user_id)
+        finally:
+            conn.close()
     if name in ("model", "models"):
         if uid not in admin_user_ids():
             return "⚠ Команда /model доступна только администраторам."
@@ -1210,6 +1223,43 @@ def _close_turn(uid: str, new_messages: list[dict]) -> None:
         conn.close()
 
 
+_COMPACT_PROMPT = (
+    "Сожми историю диалога health-бота в краткую сводку на русском (до 1200 символов). "
+    "Оставь только то, что нужно для продолжения разговора: договорённости, предпочтения, "
+    "незакрытые вопросы, контекст текущей темы. Цифры замеров и записи не пересказывай - "
+    "они в базе. Только текст сводки, без вступлений."
+)
+
+
+async def _compact_history(session: aiohttp.ClientSession, uid: str, providers: list) -> str:
+    """Старые сообщения (за пределами окна) -> одна сводка от модели. Свежие остаются как есть."""
+    def _load():
+        conn = connect()
+        try:
+            return history.split(conn, uid)
+        finally:
+            conn.close()
+
+    old = (await asyncio.to_thread(_load))[0]
+    if not old:
+        return "Сжимать нечего: вся история в окне."
+    msg = await llm.chat(session, [{"role": "system", "content": _COMPACT_PROMPT},
+                                   {"role": "user", "content": history.render(old)}], [], providers)
+    summary = (msg.get("content") or "").strip()
+    if not summary:
+        raise RuntimeError("модель вернула пустую сводку")
+
+    def _save():
+        conn = connect()
+        try:
+            history.replace(conn, uid, old[-1]["rowid"], summary)
+        finally:
+            conn.close()
+
+    await asyncio.to_thread(_save)
+    return f"История сжата: {len(old)} старых сообщений -> сводка. Записи в базе на месте."
+
+
 def _user_lock(uid: str) -> asyncio.Lock:
     """Один замок на человека. Без него два его же сообщения подряд
     перемешивают записи в chat_history: реплика второго хода вклинивается
@@ -1304,6 +1354,15 @@ async def _handle_document(message: Message, uid: str) -> None:
             await message.answer(f"❌ Не удалось обработать файл: {e}")
 
 
+# Присланный чек = покупка состоялась: запас пополняется сам, без вопроса
+_RECEIPT_RULE = (
+    "Чек из магазина: человек это купил, поэтому СРАЗУ, без вопросов, добавь каждую пищевую позицию чека в запас: "
+    "pantry(action='add', name=<название без артикулов и скидок>, qty=<количество>, unit=<г/кг/мл/л/шт/банка>, category=<категория>). "
+    "Вес и объём бери из названия позиции, иначе штуки. Не еду (пакеты, бытовое, хозтовары) пропусти. "
+    "В ответе перечисли, что добавлено, и отметь позиции, где количество угадано."
+)
+
+
 async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: dict, uid: str) -> None:
     """Скачивает фото, кодирует в base64 и отправляет модели как vision-запрос.
     Сценарии: фото еды для оценки КБЖУ, фото глюкометра, фото этикетки."""
@@ -1325,7 +1384,8 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
             f"{caption}\n\n"
             "Внимательно распознай изображение. Если на фото прибор или показатели (глюкометр, сон, часы/браслет, пульс, шаги, кислород, еда) — "
             "ОБЯЗАТЕЛЬНО извлеки точные цифры и вызови соответствующий инструмент для сохранения в базу "
-            "(log_glucose, log_sleep, log_watch_day, log_food)."
+            "(log_glucose, log_bp, log_sleep, log_watch_day, log_food). "
+            + _RECEIPT_RULE
         )
     else:
         text_part = (
@@ -1334,7 +1394,9 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
             "- Скриншот сна (Xiaomi Band, часы, приложение): вызови log_sleep(action='add', bedtime=..., wake_time=..., "
             "duration_min=..., deep_min=..., rem_min=..., awake_min=..., spo2_avg=..., source='скриншот часов').\n"
             "- Экран активности/часов (пульс, шаги, калории активности, стресс, SpO2/кислород): вызови log_watch_day(action='add', ...).\n"
+            "- Тонометр (давление): вызови log_bp(action='add', systolic=<верхнее>, diastolic=<нижнее>, pulse=<пульс, если виден>).\n"
             "- Еда: оцени КБЖУ, назови оценку и вызови log_food или предложи запись.\n"
+            f"- {_RECEIPT_RULE}\n"
             "- Этикетка/состав: разбери состав и КБЖУ на 100 г."
         )
 
@@ -1457,6 +1519,15 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
             await _answer_md(message, msg_text, kb)
             return
 
+        if cmd_name == "compact":
+            providers = list((load_config().get("bot") or {}).get("providers", []))
+            try:
+                await message.answer(await _compact_history(session, uid, providers))
+            except RuntimeError as e:
+                log.error("compact не удался: %s", e)
+                await message.answer("Не смог сжать историю: модель недоступна. Попробуй позже.")
+            return
+
         # Хендлеры команд синхронные и лезут в sqlite — в поток, чтобы не
         # блокировать polling. to_thread копирует контекст, ContextVar доедет.
         answer = await asyncio.to_thread(run_command, uid, text)
@@ -1469,11 +1540,24 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
     if rewritten:
         text = rewritten
 
-    prefix = await asyncio.to_thread(_open_turn, uid, text)
-
     load_env_file()
     current_cfg = load_config()
     bot_cfg = current_cfg.get("bot", cfg.get("bot", {}))
+    # Автосжатие: истории накопилось больше compact_rows записей - старое в сводку
+    # до хода, чтобы не раздувать хвост. Сбой не блокирует ход.
+    def _rows() -> int:
+        conn = connect()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM chat_history WHERE telegram_user_id=?", (uid,)).fetchone()[0]
+        finally:
+            conn.close()
+    if await asyncio.to_thread(_rows) > bot_cfg.get("compact_rows", 80):
+        try:
+            await _compact_history(session, uid, bot_cfg["providers"])
+        except RuntimeError as e:
+            log.warning("автосжатие истории не удалось: %s", e)
+
+    prefix = await asyncio.to_thread(_open_turn, uid, text)
     try:
         answer, full = await llm.run_loop(
             session, prefix, tool_specs(), bot_cfg["providers"],

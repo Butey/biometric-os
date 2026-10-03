@@ -213,6 +213,22 @@ def step_goal(conn, user_id: int, date: str) -> int | None:
     return min(10000, round(med) + 1000)
 
 
+def resting_hr_trend(conn, user_id: int) -> dict | None:
+    """Пульс покоя (CONTEXT.md «Дневной пульс»: минимум за день): медиана
+    последних 7 дней против медианы предыдущих 28. None, если в окнах меньше
+    4 и 10 дней с hr_min."""
+    today = datetime.strptime(config.user_today(conn, user_id), "%Y-%m-%d").date()
+    start_recent = (today - timedelta(days=6)).isoformat()
+    start_base = (today - timedelta(days=34)).isoformat()
+    q = "SELECT hr_min FROM daily_watch WHERE user_id=? AND date>=? AND date<? AND hr_min IS NOT NULL"
+    recent = [r["hr_min"] for r in conn.execute(q, (user_id, start_recent, "9999")).fetchall()]
+    base = [r["hr_min"] for r in conn.execute(q, (user_id, start_base, start_recent)).fetchall()]
+    if len(recent) < 4 or len(base) < 10:
+        return None
+    r, b = statistics.median(recent), statistics.median(base)
+    return {"recent": r, "base": b, "diff": r - b}
+
+
 def steps_drop(conn, user_id: int) -> dict | None:
     """Медиана шагов за последние 28 дней против предыдущих 28 — падение
     активности. None, если в любом из окон меньше 7 дней с шагами, или падение

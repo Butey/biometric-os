@@ -23,6 +23,8 @@ DESCRIPTIONS = {
     "food_lookup": "Состав продукта по названию: match — найти СВОЙ сохранённый продукт; search — до 5 кандидатов из Open Food Facts; remember — сохранить/обновить свой продукт (off_code сам подтянет состав, либо числа на 100 г); list — свои продукты; forget — убрать.",
     "log_water": "Записать выпитую воду в мл.",
     "log_glucose": "Записать замер сахара крови (ммоль/л), опционально контекст (до/после еды).",
+    "meal_options": "Собрать варианты завтрака/обеда/ужина/перекуса ИЗ ЗАПАСОВ с граммовками и КБЖУ под остаток целей дня. Звать на любое «собери/что на завтрак/что приготовить».",
+    "log_bp": "Записать замер давления (верхнее/нижнее, пульс с тонометра), список, удаление. Категорию и алерты считает код.",
     "log_side_effect": "Записать побочный эффект с тяжестью mild/moderate/severe. Без привязки к препарату — связь по времени приёма устанавливает модель.",
     "log_watch_day": "Записать день с часов: пульс (min/avg/max), шаги, калории активности, стресс, HRV за конкретный день, можно сразу несколько дней. Только суточные значения — сводки за неделю/месяц не принимать. Запись дня заменяет только присланные показатели.",
     "council": "Консилиум: честный разбор всех данных человека несколькими независимыми моделями в фоне. request запускает разбор и сразу отвечает, итог придёт отдельным сообщением; status — последний результат.",
@@ -252,11 +254,11 @@ if __name__ == "__main__":
     conn.commit()
 
     expected_tools = {
-        "log_food", "food_lookup", "log_water", "log_glucose", "log_side_effect", "log_watch_day", "log_labs", "log_sleep", "log_weight",
+        "log_food", "food_lookup", "log_water", "log_glucose", "log_bp", "log_side_effect", "log_watch_day", "log_labs", "log_sleep", "log_weight",
         "equipment", "plan_day", "log_workout", "refeed", "sick", "forecast",
         "log_anthropometry", "log_med", "pharma", "drug_card_draft", "plans", "import_scale_export",
         "get_day_summary", "get_trends", "get_status_bar",
-        "query_metrics", "query_food", "pantry", "style", "explain_target", "get_progress",
+        "query_metrics", "query_food", "pantry", "meal_options", "style", "explain_target", "get_progress",
         "get_evening_report", "register_user", "set_milestone", "admin_cmd", "help",
         "get_weekly_summary", "council",
     }

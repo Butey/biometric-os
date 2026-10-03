@@ -476,6 +476,17 @@ CREATE TABLE IF NOT EXISTS daily_watch (
     created_at TEXT NOT NULL,
     UNIQUE(user_id, date)
 );
+
+CREATE TABLE IF NOT EXISTS bp_log (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    at TEXT NOT NULL,
+    systolic INTEGER NOT NULL,
+    diastolic INTEGER NOT NULL,
+    pulse INTEGER,
+    context TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_bp_log_user_time ON bp_log(user_id, at);
 """
 
 
@@ -785,13 +796,13 @@ if __name__ == "__main__":
         )}
         expected = {
             "users", "user_targets", "milestones", "body_metrics", "anthropometry",
-            "food_log", "food_items", "water_log", "glucose_log", "activity",
+            "food_log", "food_items", "water_log", "glucose_log", "bp_log", "activity",
             "daily_targets", "alerts", "med_log", "llm_calls", "import_log",
             "refeed_days", "meal_plan", "workout_plan", "persona_styles", "lab_results",
             "sick_days",
         }
         assert expected <= tables, f"missing tables: {expected - tables}"
-        assert len(expected) == 21
+        assert len(expected) == 22
 
         conn.execute(
             "INSERT INTO users(telegram_user_id, created_at) VALUES (1, '2026-08-20 00:00:00')"

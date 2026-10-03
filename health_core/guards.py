@@ -574,48 +574,65 @@ def check_protein_skew(conn: sqlite3.Connection, user_id: int):
 
 # ---------------------------------------------------------------- GLUCOSE_VOLATILITY
 
-def check_glucose_volatility(conn: sqlite3.Connection, user_id: int):
-    cfg = _cfg()
-    since = (_now(conn, user_id) - timedelta(days=cfg["glucose_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
-    rows = conn.execute(
-        "SELECT at, mmol_l FROM glucose_log WHERE user_id=? AND at>=? ORDER BY at", (user_id, since)
-    ).fetchall()
-    if len(rows) < cfg["glucose_min_points"]:
-        return None  # лог глюкозы ведётся нерегулярно — тонкая история это норма, не сигнал
-    values = [r["mmol_l"] for r in rows]
-    sd = statistics.stdev(values)  # выборочное SD из stdlib, n>=2 гарантирован min_points
-    # Тренд берём как разницу средних второй и первой половины окна, а не МНК-наклон:
-    # замеры на временной оси нерегулярны, наклон по порядковому индексу исказил бы
-    # недели с редкими замерами сильнее, чем недели с частыми.
-    mid = len(values) // 2
-    mean_first = statistics.fmean(values[:mid])
-    mean_second = statistics.fmean(values[mid:])
-    days_span = (_parse(rows[-1]["at"]) - _parse(rows[0]["at"])).days
-    trend = (mean_second - mean_first) / (days_span / 7) if days_span > 0 else None
+def is_fasting_glucose(conn: sqlite3.Connection, user_id: int, at: str, context: str | None) -> bool:
+    """Замер натощак: так назван в context, либо context пуст, замер до 10:00 и
+    в этот день до него ещё не было еды. Любой другой context (после еды,
+    перед сном...) в натощаковую серию не идёт."""
+    ctx = (context or "").strip().lower()
+    if ctx:
+        return "натощак" in ctx or "fasting" in ctx
+    if _parse(at).hour >= 10:
+        return False
+    day = at[:10]
+    return conn.execute(
+        "SELECT 1 FROM food_log WHERE user_id=? AND eaten_at>=? AND eaten_at<? LIMIT 1",
+        (user_id, day, at),
+    ).fetchone() is None
 
-    sd_threshold = cfg["glucose_sd_threshold"]
-    trend_threshold = cfg["glucose_trend_threshold"]
-    sd_fired = sd > sd_threshold
-    trend_fired = trend is not None and trend > trend_threshold
-    if not sd_fired and not trend_fired:
+
+def check_glucose_volatility(conn: sqlite3.Connection, user_id: int):
+    """Устойчивый сдвиг, а не отдельный пик: последние glucose_streak замеров
+    натощак ВСЕ выше своей медианы за окно на glucose_rise_mmol и больше. Замеры
+    после короткого сна не считаются — это объяснимые выбросы. Тон «наблюдать
+    динамику»: уверенность и точки, давшие сигнал, идут в текст."""
+    cfg = _cfg()
+    now = _now(conn, user_id)
+    since = (now - timedelta(days=cfg["glucose_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
+    rows = conn.execute(
+        "SELECT at, mmol_l, context FROM glucose_log WHERE user_id=? AND at>=? ORDER BY at", (user_id, since)
+    ).fetchall()
+    series = []
+    for r in rows:
+        if not is_fasting_glucose(conn, user_id, r["at"], r["context"]):
+            continue
+        sleep = conn.execute(
+            "SELECT duration_min FROM sleep_log WHERE user_id=? AND night_date=?", (user_id, r["at"][:10])
+        ).fetchone()
+        if sleep and sleep["duration_min"] is not None and sleep["duration_min"] < cfg["glucose_short_sleep_min"]:
+            continue
+        series.append((r["at"], r["mmol_l"]))
+    k = cfg["glucose_streak"]
+    base = [v for _, v in series[:-k]]
+    if len(base) < cfg["glucose_min_points"]:
+        return None  # лог ведётся нерегулярно — тонкая история это норма, не сигнал
+    last = series[-k:]
+    if (now - _parse(last[-1][0])).days > 7:
+        return None  # сдвиг был, но свежих замеров нет — не напоминаем о старом
+    baseline = statistics.median(base)
+    excess = min(v for _, v in last) - baseline
+    rise = cfg["glucose_rise_mmol"]
+    if excess < rise:
         return None
-    if sd_fired and trend_fired:
-        # оба сигнала есть — озвучиваем только более серьёзный (по кратности
-        # превышения своего порога), чтобы не сжечь дневной лимит на алерт дважды
-        if (trend / trend_threshold) > (sd / sd_threshold):
-            sd_fired = False
-        else:
-            trend_fired = False
-    if sd_fired:
-        return _alert(
-            "GLUCOSE_VOLATILITY", "warning",
-            f"Вариативность глюкозы (SD {sd:.2f} ммоль/л) за {cfg['glucose_window_days']} дней выше порога {sd_threshold:.2f}.",
-            round(sd, 2), sd_threshold,
-        )
+    score = (len(base) >= 10) + (excess >= 2 * rise)
+    confidence = ("низкая", "средняя", "высокая")[score]
+    points = ", ".join(f"{a[8:10]}.{a[5:7]} {v:.1f}" for a, v in last)
     return _alert(
-        "GLUCOSE_VOLATILITY", "warning",
-        f"Глюкоза растёт: тренд {trend:.2f} ммоль/л в неделю выше порога {trend_threshold:.2f}.",
-        round(trend, 2), trend_threshold,
+        "GLUCOSE_VOLATILITY", "info",
+        f"Наблюдать динамику: {k} последних замера натощак ({points}) выше своей медианы "
+        f"{baseline:.1f} ммоль/л за {cfg['glucose_window_days']} дней минимум на {excess:.1f}. "
+        f"Уверенность: {confidence} (опорных замеров {len(base)}). Не диагноз; "
+        f"подтверждается только если сдвиг держится на следующих замерах.",
+        round(excess, 2), rise,
     )
 
 
@@ -830,6 +847,77 @@ def check_recovery_low(conn: sqlite3.Connection, user_id: int):
     )
 
 
+# ---------------------------------------------------------------- RESTING_HR_RISING
+
+def check_resting_hr_rising(conn: sqlite3.Connection, user_id: int):
+    """Минимальный пульс дня (пульс покоя) за 7 дней выше своей медианы за
+    предыдущие 28 на resting_hr_rise_bpm и больше. В отличие от RECOVERY_LOW
+    не требует HRV. Не диагноз: поводов много (недосып, стресс, болезнь, кофеин)."""
+    from health_core.watch import resting_hr_trend
+    t = resting_hr_trend(conn, user_id)
+    threshold = _cfg()["resting_hr_rise_bpm"]
+    if t is None or t["diff"] < threshold:
+        return None
+    return _alert(
+        "RESTING_HR_RISING", "info",
+        f"Пульс покоя вырос: медиана за 7 дней {t['recent']:.0f} уд/мин против {t['base']:.0f} за предыдущие 28 "
+        f"(+{t['diff']:.0f}). Не диагноз: проверь сон, стресс, кофеин, самочувствие.",
+        round(t["diff"], 1), threshold,
+    )
+
+
+# ---------------------------------------------------------------- BP_HIGH / BP_LOW
+
+def check_bp_high(conn: sqlite3.Connection, user_id: int):
+    """Кризисный одиночный замер за сутки - сразу critical (безопасность, без
+    «наблюдать»). Иначе - устойчивое повышение: медиана за окно выше домашнего
+    порога, при минимуме замеров и минимум двух разных днях; единичные скачки
+    не дают сигнала."""
+    from health_core import bp
+    cfg = _cfg()
+    now = _now(conn, user_id)
+    day = bp.recent(conn, user_id, now, 1)
+    for r in reversed(day):
+        if r["systolic"] >= cfg["bp_crisis_sys"] or r["diastolic"] >= cfg["bp_crisis_dia"]:
+            return _alert(
+                "BP_HIGH", "critical",
+                f"Давление {r['systolic']}/{r['diastolic']} в кризисном диапазоне. Посиди спокойно 5 минут и повтори замер. "
+                f"Если снова высокое или есть головная боль, боль в груди, одышка, слабость в руке или ноге, нарушение речи - вызывай скорую.",
+                r["systolic"], cfg["bp_crisis_sys"],
+            )
+    rows = bp.recent(conn, user_id, now, cfg["bp_window_days"])
+    if len(rows) < cfg["bp_min_readings"] or len({r["at"][:10] for r in rows}) < 2:
+        return None
+    sys_med = statistics.median(r["systolic"] for r in rows)
+    dia_med = statistics.median(r["diastolic"] for r in rows)
+    if sys_med < cfg["bp_high_sys"] and dia_med < cfg["bp_high_dia"]:
+        return None
+    return _alert(
+        "BP_HIGH", "warning",
+        f"Давление держится выше домашнего порога {cfg['bp_high_sys']}/{cfg['bp_high_dia']}: медиана {sys_med:.0f}/{dia_med:.0f} "
+        f"за {cfg['bp_window_days']} дней ({len(rows)} замеров). Не диагноз: мерь утром и вечером в покое, сидя, "
+        f"и покажи записи врачу, если сохранится.",
+        round(sys_med), cfg["bp_high_sys"],
+    )
+
+
+def check_bp_low(conn: sqlite3.Connection, user_id: int):
+    """Два последних замера за трое суток подряд с систолическим ниже порога:
+    на GLP-1 это частый след обезвоживания и слишком глубокого дефицита."""
+    from health_core import bp
+    cfg = _cfg()
+    rows = bp.recent(conn, user_id, _now(conn, user_id), 3)[-2:]
+    if len(rows) < 2 or any(r["systolic"] >= cfg["bp_low_sys"] for r in rows):
+        return None
+    return _alert(
+        "BP_LOW", "warning",
+        f"Два последних замера давления ниже {cfg['bp_low_sys']} сист. ({rows[0]['systolic']}/{rows[0]['diastolic']}, "
+        f"{rows[1]['systolic']}/{rows[1]['diastolic']}). Проверь воду и соль, не вставай резко; "
+        f"при головокружении или обмороке - к врачу.",
+        rows[1]["systolic"], cfg["bp_low_sys"],
+    )
+
+
 # ---------------------------------------------------------------- диспетчер
 
 _CHECKS = (
@@ -850,6 +938,9 @@ _CHECKS = (
     check_binge_risk,
     check_weight_regain,
     check_recovery_low,
+    check_resting_hr_rising,
+    check_bp_high,
+    check_bp_low,
 )
 
 # Режим болезни (health_core/sick.py) глушит поведенческие гардрейлы: во время
@@ -861,7 +952,7 @@ _CHECKS = (
 SICK_QUIET_CODES = frozenset({
     "UNDEREATING", "BINGE_RISK", "PROTEIN_SKEW", "PLATEAU", "RATE_HIGH",
     "STALE_CALIB", "NO_MEASURE", "MEASURE_SOON", "LBM_RATIO", "LBM_DRIFT",
-    "RECOVERY_LOW",
+    "RECOVERY_LOW", "RESTING_HR_RISING",
 })
 
 
@@ -1014,10 +1105,10 @@ GUARD_DEFINITIONS = {
         "name": "Вариативность и тренд гликемии",
         "category": "Здоровье и метаболизм",
         "default_severity": "warning",
-        "description": "Высокий разброс сахара (SD > 0.8 ммоль/л) или устойчивый рост тренда (> 0.1 ммоль/л/нед) за 14 дней.",
-        "rationale": "Гликемические качели вызывают окислительный стресс эндотелия сосудов и ускоряют образование конечных продуктов гликирования (AGE). Рост тренда предупреждает о снижении чувствительности к инсулину.",
-        "action": "Исключить быстрые углеводы, добавить клетчатку перед едой, совершать 15-минутную ходьбу после еды.",
-        "keys": ["glucose_sd_threshold", "glucose_trend_threshold", "glucose_window_days", "glucose_min_points"],
+        "description": "Три последних замера натощак подряд выше своей медианы за 28 дней на 0.3 ммоль/л и больше. Замеры не натощак и после короткого сна не считаются.",
+        "rationale": "Отдельные утра зависят от сна, воды, позднего ужина и условий замера. Только устойчивый сдвиг нескольких замеров подряд говорит о смещении базового уровня и возможном снижении чувствительности к инсулину.",
+        "action": "Продолжить замеры натощак в одинаковых условиях и наблюдать динамику; при сохранении сдвига показать врачу.",
+        "keys": ["glucose_streak", "glucose_rise_mmol", "glucose_window_days", "glucose_min_points", "glucose_short_sleep_min"],
     },
     "WHR_HIGH": {
         "code": "WHR_HIGH",
@@ -1078,6 +1169,36 @@ GUARD_DEFINITIONS = {
         "rationale": "Снижение вариабельности пульса (HRV) вместе с ростом минимального пульса во сне — устойчивый признак недовосстановления (накопленный стресс, недосып, начало болезни). Не диагноз, а повод не наращивать нагрузку сегодня.",
         "action": "Сделать сегодняшнюю тренировку легче или пропустить, проверить сон и стресс.",
         "keys": ["recovery_hrv_drop_pct", "recovery_hr_min_rise_bpm"],
+    },
+    "RESTING_HR_RISING": {
+        "code": "RESTING_HR_RISING",
+        "name": "Рост пульса покоя",
+        "category": "Здоровье и метаболизм",
+        "default_severity": "info",
+        "description": "Медиана минимального пульса за 7 дней выше медианы за предыдущие 28 дней на 4 уд/мин и больше.",
+        "rationale": "Устойчивый рост пульса покоя без роста нагрузки - ранний неспецифический признак недовосстановления, недосыпа, стресса или начинающейся болезни. Работает и без данных HRV.",
+        "action": "Проверить сон, стресс, кофеин и самочувствие; не наращивать нагрузку, пока пульс не вернётся.",
+        "keys": ["resting_hr_rise_bpm"],
+    },
+    "BP_HIGH": {
+        "code": "BP_HIGH",
+        "name": "Повышенное давление",
+        "category": "Здоровье и метаболизм",
+        "default_severity": "warning",
+        "description": "Медиана давления за 7 дней (от 3 замеров в 2 разные даты) выше домашнего порога 135/85; одиночный замер от 180/120 за сутки - critical сразу.",
+        "rationale": "Единичный замер зависит от стресса, кофеина и позы, поэтому вывод делается по серии. Кризисное значение при этом не ждёт серии: это вопрос безопасности.",
+        "action": "Мерить утром и вечером в покое, сидя, 2 замера подряд; записи показать врачу. При кризисном значении с симптомами - скорая.",
+        "keys": ["bp_window_days", "bp_min_readings", "bp_high_sys", "bp_high_dia", "bp_crisis_sys", "bp_crisis_dia"],
+    },
+    "BP_LOW": {
+        "code": "BP_LOW",
+        "name": "Пониженное давление",
+        "category": "Здоровье и метаболизм",
+        "default_severity": "warning",
+        "description": "Два последних замера за 3 суток подряд с систолическим ниже 90.",
+        "rationale": "На терапии GLP-1 низкое давление часто следует за обезвоживанием, слишком глубоким дефицитом калорий и малым количеством соли.",
+        "action": "Добрать воду, не вставать резко; при головокружении, потемнении в глазах или обмороке - к врачу.",
+        "keys": ["bp_low_sys"],
     },
 }
 
@@ -1266,7 +1387,7 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
                 item["current_val"] = "Нет записей сегодня"
 
         elif code == "GLUCOSE_VOLATILITY":
-            item["threshold_val"] = f"SD ≤ {cfg['glucose_sd_threshold']}, тренд ≤ {cfg['glucose_trend_threshold']}"
+            item["threshold_val"] = f"сдвиг натощак < {cfg['glucose_rise_mmol']} ммоль/л от медианы"
             item["current_val"] = "Стабильная"
 
         elif code == "WHR_HIGH":
@@ -1306,6 +1427,18 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
         elif code == "RECOVERY_LOW":
             item["threshold_val"] = f"HRV −{cfg['recovery_hrv_drop_pct']:.0f}%, HRmin +{cfg['recovery_hr_min_rise_bpm']:.0f} — 3 дня подряд"
             item["current_val"] = "Восстановление в норме"
+
+        elif code == "RESTING_HR_RISING":
+            item["threshold_val"] = f"+{cfg['resting_hr_rise_bpm']:.0f} уд/мин к медиане 28 дней"
+            item["current_val"] = "Пульс покоя в норме"
+
+        elif code == "BP_HIGH":
+            item["threshold_val"] = f"медиана < {cfg['bp_high_sys']}/{cfg['bp_high_dia']}, разово < {cfg['bp_crisis_sys']}/{cfg['bp_crisis_dia']}"
+            item["current_val"] = "Давление в норме"
+
+        elif code == "BP_LOW":
+            item["threshold_val"] = f"сист. ≥ {cfg['bp_low_sys']}"
+            item["current_val"] = "Давление не снижено"
 
         results.append(item)
 
@@ -1698,35 +1831,33 @@ if __name__ == "__main__":
             print("OK: PROTEIN_SKEW считается от плана (не срабатывает на 37% плана при низком дне, срабатывает на >50% плана)")
 
             # GLUCOSE_VOLATILITY tests
-            def _add_glucose(uid, days_ago, value):
+            def _add_glucose(uid, days_ago, value, ctx="натощак"):
                 ts = (_now() - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
-                conn.execute("INSERT INTO glucose_log(user_id, at, mmol_l) VALUES (?,?,?)", (uid, ts, value))
+                conn.execute("INSERT INTO glucose_log(user_id, at, mmol_l, context) VALUES (?,?,?,?)", (uid, ts, value, ctx))
 
-            u21 = make_user(121, height_cm=185, created_days_ago=30)
-            for d, v in [(10, 5.0), (7, 5.2), (4, 4.9)]:  # только 3 точки < min_points=5
-                _add_glucose(u21, d, v)
-            conn.commit()
-            alerts21 = check_all(conn, u21)
-            glu_fired21 = [a for a in alerts21 if a["code"] == "GLUCOSE_VOLATILITY"]
-            assert not glu_fired21, f"GLUCOSE_VOLATILITY не должен сработать при 3 точках (<5), получили {alerts21}"
+            _base = [(24, 5.0), (21, 5.1), (18, 4.9), (15, 5.0), (12, 5.1), (9, 5.0)]
+            _shift = [(5, 5.8), (3, 5.9), (1, 5.8)]
 
-            u22 = make_user(122, height_cm=185, created_days_ago=30)
-            for d, v in [(12, 4.0), (10, 7.5), (8, 4.2), (4, 7.8), (0, 4.1)]:  # большой разброс -> SD высокий
-                _add_glucose(u22, d, v)
-            conn.commit()
-            alerts22 = check_all(conn, u22)
-            glu_fired22 = [a for a in alerts22 if a["code"] == "GLUCOSE_VOLATILITY"]
-            assert glu_fired22, f"GLUCOSE_VOLATILITY должен сработать на волатильной серии, получили {alerts22}"
+            def _glu(uid, series, ctx="натощак"):
+                for d, v in series:
+                    _add_glucose(uid, d, v, ctx)
+                conn.commit()
+                return [a for a in check_all(conn, uid) if a["code"] == "GLUCOSE_VOLATILITY"]
 
-            u23 = make_user(123, height_cm=185, created_days_ago=30)
-            for d, v in [(12, 5.0), (10, 5.1), (8, 5.0), (4, 5.1), (0, 5.0)]:  # стабильная серия
-                _add_glucose(u23, d, v)
-            conn.commit()
-            alerts23 = check_all(conn, u23)
-            glu_fired23 = [a for a in alerts23 if a["code"] == "GLUCOSE_VOLATILITY"]
-            assert not glu_fired23, f"GLUCOSE_VOLATILITY не должен сработать на стабильной серии, получили {alerts23}"
+            assert not _glu(make_user(121, height_cm=185, created_days_ago=30), [(10, 5.0), (7, 5.2), (4, 4.9)]), \
+                "GLUCOSE_VOLATILITY не должен сработать на тонкой истории"
 
-            print("OK: GLUCOSE_VOLATILITY молчит на тонких данных, срабатывает на волатильности, молчит на стабильной серии")
+            glu22 = _glu(make_user(122, height_cm=185, created_days_ago=30), _base + _shift)
+            assert glu22 and "Наблюдать динамику" in glu22[0]["message"] and "Уверенность" in glu22[0]["message"], \
+                f"устойчивый сдвиг 3 замеров натощак должен дать осторожный алерт, получили {glu22}"
+
+            assert not _glu(make_user(123, height_cm=185, created_days_ago=30), _base + [(5, 5.0), (3, 6.5), (1, 5.0)]), \
+                "одиночный пик не должен давать сигнал"
+
+            assert not _glu(make_user(424, height_cm=185, created_days_ago=30), _base + _shift, ctx="после еды"), \
+                "замеры не натощак не должны давать сигнал"
+
+            print("OK: GLUCOSE_VOLATILITY молчит на тонких данных, на одиночном пике и не-натощак, срабатывает на устойчивом сдвиге")
 
             # Мера разрыва — календарная. Ставим метку на 23:59 пять дней
             # назад: по календарю это 5 дней в любой час запуска, а по полным
@@ -1997,7 +2128,7 @@ if __name__ == "__main__":
 
             # GLUCOSE_VOLATILITY — безопасность, должен звучать и в день болезни.
             u_sick_glucose = make_user(152, height_cm=185, created_days_ago=30)
-            for d, v in [(12, 4.0), (10, 7.5), (8, 4.2), (4, 7.8), (0, 4.1)]:  # тот же волатильный сценарий
+            for d, v in _base + _shift:  # тот же сценарий устойчивого сдвига
                 _add_glucose(u_sick_glucose, d, v)
             sick_mod.start(conn, u_sick_glucose, today_sick, 1, note="грипп")
             conn.commit()
@@ -2149,5 +2280,49 @@ if __name__ == "__main__":
             )
 
             print("OK: RECOVERY_LOW — 3 дня HRV↓/HRmin↑ подряд срабатывает, день болезни в тройке глушит")
+
+            # --- RESTING_HR_RISING: медиана hr_min 7 дней выше базы 28 дней на >=4 без HRV ---
+            def _hr_user(uid, recent_hr):
+                u = make_user(uid, height_cm=185, created_days_ago=60)
+                for days_ago in range(0, 35):
+                    d = (today_rec - timedelta(days=days_ago)).isoformat()
+                    _watch.save_days(conn, u, [{"date": d, "hr_min": recent_hr if days_ago < 7 else 55}])
+                conn.commit()
+                return [a for a in check_all(conn, u) if a["code"] == "RESTING_HR_RISING"]
+            assert _hr_user(182, 60), "RESTING_HR_RISING должен сработать при +5 уд/мин"
+            assert not _hr_user(183, 57), "RESTING_HR_RISING должен молчать при +2 уд/мин"
+            print("OK: RESTING_HR_RISING срабатывает на +5 уд/мин и молчит на +2")
+
+            # --- morning_checklist: записанное - ✓ с вчерашними шагами/пульсом, остальное - ☐ ---
+            from health_core.report import morning_checklist
+            u_chk = make_user(184, height_cm=185, created_days_ago=60)
+            y_chk = (today_rec - timedelta(days=1)).isoformat()
+            _watch.save_days(conn, u_chk, [{"date": y_chk, "steps": 7300, "hr_min": 56, "hr_avg": 71, "hr_max": 130}])
+            _add_glucose(u_chk, 0, 5.2, "натощак")
+            conn.execute("INSERT INTO bp_log(user_id, at, systolic, diastolic, pulse) VALUES (?,?,?,?,?)",
+                         (u_chk, _now().strftime("%Y-%m-%d %H:%M:%S"), 118, 76, 64))
+            conn.commit()
+            chk = morning_checklist(conn, u_chk)
+            for want in ("☐ Вес", "✓ Глюкоза натощак 5.2", "☐ Сон", "✓ Шаги вчера 7300", "✓ Пульс вчера мин 56, сред 71, макс 130", "✓ Давление 118/76, пульс 64"):
+                assert want in chk, f"в чек-листе нет {want!r}:\n{chk}"
+            print("OK: morning_checklist отмечает записанное и вчерашние шаги/пульс, остальное просит")
+
+            # --- BP_HIGH / BP_LOW ---
+            def _bp_user(uid, readings):
+                u = make_user(uid, height_cm=185, created_days_ago=60)
+                for days_ago, sy, di in readings:
+                    ts = (_now() - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
+                    conn.execute("INSERT INTO bp_log(user_id, at, systolic, diastolic) VALUES (?,?,?,?)", (u, ts, sy, di))
+                conn.commit()
+                return {a["code"]: a for a in check_all(conn, u) if a["code"].startswith("BP_")}
+            hi = _bp_user(485, [(5, 145, 92), (3, 142, 90), (1, 148, 94)])
+            assert hi.get("BP_HIGH", {}).get("severity") == "warning", f"серия 145/92 должна дать BP_HIGH warning: {hi}"
+            assert not _bp_user(486, [(1, 150, 95)]), "одиночный 150/95 - не сигнал"
+            assert not _bp_user(487, [(5, 118, 76), (3, 150, 95), (1, 120, 78)]), "один скачок в серии - не сигнал"
+            crisis = _bp_user(488, [(0, 185, 100)])
+            assert crisis.get("BP_HIGH", {}).get("severity") == "critical", f"185/100 за сутки - critical сразу: {crisis}"
+            assert "BP_LOW" in _bp_user(489, [(2, 88, 58), (0, 86, 55)]), "два замера сист. <90 подряд - BP_LOW"
+            assert "BP_LOW" not in _bp_user(490, [(2, 88, 58), (0, 110, 70)]), "один низкий замер - не BP_LOW"
+            print("OK: BP_HIGH по серии и critical на кризисном замере, молчит на одиночном и скачке; BP_LOW на двух низких подряд")
         finally:
             conn.close()

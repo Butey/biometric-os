@@ -258,6 +258,61 @@ def status_bar(conn: sqlite3.Connection, user_id: int) -> str:
     return "\n".join([line1, line2, line3, line4])
 
 
+def morning_checklist(conn: sqlite3.Connection, user_id: int) -> str:
+    """Чек-лист утренних замеров: что уже записано сегодня (✓) и чего не хватает
+    (☐), плюс шаги и пульс за вчера из часов. Без модели."""
+    from health_core.guards import is_fasting_glucose
+    from health_core.watch import resting_hr_trend, step_goal
+
+    today = _now(conn, user_id).date()
+    t, y = today.isoformat(), (today - timedelta(days=1)).isoformat()
+    lines = [f"Утренние замеры {today.strftime('%d.%m')}:"]
+
+    w = conn.execute(
+        "SELECT weight_kg, fat_pct FROM body_metrics WHERE user_id=? AND date(measured_at)=? "
+        "ORDER BY measured_at DESC LIMIT 1", (user_id, t)).fetchone()
+    if w:
+        fat = f", жир {w['fat_pct']:.1f}%" if w["fat_pct"] is not None else ", состав тела не записан"
+        lines.append(f"✓ Вес {w['weight_kg']:.1f} кг{fat}")
+    else:
+        lines.append("☐ Вес и состав тела (весы натощак)")
+
+    g = [r for r in conn.execute(
+        "SELECT at, mmol_l, context FROM glucose_log WHERE user_id=? AND date(at)=? ORDER BY at", (user_id, t))
+        if is_fasting_glucose(conn, user_id, r["at"], r["context"])]
+    lines.append(f"✓ Глюкоза натощак {g[0]['mmol_l']:.1f} ммоль/л" if g else "☐ Глюкоза натощак")
+
+    b = conn.execute("SELECT systolic, diastolic, pulse FROM bp_log WHERE user_id=? AND date(at)=? ORDER BY at LIMIT 1",
+                     (user_id, t)).fetchone()
+    if b:
+        lines.append(f"✓ Давление {b['systolic']}/{b['diastolic']}" + (f", пульс {b['pulse']}" if b["pulse"] else ""))
+    else:
+        lines.append("☐ Давление (тонометр в покое, сидя)")
+
+    sl = conn.execute("SELECT duration_min FROM sleep_log WHERE user_id=? AND night_date=?", (user_id, t)).fetchone()
+    if sl and sl["duration_min"] is not None:
+        lines.append(f"✓ Сон {sl['duration_min'] // 60} ч {sl['duration_min'] % 60:02d} мин")
+    else:
+        lines.append("☐ Сон за ночь")
+
+    d = conn.execute("SELECT steps, hr_min, hr_avg, hr_max FROM daily_watch WHERE user_id=? AND date=?",
+                     (user_id, y)).fetchone()
+    if d and d["steps"] is not None:
+        goal = step_goal(conn, user_id, y)
+        lines.append(f"✓ Шаги вчера {d['steps']}" + (f" из {goal}" if goal else ""))
+    else:
+        lines.append("☐ Шаги за вчера (скрин часов)")
+    if d and d["hr_min"] is not None:
+        hr = f"мин {d['hr_min']}" + "".join(
+            f", {n} {d[k]}" for n, k in (("сред", "hr_avg"), ("макс", "hr_max")) if d[k] is not None)
+        tr = resting_hr_trend(conn, user_id)
+        trend = f" (покой за 7 дн {tr['recent']:.0f}, норма 28 дн {tr['base']:.0f})" if tr else ""
+        lines.append(f"✓ Пульс вчера {hr}{trend}")
+    else:
+        lines.append("☐ Пульс за вчера (скрин часов)")
+    return "\n".join(lines)
+
+
 def evening_report(conn: sqlite3.Connection, user_id: int, date: str) -> str:
     """Вечерний отчёт 21:30 (§11) — данные для единственного вызова LLM за этот тик."""
     d = day_summary(conn, user_id, date)

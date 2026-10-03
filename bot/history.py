@@ -9,6 +9,7 @@ from health_core.config import load as _load_config, local_now
 
 _DEFAULT_WINDOW = 20
 _DEFAULT_CHARS = 8000
+_SUMMARY_TAG = "[Сводка предыдущего разговора]"
 
 # Поля, которые понимают все провайдеры + thought_signature/extra_content (Gemini 3.x,
 # без них она отвергает историю). Остальное (reasoning, refusal, annotations...) строгие
@@ -62,7 +63,15 @@ def load(conn, telegram_id: str) -> list[dict]:
         ") ORDER BY rowid ASC",
         (str(telegram_id), window if window > 0 else 0),
     ).fetchall()
-    return [json.loads(r["content"]) for r in _trim(rows, window, chars)]
+    msgs = [json.loads(r["content"]) for r in _trim(rows, window, chars)]
+    # Сводка из /compact живёт за пределами окна - подтягиваем последнюю, если её в окне нет
+    if not any(str(m.get("content")).startswith(_SUMMARY_TAG) for m in msgs):
+        row = conn.execute(
+            "SELECT content FROM chat_history WHERE telegram_user_id=? AND role='user' AND content LIKE ? "
+            "ORDER BY rowid DESC LIMIT 1", (str(telegram_id), f"%{_SUMMARY_TAG}%")).fetchone()
+        if row:
+            msgs.insert(0, json.loads(row["content"]))
+    return msgs
 
 
 def append(conn, telegram_id: str, message: dict) -> None:
@@ -72,6 +81,45 @@ def append(conn, telegram_id: str, message: dict) -> None:
         "INSERT INTO chat_history(telegram_user_id, ts, role, content) VALUES (?, ?, ?, ?)",
         (str(telegram_id), _now_iso(), message.get("role", ""),
          json.dumps(clean_message(message), ensure_ascii=False)),
+    )
+    conn.commit()
+
+
+def split(conn, telegram_id: str) -> tuple[list, list]:
+    """(old, tail): tail - то, что load() отдаёт модели, old - всё более раннее.
+    Строки с rowid, в хронологическом порядке."""
+    rows = conn.execute(
+        "SELECT rowid, ts, role, content FROM chat_history WHERE telegram_user_id=? ORDER BY rowid",
+        (str(telegram_id),),
+    ).fetchall()
+    window, chars = _bot_config()
+    tail = _trim(rows, window, chars)
+    return rows[:len(rows) - len(tail)], tail
+
+
+def render(rows: list, limit: int = 30000) -> str:
+    """Текст для модели-сжимателя: tool-ответы обрезаны, при превышении limit
+    остаётся самый свежий хвост."""
+    out = []
+    for r in rows:
+        m = json.loads(r["content"])
+        text = m.get("content") if isinstance(m.get("content"), str) else ""
+        if m["role"] == "tool":
+            text = text[:200]
+        elif m.get("tool_calls"):
+            text += " [вызовы: " + ", ".join(c["function"]["name"] for c in m["tool_calls"]) + "]"
+        out.append(f"{m['role']}: {text}")
+    return "\n".join(out)[-limit:]
+
+
+def replace(conn, telegram_id: str, up_to_rowid: int, summary: str) -> None:
+    """Заменить все сообщения пользователя до up_to_rowid включительно одной
+    сводкой. Она занимает освободившийся rowid, поэтому остаётся перед хвостом."""
+    conn.execute("DELETE FROM chat_history WHERE telegram_user_id=? AND rowid<=?", (str(telegram_id), up_to_rowid))
+    conn.execute(
+        "INSERT INTO chat_history(rowid, telegram_user_id, ts, role, content) VALUES (?, ?, ?, 'user', ?)",
+        (up_to_rowid, str(telegram_id), _now_iso(),
+         json.dumps({"role": "user", "content": _SUMMARY_TAG + "\n" + summary}, ensure_ascii=False)),
     )
     conn.commit()
 
@@ -158,6 +206,24 @@ if __name__ == "__main__":
         assert len(hist4) < 20, "лимит символов должен был обрезать раньше, чем 20 сообщений"
         assert hist4[0]["role"] == "user"
         print(f"OK: обрезка по chars ({len(hist4)} сообщений, ~{total_chars} симв.), голова — 'user'")
+
+        # --- split/replace: старое уходит в одну сводку, хвост цел и идёт после неё ---
+        clear(conn, "6")
+        for i in range(15):
+            append(conn, "6", {"role": "user", "content": f"q{i}"})
+            append(conn, "6", {"role": "assistant", "content": f"a{i}"})
+        append(conn, "7", {"role": "user", "content": "чужое"})
+        old, tail = split(conn, "6")
+        assert old and tail and old[-1]["rowid"] < tail[0]["rowid"]
+        replace(conn, "6", old[-1]["rowid"], "итог")
+        h6 = load(conn, "6")
+        assert h6[0]["content"].startswith("[Сводка") and h6[-1]["content"] == "a14", h6
+        assert len(h6) == len(tail) + 1 and len(load(conn, "7")) == 1
+        for i in range(30):  # сводка вышла из окна - load всё равно её отдаёт
+            append(conn, "6", {"role": "user", "content": f"n{i}"})
+            append(conn, "6", {"role": "assistant", "content": f"m{i}"})
+        assert load(conn, "6")[0]["content"].startswith("[Сводка"), "сводка потерялась после выхода из окна"
+        print("OK: split/replace: сводка вместо старого, хвост цел, чужой пользователь не задет")
 
         # --- умолчания при отсутствии bot: в config.yaml (не падаем) ---
         window, chars = _bot_config()

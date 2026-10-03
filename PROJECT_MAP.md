@@ -193,3 +193,46 @@ Always verify changes with:
 - `.venv/bin/python test_bot.py`
 - `.venv/bin/python test_e2e.py`
 ```
+
+---
+
+## 6. Быстрый индекс: где что лежит (file:line, на 2026-10-03)
+
+Строки плывут, при сомнении `grep -n "def имя"`. Читать срез, не файл целиком.
+
+| Задача | Где |
+| :--- | :--- |
+| Гард глюкозы (устойчивый сдвиг натощак) | `health_core/guards.py:593` `check_glucose_volatility`; классификатор натощак `:577` `is_fasting_glucose` |
+| Гард недовосстановления (HRV + пульс) | `health_core/guards.py:782` `check_recovery_low` |
+| Гард пульса покоя | `health_core/guards.py:852` `check_resting_hr_rising`; расчёт тренда `health_core/watch.py:216` `resting_hr_trend` |
+| Диспетчер гардов, тишина при болезни | `guards.py` `_CHECKS`, `SICK_QUIET_CODES`, `check_all:905`, `record:918` |
+| Описания гардов для админки | `guards.py` `GUARD_DEFINITIONS`; поля порогов `admin/pages.py` (`glucose_*`, `resting_hr_rise_bpm`) |
+| Пороги | `config.yaml` секции `guards:` и `bot:` |
+| День с часов (пульс, шаги, HRV) | `health_core/watch.py:114` `save_days`, `step_goal:198`, `steps_drop:232` |
+| Утренний чек-лист | `health_core/report.py:261` `morning_checklist`; команда `/checklist` в `bot/main.py` `run_command`; блок в `scripts/morning_checkin.py` |
+| Статус-бар, вечерний отчёт | `health_core/report.py:219`, `:309` |
+| История диалога, окно, `/compact` | `bot/history.py` (`load:55`, `split:88`, `replace:115`), `bot/main.py:1234` `_compact_history`, автосжатие в `_handle_turn` по `bot.compact_rows` |
+| Слэш-команды | `bot/main.py:70` `BUILTIN_COMMANDS`, `run_command:1091`; плагинные - `plugin/tools.py` `_SLASH_COMMANDS` |
+| Инструменты глюкозы / часов | `plugin/tools.py:1070` `handle_log_glucose`, `:1286` `handle_log_watch_day`; схемы `plugin/schemas.py` |
+| Давление | `health_core/bp.py` (категория, выборка); таблица `bp_log`; инструмент `plugin/tools.py` `handle_log_bp`; гарды `guards.py` `check_bp_high` (critical на 180/120, иначе медиана 7 дней >= 135/85), `check_bp_low`; пороги `config.yaml` `bp_*` |
+| Варианты еды из запасов | `health_core/meal_options.py` `build`; инструмент `handle_meal_options`; веса штук - таблица `_PIECE_G` (допущение, помечается `assumed_weight`) |
+| Запасы | `plugin/tools.py` `handle_pantry`, сопоставление названий `_pantry_find` (по основам слов, не по точной строке) |
+| Мои продукты (цифры с этикеток) | `health_core/foods.py` `find_mine` (прямое и нестрогое совпадение), `remember` (оценка не затирает этикетку/базу), `search` (OFF через search.openfoodfacts.org) |
+| Фото: чек -> запас, тонометр | `bot/main.py` `_RECEIPT_RULE`, промпты в `_handle_photo` |
+| Словарь терминов и решения | `CONTEXT.md` (глоссарий), `Docs/` |
+
+### Как запускать проверки
+- `.venv/bin/python test_bot.py` (46 тестов, пишет в живую БД намеренно)
+- `.venv/bin/python -m bot.history` - история и compact
+- `.venv/bin/python -m health_core.guards` - гарды. Известная проблема: упорный assert формата `status_bar` (ожидает цель 2209 ккал) падает независимо от правок; для прогона остальных блоков он обходится подменой `re.match`.
+
+### Гарды глюкозы и пульса (кратко)
+- `GLUCOSE_VOLATILITY` (код оставлен, смысл сменился): 3 последних замера натощак подряд выше своей медианы за 28 дней на 0.3 ммоль/л и больше; замеры не натощак и после сна <6 ч не считаются; severity `info`; в тексте уверенность, точки сигнала, «наблюдать динамику».
+- `RESTING_HR_RISING`: медиана `hr_min` за 7 дней минус медиана за предыдущие 28 дней >= 4 уд/мин; severity `info`; глушится режимом болезни.
+
+### Правила, которые легко сломать
+- Чек-лист и гарды: галочка `✓` - записано, `☐` - нет.
+- `find_mine(loose=True)` по умолчанию; `forget` обязан звать с `loose=False`, иначе удалит не тот продукт.
+- Тесты, которые пишут в БД, должны ставить `HEALTH_DB` ДО импорта модулей, тянущих `health_core.db` (иначе пишут в живую `/root/.hermes/health.db`). У `meal_options.py` это учтено отложенным импортом `report`.
+- Файлы с CRLF (`guards.py`, `report.py`, `export.py`, `schemas.py`, `registry.py`, `system_promt.md`): править с сохранением окончаний строк, иначе дифф на тысячи строк.
+- Существующие падения вне этих задач: `python -m health_core.guards` (assert формата `status_bar`), `test_e2e.py::export_all` (путь `Metrics/body_metrics.csv`).

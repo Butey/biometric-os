@@ -54,7 +54,7 @@ _VALID_MILESTONE_METRICS = ("weight_kg", "ffm_kg", "fat_pct", "waist")  # must m
 # отдельным запросом в _delete_persona ниже (см. также FK-каскад в комментарии там).
 PERSONA_TABLES = (
     "user_targets", "milestones", "body_metrics", "anthropometry", "food_log",
-    "water_log", "glucose_log", "activity", "med_schedule", "pantry",
+    "water_log", "glucose_log", "bp_log", "activity", "med_schedule", "pantry",
     "daily_targets", "alerts", "med_log", "llm_calls", "import_log",
     "refeed_days", "meal_plan", "workout_plan", "persona_styles", "plan_log",
     "sick_days", "lab_results", "dispatch_log", "side_effects", "my_products",

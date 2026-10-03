@@ -28,6 +28,7 @@ _BODY_METRICS_COLS = [
     "metabolic_age", "device_mac",
 ]
 _SUGAR_COLS = ["at", "mmol_l", "context", "confirmed"]
+_BP_COLS = ["at", "systolic", "diastolic", "pulse", "context"]
 _ACTIVITY_COLS = ["started_at", "duration_min", "kcal", "avg_hr", "sport", "notes", "source"]
 _WATCH_COLS = ["date", "hr_min", "hr_avg", "hr_max", "steps", "active_kcal", "stress_avg", "hrv_ms", "spo2_avg", "spo2_min", "spo2_max", "source"]
 _SLEEP_COLS = ["night_date", "bedtime", "wake_time", "duration_min", "deep_min", "rem_min", "awake_min", "quality", "efficiency_pct", "hr_avg", "spo2_avg", "source", "notes"]
@@ -117,6 +118,13 @@ def export_all(conn: sqlite3.Connection, user_id: int, out_dir: str) -> dict:
     rows += _write_csv_streamed(conn, p_csv, "glucose_log", _SUGAR_COLS, user_id, "at")
     files.append(str(p_csv))
     _write_xlsx(p_xlsx, "glucose_log", _SUGAR_COLS, user_id, "at")
+
+    # Blood pressure log
+    p_csv = base / "Metrics" / "Blood pressure" / "bp_log.csv"
+    p_xlsx = base / "Metrics" / "Blood pressure" / "bp_log.xlsx"
+    rows += _write_csv_streamed(conn, p_csv, "bp_log", _BP_COLS, user_id, "at")
+    files.append(str(p_csv))
+    _write_xlsx(p_xlsx, "bp_log", _BP_COLS, user_id, "at")
 
     # Activity log
     p_csv = base / "Metrics" / "Activity" / "activity.csv"

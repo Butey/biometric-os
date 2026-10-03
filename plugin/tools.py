@@ -1185,6 +1185,87 @@ def handle_log_glucose(params: dict) -> str:
 
 
 @_handler_wrapper
+def handle_log_bp(params: dict) -> str:
+    """Замер давления (CONTEXT.md «Замер давления»): add / list / delete. Категорию
+    и алерты считает код."""
+    from health_core import bp
+    conn = connect()
+    migrate(conn)
+    user_id = _get_user_id(params, conn)
+    action = (params.get("action") or "add").lower()
+
+    if action == "list":
+        try:
+            limit = min(int(params.get("limit") or 10), 50)
+        except (TypeError, ValueError):
+            limit = 10
+        rows = conn.execute(
+            "SELECT id, at, systolic, diastolic, pulse, context FROM bp_log WHERE user_id=? ORDER BY at DESC, id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        conn.close()
+        entries = [{"bp_id": r["id"], "at": r["at"], "systolic": r["systolic"], "diastolic": r["diastolic"],
+                    "pulse": r["pulse"], "context": r["context"],
+                    "category": bp.category(r["systolic"], r["diastolic"])} for r in rows]
+        return json.dumps({"entries": entries, "count": len(entries)}, ensure_ascii=False)
+
+    if action == "delete":
+        bp_id = params.get("bp_id")
+        if bp_id is None:
+            row = conn.execute("SELECT id, at, systolic, diastolic FROM bp_log WHERE user_id=? ORDER BY at DESC, id DESC LIMIT 1",
+                               (user_id,)).fetchone()
+        else:
+            try:
+                row = conn.execute("SELECT id, at, systolic, diastolic FROM bp_log WHERE id=? AND user_id=?",
+                                   (int(bp_id), user_id)).fetchone()
+            except (TypeError, ValueError):
+                conn.close()
+                return json.dumps({"error": "Нужен bp_id - номер записи давления"}, ensure_ascii=False)
+        if row is None:
+            conn.close()
+            return json.dumps({"error": "Записей давления нет"}, ensure_ascii=False)
+        conn.execute("DELETE FROM bp_log WHERE id=? AND user_id=?", (row["id"], user_id))
+        conn.commit()
+        conn.close()
+        return json.dumps({"deleted": {"bp_id": row["id"], "at": row["at"], "systolic": row["systolic"],
+                                       "diastolic": row["diastolic"]}}, ensure_ascii=False)
+
+    if action != "add":
+        conn.close()
+        return json.dumps({"error": f"Неизвестное действие: {action}. Допустимо: add, list, delete"}, ensure_ascii=False)
+
+    # Модель заполняет непереданные числа нулём: 0 для давления и пульса значит «нет».
+    try:
+        sys_v = int(_as_float("systolic", params.get("systolic")))
+        dia_v = int(_as_float("diastolic", params.get("diastolic")))
+        pulse = int(_as_float("pulse", params["pulse"])) if params.get("pulse") else None
+    except ValueError as e:
+        conn.close()
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+    if not 60 <= sys_v <= 260 or not 30 <= dia_v <= 160 or sys_v <= dia_v:
+        conn.close()
+        return json.dumps({"error": f"давление {sys_v}/{dia_v} невозможно: верхнее 60-260 и больше нижнего, нижнее 30-160. "
+                                    f"Перепроверь, какое число верхнее (SYS), какое нижнее (DIA)"}, ensure_ascii=False)
+    if pulse is not None and not 30 <= pulse <= 220:
+        conn.close()
+        return json.dumps({"error": f"pulse={pulse} вне диапазона 30-220"}, ensure_ascii=False)
+
+    at = _norm_event_ts(params.get("at"), conn, user_id) or _now_iso(conn, user_id)
+    if "T" in at and at.count(":") == 1:
+        at += ":00"
+    cur = conn.execute(
+        "INSERT INTO bp_log(user_id, at, systolic, diastolic, pulse, context) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, at, sys_v, dia_v, pulse, params.get("context")),
+    )
+    conn.commit()
+    alerts = check_all(conn, user_id)
+    record(conn, user_id, alerts)
+    conn.close()
+    return json.dumps({"bp_id": cur.lastrowid, "systolic": sys_v, "diastolic": dia_v, "pulse": pulse,
+                       "category": bp.category(sys_v, dia_v), "alerts": alerts}, ensure_ascii=False)
+
+
+@_handler_wrapper
 def handle_log_side_effect(params: dict) -> str:
     """Журнал побочных эффектов (CONTEXT.md «Побочный эффект»): дата, симптом,
     тяжесть. Без привязки к препарату — связь по времени приёма устанавливает
@@ -4170,6 +4251,39 @@ def handle_sick(params: dict) -> str:
     return json.dumps({"error": f"Неизвестное действие {action!r}. Допустимо: start, stop, status"}, ensure_ascii=False)
 
 
+def _pantry_find(conn, user_id: int, name: str, loose: bool):
+    """Позиция запаса по названию без учёта регистра и формулировки (основы слов,
+    как у моих продуктов). Точное совпадение основ; при loose, если его нет, -
+    единственная позиция, чьи основы вложены в запрос или содержат его
+    («творог» ~ «Творог Анфискино 5%»). Неоднозначность - None, а не угадывание."""
+    from health_core import foods
+    q = foods.name_stems(name)
+    rows = conn.execute("SELECT id, name, qty FROM pantry WHERE user_id=?", (user_id,)).fetchall()
+    exact = [r for r in rows if foods.name_stems(r["name"]) == q]
+    if exact or not loose:
+        return exact[0] if exact else conn.execute(
+            "SELECT id, name, qty FROM pantry WHERE user_id=? AND name=?", (user_id, name)).fetchone()
+    near = [r for r in rows if q and (foods.name_stems(r["name"]) <= q or q <= foods.name_stems(r["name"]))]
+    return near[0] if len(near) == 1 else None
+
+
+@_handler_wrapper
+def handle_meal_options(params: dict) -> str:
+    """Варианты приёма пищи из запасов: граммовки и итоги считает код
+    (health_core/meal_options.py), модель оформляет."""
+    from health_core import meal_options
+    conn = connect()
+    migrate(conn)
+    user_id = _get_user_id(params, conn)
+    try:
+        n = int(params.get("count") or 3)
+    except (TypeError, ValueError):
+        n = 3
+    out = meal_options.build(conn, user_id, params.get("slot"), n)
+    conn.close()
+    return json.dumps(out, ensure_ascii=False)
+
+
 @_handler_wrapper
 def handle_pantry(params: dict) -> str:
     """Холодильник: учёт продуктовых запасов. action=list|add|remove.
@@ -4227,9 +4341,7 @@ def handle_pantry(params: dict) -> str:
         except (TypeError, ValueError):
             conn.close()
             return json.dumps({"error": "Количество должно быть числом"}, ensure_ascii=False)
-        existing = conn.execute(
-            "SELECT id, qty FROM pantry WHERE user_id=? AND name=?", (user_id, name)
-        ).fetchone()
+        existing = _pantry_find(conn, user_id, name, loose=False)
         if existing is not None:
             # Пополнение существующего: складываем количества; None-qty у любой из
             # сторон означает «без счёта», тогда просто сохраняем что есть.
@@ -4248,12 +4360,11 @@ def handle_pantry(params: dict) -> str:
         return json.dumps({"ok": f"В холодильник: {name}"}, ensure_ascii=False)
 
     if action == "remove":
-        existing = conn.execute(
-            "SELECT id, qty FROM pantry WHERE user_id=? AND name=?", (user_id, name)
-        ).fetchone()
+        existing = _pantry_find(conn, user_id, name, loose=True)
         if existing is None:
             conn.close()
-            return json.dumps({"error": f"'{name}' нет в холодильнике"}, ensure_ascii=False)
+            return json.dumps({"error": f"'{name}' нет в холодильнике или название подходит к нескольким позициям - уточни, какую"}, ensure_ascii=False)
+        name = existing["name"]
         try:
             amount = _qty_or_none() or None   # 0 от модели = "не задано" -> убрать целиком
         except (TypeError, ValueError):
@@ -5038,7 +5149,7 @@ def _admin_status() -> str:
         conn = connect()
         user_count = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
 
-        tables = ["users", "body_metrics", "food_log", "water_log", "glucose_log", "anthropometry", "med_log", "alerts", "milestones"]
+        tables = ["users", "body_metrics", "food_log", "water_log", "glucose_log", "bp_log", "anthropometry", "med_log", "alerts", "milestones"]
         rows = {}
         for table in tables:
             c = conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
@@ -5449,7 +5560,7 @@ def cmd_users(raw_args: str) -> str:
 # вехи, стили, холодильник, планы, расписание лекарств) — настройки переживают
 # /wipe. Персона (users) не удаляется вовсе: удаление персоны — web-admin.
 _WIPE_TABLES = (
-    "food_log", "water_log", "glucose_log", "body_metrics", "anthropometry",
+    "food_log", "water_log", "glucose_log", "bp_log", "body_metrics", "anthropometry",
     "activity", "med_log", "alerts", "daily_targets", "import_log",
     "llm_calls", "refeed_days", "sick_days", "lab_results", "plan_log",
     "side_effects", "my_products", "sleep_log", "daily_watch", "council_runs",
@@ -5551,6 +5662,7 @@ def register(ctx):
         ("food_lookup", handle_food_lookup, schemas.food_lookup_schema),
         ("log_water", handle_log_water, schemas.log_water_schema),
         ("log_glucose", handle_log_glucose, schemas.log_glucose_schema),
+        ("log_bp", handle_log_bp, schemas.log_bp_schema),
         ("log_side_effect", handle_log_side_effect, schemas.log_side_effect_schema),
         ("log_watch_day", handle_log_watch_day, schemas.log_watch_day_schema),
         ("council", handle_council, schemas.council_schema),
@@ -5572,6 +5684,7 @@ def register(ctx):
         ("query_metrics", handle_query_metrics, schemas.query_metrics_schema),
         ("query_food", handle_query_food, schemas.query_food_schema),
         ("pantry", handle_pantry, schemas.pantry_schema),
+        ("meal_options", handle_meal_options, schemas.meal_options_schema),
         ("equipment", handle_equipment, schemas.equipment_schema),
         ("plan_day", handle_plan_day, schemas.plan_day_schema),
         ("log_workout", handle_log_workout, schemas.log_workout_schema),
@@ -5675,11 +5788,11 @@ if __name__ == "__main__":
         register(ctx)
 
         expected_tools = {
-            "log_food", "food_lookup", "log_water", "log_glucose", "log_side_effect", "log_watch_day", "log_labs", "log_sleep", "log_weight",
+            "log_food", "food_lookup", "log_water", "log_glucose", "log_bp", "log_side_effect", "log_watch_day", "log_labs", "log_sleep", "log_weight",
             "equipment", "plan_day", "log_workout", "refeed", "sick", "forecast",
             "log_anthropometry", "log_med", "pharma", "drug_card_draft", "plans", "import_scale_export",
             "get_day_summary", "get_trends", "get_status_bar",
-            "query_metrics", "query_food", "pantry", "style", "explain_target", "get_progress",
+            "query_metrics", "query_food", "pantry", "meal_options", "style", "explain_target", "get_progress",
             "get_evening_report", "register_user", "set_milestone", "admin_cmd", "help",
             "get_weekly_summary", "council",
         }
@@ -6959,6 +7072,8 @@ if __name__ == "__main__":
             "forecast": {"intake_kcal": 1500},
             "log_water": {"ml": 250},
             "log_glucose": {"mmol_l": 5.5},
+            "log_bp": {"systolic": 120, "diastolic": 80},
+            "meal_options": {},
             "log_side_effect": {"symptom": "тошнота"},
             # days не required схемой (add() валидный без него был бы ошибкой
             # контракта в другую сторону), дата — заведомо прошлая.
@@ -7077,6 +7192,12 @@ if __name__ == "__main__":
         assert "Молочка/Сыры" in listing and "Овощи/Фрукты" in listing, "список группируется по категориям"
         # Порядок: Молочка/Сыры (индекс 1) раньше Овощи/Фрукты (индекс 2) по _PANTRY_CATEGORY_ORDER.
         assert listing.index("Молочка/Сыры") < listing.index("Овощи/Фрукты"), "категории в заданном порядке"
+        # Название в другой формулировке/регистре - та же позиция, не дубль и не «нет в запасах».
+        _pan(action="add", name="ТВОРОГ", qty=100, unit="г")
+        assert conn.execute("SELECT COUNT(*) c FROM pantry WHERE user_id=? AND name LIKE '%орог%'", (p_uid,)).fetchone()["c"] == 1, \
+            "добавление в другом регистре не должно плодить дубль"
+        assert "ok" in _pan(action="remove", name="Творог Анфискино 5%", qty=100), "списание по уточнённому названию"
+        assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name='Творог'", (p_uid,)).fetchone()["qty"] == 200.0
         print("OK: pantry list/add/remove — сумма при пополнении, декремент, удаление на нуле, ошибка на отсутствующем, группировка")
 
         print("\n" + "="*60)
@@ -7150,6 +7271,18 @@ if __name__ == "__main__":
         assert _back["trend"] == 1.0 and _back["confirmed"] is False, _back
         assert _gl(mmol_l=4.0, at="2026-09-19 08:00:00")["trend"] is None, "раньше всех - сравнивать не с чем"
         assert _gl(mmol_l=4.5, at="2026-09-19 09:00:00", confirmed=True)["confirmed"] is True
+
+        # давление: перепутанные местами числа отклоняются, категория считается кодом, list/delete
+        _bpt = lambda **kw: json.loads(handle_log_bp({"user_id": rx_uid, **kw}))
+        assert "error" in _bpt(systolic=72, diastolic=118), "верхнее меньше нижнего - ошибка"
+        assert "error" in _bpt(systolic=0, diastolic=0), "нули от модели - не замер"
+        _b1 = _bpt(systolic=118, diastolic=76, pulse=64, at="2026-09-20 08:00:00", context="утром в покое")
+        assert _b1["category"] == "норма" and _b1["pulse"] == 64, _b1
+        assert _bpt(systolic=150, diastolic=95, pulse=0, at="2026-09-20 09:00:00")["pulse"] is None, "pulse=0 - не передан"
+        _lst = _bpt(action="list")
+        assert _lst["count"] == 2 and _lst["entries"][0]["systolic"] == 150, _lst
+        assert _bpt(action="delete")["deleted"]["systolic"] == 150, "delete без id убирает последний"
+        assert _bpt(action="list")["count"] == 1
 
         # сон: среднее за 7 дней не заглядывает в ночи позже вставляемой
         _sl = lambda **kw: json.loads(handle_log_sleep({"user_id": rx_uid, **kw}))

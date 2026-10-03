@@ -20,6 +20,7 @@ provides_tools:
   - food_lookup
   - log_water
   - log_glucose
+  - log_bp
   - log_side_effect
   - log_watch_day
   - log_labs
@@ -39,6 +40,7 @@ provides_tools:
   - query_metrics
   - query_food
   - pantry
+  - meal_options
   - equipment
   - plan_day
   - log_workout
