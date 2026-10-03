@@ -5,6 +5,7 @@
 пересказывает готовый результат. Гардрейл без данных не срабатывает никогда —
 не на одиночном взвешивании, не на тонкой истории.
 """
+import logging
 import sqlite3
 import statistics
 from datetime import datetime, timedelta
@@ -959,7 +960,13 @@ SICK_QUIET_CODES = frozenset({
 def check_all(conn: sqlite3.Connection, user_id: int) -> list[dict]:
     out: list[dict] = []
     for fn in _CHECKS:
-        res = fn(conn, user_id)
+        # check_all зовут после commit записи: упавший гард не должен превращать
+        # сохранённую запись в «ошибку» (модель повторит вызов - и будет дубль).
+        try:
+            res = fn(conn, user_id)
+        except Exception:
+            logging.getLogger(__name__).exception("guard %s failed", fn.__name__)
+            continue
         if res is None:
             continue
         out.extend(res) if isinstance(res, list) else out.append(res)
