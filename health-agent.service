@@ -1,34 +1,42 @@
-# Health Agent Bot — пользовательский systemd-юнит (не системный, не от root).
+# Health Agent Bot - системный systemd-юнит, работает от root (User= не задан).
 #
-# Установка на Debian VPS от обычного пользователя:
-#   mkdir -p ~/.config/systemd/user
-#   cp health-agent.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now health-agent.service
+# Установка (от root, подробности в DEPLOY.md):
+#   cp health-agent.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now health-agent.service
 #
-# Чтобы сервис жил после выхода из ssh (иначе systemd убьёт сессию пользователя),
-# один раз от root:
-#   loginctl enable-linger <username>
+# EnvironmentFile=%h/.hermes/.env: в системном юните %h - домашний каталог
+# root, то есть /root/.hermes/.env (systemctl show health-agent -p EnvironmentFiles).
+#
+# Сбой уходит админам в телеграм через health-alert@.service (systemd/).
+# ExecStopPost= нужен именно здесь: при Restart=on-failure и RestartSec=10
+# лимит запусков по умолчанию (5 за 10 с) не достигается никогда, юнит не
+# попадает в failed, и OnFailure= молчит при любом количестве падений.
+# SERVICE_RESULT=success при штатном stop/restart - деплой алерт не шлёт.
 #
 # Статус и логи:
-#   systemctl --user status health-agent.service
-#   journalctl --user-unit health-agent.service -f
+#   systemctl status health-agent.service
+#   journalctl -u health-agent.service -f
 
 [Unit]
 Description=Health Agent Bot
 After=network-online.target
 Wants=network-online.target
+OnFailure=health-alert@%n.service
 
 [Service]
 Type=simple
 Restart=on-failure
 RestartSec=10
 
-# User= здесь НЕ указывается намеренно: пользовательский юнит и так исполняется
-# от владельца сессии. Директива User= в --user юните — ошибка запуска.
+# User= не указывается: юнит системный, исполняется от root.
 
 EnvironmentFile=%h/.hermes/.env
 Environment=PYTHONUNBUFFERED=1
+# Панель поднимает только health-admin.service: иначе бот, стартовав раньше,
+# занимает 8765 сам, и health-admin падает в цикле с EADDRINUSE.
+Environment=HEALTH_ADMIN_AUTOSTART=0
+ExecStopPost=-/bin/sh -c '[ "$$SERVICE_RESULT" = success ] || systemctl start --no-block health-alert@%n.service'
 
 # Бот работает ИЗ КАТАЛОГА ПРОЕКТА, а не из копии в ~/.hermes/: персона,
 # config.yaml, Knowledge/ и код читаются отсюда, и правка файла сразу боевая.

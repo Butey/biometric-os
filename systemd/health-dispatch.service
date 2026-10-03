@@ -4,6 +4,7 @@
 Description=Health: диспетчер уведомлений по часовым поясам
 After=network-online.target
 Wants=network-online.target
+OnFailure=health-alert@%n.service
 
 [Service]
 Type=oneshot

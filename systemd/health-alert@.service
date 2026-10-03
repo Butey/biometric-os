@@ -1,0 +1,16 @@
+# Алерт админам о сбое юнита %I: последние строки его журнала уходят в телеграм
+# через notify.py (текст со stdin, получатели - admin.telegram_admin_ids).
+# Запускается из OnFailure=health-alert@%n.service и из ExecStopPost= сервисов
+# с Restart= (там юнит в failed не попадает, см. health-agent.service).
+# OnFailure= здесь НЕТ намеренно: иначе сбой алерта зациклит алерты.
+# Лимит: не больше 3 запусков в час на юнит (у каждого экземпляра шаблона свой
+# счётчик), остальное systemd отбрасывает - падающий в цикле бот не засыплет чат.
+[Unit]
+Description=Health: алерт админам о сбое %I
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/webapps/health_agent_system
+ExecStart=/bin/sh -c '{ echo "Сбой юнита %I, последние строки журнала:"; journalctl -u %I -n 15 --no-pager -o short-iso | tail -c 3500; } | /opt/webapps/health_agent_system/.venv/bin/python scripts/notify.py - --admins'

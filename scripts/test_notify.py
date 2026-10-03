@@ -6,6 +6,7 @@
 HEALTH_DB указывает на временный файл ДО импорта health_core.db — боевую
 ~/.hermes/health.db не трогаем.
 """
+import io
 import os
 import sys
 import tempfile
@@ -120,8 +121,57 @@ try:
     assert {t for _, t in sent} == {"admin report"}, sent
     assert counter_path.read_text(encoding="utf-8") == "x", "скрипт должен был выполниться ровно один раз на --admins"
     print("OK: --admins — общий текст, один прогон скрипта на всех админов")
+
+    # --- E: упавший скрипт - админам уходит и его stdout (причина, напечатанная до падения) ---
+    (fixtures_dir / "loud_fail.py").write_text(
+        "print('ВНИМАНИЕ: громкая строка')\nraise SystemExit(1)\n", encoding="utf-8")
+    rc = run(["loud_fail.py", "--admins"])
+    assert rc == 1, f"loud_fail --admins должен вернуть 1, rc={rc}"
+    assert len(sent) == 2 and all("ВНИМАНИЕ: громкая строка" in t for _, t in sent), sent
+    print("OK: упавший скрипт - stdout доходит админам")
+
+    # --- F: notify.py - --admins шлёт текст со stdin (health-alert@.service) ---
+    sys.stdin = io.TextIOWrapper(io.BytesIO("Сбой юнита x\nстрока журнала".encode("utf-8")), encoding="utf-8")
+    rc = run(["-", "--admins"])
+    assert rc == 0 and {c for c, _ in sent} == {"501", "502"}, (rc, sent)
+    assert {t for _, t in sent} == {"Сбой юнита x\nстрока журнала"}, sent
+    print("OK: '-' --admins - текст со stdin уходит админам")
 finally:
     notify.ROOT = orig_root
+
+# --- G: сводка журнала для export_backup.py (чистая функция, без journalctl) ---
+import export_backup  # noqa: E402
+
+P = "2026-10-02 01:20:49,531 INFO bot.llm tool "
+sample = "\n".join([
+    P + 'log_water({"action":"add","ml":500}) -> {"water_id": 114, "water_ml": 1000.0}',
+    P + 'food_lookup({"action":"search","name":"тушёная индейка"}) -> {"error": "Open Food Facts недоступен: HTTP Error 503"}',
+    P + 'food_lookup({"action":"search","name":"творог"}) -> {"error": "Open Food Facts недоступен: HTTP Error 503"}',
+    P + 'pantry({"action":"remove","name":"X"}) -> {"error": "\'X\' нет в холодильнике"} [ПРАВИЛА pantry] текст...(+192)',
+    P + 'log_sleep({"action":"add","notes":"сон"}) -> {"saved": true, "warning": "сон короче 4 ч"}',
+    "2026-10-02 02:00:00,000 ERROR bot config.yaml отклонён: нет bot.providers",
+    "2026-10-02 02:00:01,000 ERROR aiogram.dispatcher Failed to fetch updates - TelegramConflictError: Conflict",
+    "2026-10-02 02:00:02,000 ERROR aiogram.dispatcher Failed to fetch updates - TelegramConflictError: Conflict",
+    "2026-10-02 02:00:03,000 INFO bot отправлено chat=1 message_id=2 (3 симв)",
+])
+got = export_backup.journal_summary(sample)
+assert got[0] == ("Журнал за 24 ч: вызовов инструментов 5, ошибок 3, "
+                  "config.yaml отклонён 1, TelegramConflictError 2."), got[0]
+assert got[1] == ("Частые ошибки: food_lookup | Open Food Facts недоступен: HTTP Error 503 (2); "
+                  "pantry | 'X' нет в холодильнике (1)"), got[1]
+assert len(got) == 2 and "saved" not in got[1], got
+assert len(export_backup.journal_summary("")) == 1
+print("OK: сводка журнала - вызовы, ошибки, топ, отклонённый конфиг, Conflict; saved+warning не ошибка")
+
+ok, verdict = export_backup.check_copy(_tmp_db.name)
+assert ok and verdict == "ok, users 2, food_log 0", (ok, verdict)
+_bad = Path(tempfile.mkdtemp()) / "bad.db"
+_bad.write_bytes(b"not a sqlite file" * 100)
+ok, verdict = export_backup.check_copy(str(_bad))
+assert not ok and verdict, (ok, verdict)
+ok, verdict = export_backup.check_copy(str(_bad.parent / "missing.db"))
+assert not ok and "не открывается" in verdict, (ok, verdict)
+print("OK: проверка копии - здоровая ok, мусор и отсутствующий файл не ok")
 
 os.unlink(_tmp_db.name)
 print("ВСЕ ПРОВЕРКИ ПРОШЛИ")

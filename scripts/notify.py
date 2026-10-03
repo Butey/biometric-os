@@ -156,7 +156,9 @@ def _user_tz(user_id: int) -> str | None:
 def report_failure(script: str, proc: subprocess.CompletedProcess, token: str) -> None:
     # Сбой уходит админам, а не пользователям: человеку на диете незачем
     # видеть трейсбек, а админу без него не починить.
-    text = f"{script} упал (код {proc.returncode}):\n{proc.stderr.strip()[:3000]}"
+    # stdout тоже: скрипт мог успеть напечатать причину (export_backup: «бэкап не прошёл проверку»)
+    text = (f"{script} упал (код {proc.returncode}):\n{proc.stdout.strip()[:1500]}\n"
+            f"{proc.stderr.strip()[:2000]}").strip()
     print(text, file=sys.stderr)
     for admin_id in admin_ids():
         try:
@@ -220,6 +222,18 @@ def main() -> int:
         targets = all_registered_users()
     else:
         targets = [target_for(args.to)]
+
+    if args.script == "-":
+        # Текст со stdin вместо запуска скрипта: так health-alert@.service шлёт сбой юнита.
+        text = sys.stdin.buffer.read().decode("utf-8", "replace").strip()
+        failed = False
+        for _, chat_id in targets:
+            try:
+                send(token, chat_id, text)
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                print(f"не доставлено {chat_id}: {e}", file=sys.stderr)
+                failed = True
+        return 1 if failed else 0
 
     had_error, _ = deliver(token, args.script, targets)
     return 1 if had_error else 0

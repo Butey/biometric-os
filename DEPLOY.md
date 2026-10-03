@@ -287,6 +287,39 @@ LLM: Hermes пересказывал текст `evening_report()` персон�
 Путь `/opt/webapps/health_agent_system` в юнитах `systemd/` — поправьте под
 реальное расположение проекта, то же самое, что в `health-agent.service`.
 
+## Алерт о сбое юнитов
+
+Сбой `health-agent`, `health-admin`, `health-dispatch` или `health-backup` -
+админам в телеграм приходит имя юнита и последние 15 строк его журнала
+(`systemd/health-alert@.service`, через `notify.py - --admins`). Не больше 3
+алертов в час на юнит. Боевые юниты системные, от root (так они и установлены;
+описание `--user` в шаге 7 устарело).
+
+```bash
+cd /opt/webapps/health_agent_system
+cp health-agent.service health-admin.service /etc/systemd/system/
+systemctl link /opt/webapps/health_agent_system/systemd/health-alert@.service
+systemctl daemon-reload
+systemctl enable health-agent.service health-admin.service   # уже включены, повтор безвреден
+systemctl restart health-agent.service health-admin.service  # ExecStopPost= подхватывается только после рестарта
+```
+
+`health-backup.service` и `health-dispatch.service` в `/etc/systemd/system/` -
+симлинки на `systemd/` проекта: их НЕ копировать (`cp` запишет поверх файла в
+репозитории), после обновления кода хватает `systemctl daemon-reload`.
+
+Проверка (шлёт одно настоящее сообщение админам):
+
+```bash
+systemctl start 'health-alert@health-backup.service'
+systemctl show health-agent.service -p OnFailure   # OnFailure=health-alert@health-agent.service.service
+```
+
+Для `health-agent` и `health-admin` (`Restart=on-failure`) одного `OnFailure=`
+мало: при `RestartSec=10` и лимите запусков по умолчанию (5 за 10 с) юнит в
+`failed` не попадает, поэтому каждый нештатный выход ловит `ExecStopPost=`.
+Штатный `stop`/`restart` при деплое алерт не шлёт.
+
 ## Откат
 
 Если бот не влезает в 1 GB (OOM в `dmesg`):

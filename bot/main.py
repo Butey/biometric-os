@@ -1673,6 +1673,32 @@ def _stop_admin_panel(proc: subprocess.Popen | None) -> None:
     log.info("админка остановлена")
 
 
+_instance_lock = None   # держим открытым до конца процесса: flock снимается при закрытии файла
+
+
+def _acquire_instance_lock(token: str) -> bool:
+    """Один поллер на токен. Второй getUpdates с тем же токеном делит апдейты с
+    первым (TelegramConflictError), и оба пишут в БД. Файл зависит только от
+    токена: dev-бот с другим токеном и БД рядом с боевым не мешает. В имя идёт
+    хэш, не сам токен. Вызывать из main(), не при импорте: test_bot.py импортирует
+    этот модуль. Дочерние процессы (админка) замок не наследуют: файл открыт с CLOEXEC."""
+    global _instance_lock
+    path = f"/tmp/health-agent-{hashlib.sha256(token.encode()).hexdigest()[:12]}.lock"
+    try:
+        import fcntl   # только Unix; на Windows замка нет
+    except ImportError:
+        return True
+    try:
+        fh = open(path, "a")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        log.error("бот с этим токеном уже запущен или замок недоступен (%s: %s) - "
+                  "второй поллер не стартует", path, e)
+        return False
+    _instance_lock = fh
+    return True
+
+
 async def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -1687,6 +1713,8 @@ async def main() -> int:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         log.error("TELEGRAM_BOT_TOKEN не задан (~/.hermes/.env)")
+        return 1
+    if not _acquire_instance_lock(token):
         return 1
     if not admin_user_ids():
         log.error("admin.telegram_admin_ids пуст — некому одобрять доступ. Заполните config.yaml")

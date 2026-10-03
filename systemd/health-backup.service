@@ -1,5 +1,7 @@
+# Установка: systemctl link (юнит живёт в каталоге проекта), см. DEPLOY.md.
 [Unit]
 Description=Health notify: export_backup (админам)
+OnFailure=health-alert@%n.service
 
 [Service]
 Type=oneshot

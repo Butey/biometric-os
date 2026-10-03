@@ -1,21 +1,17 @@
-# Health Admin Panel — пользовательский systemd-юнit (не системный, не от root).
-# Тот же стиль, что и health-agent.service — см. этот файл для деталей.
+# Health Admin Panel - системный systemd-юнит, работает от root (User= не задан).
+# Тот же стиль, что и health-agent.service - см. этот файл для деталей
+# (EnvironmentFile, алерт о сбое через OnFailure= и ExecStopPost=).
 #
-# Установка на Debian VPS от обычного пользователя:
-#   mkdir -p ~/.config/systemd/user
-#   cp health-admin.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now health-admin.service
+# Установка (от root, подробности в DEPLOY.md):
+#   cp health-admin.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now health-admin.service
 #
 # Пароль администратора (один раз, до первого запуска):
 #   python -m admin.server --set-password
-#   # две выведенные строки вручную добавить в ~/.hermes/.env:
+#   # две выведенные строки вручную добавить в /root/.hermes/.env:
 #   #   ADMIN_PASSWORD_HASH=...
 #   #   ADMIN_PASSWORD_SALT=...
-#
-# Чтобы сервис жил после выхода из ssh (иначе systemd убьёт пользовательскую
-# сессию вместе с сервисом), один раз от root:
-#   loginctl enable-linger <username>
 #
 # Панель слушает ТОЛЬКО 127.0.0.1:8765 — снаружи VPS недоступна. Доступ с
 # рабочей машины — ssh-туннель:
@@ -27,22 +23,23 @@
 # отказывается стартовать (см. admin/server.py::_refuse_exposed_bind).
 #
 # Статус и логи:
-#   systemctl --user status health-admin.service
-#   journalctl --user-unit health-admin.service -f
+#   systemctl status health-admin.service
+#   journalctl -u health-admin.service -f
 
 [Unit]
 Description=Health Admin Panel (stdlib HTTP server, 127.0.0.1 only)
 After=network.target
+OnFailure=health-alert@%n.service
 
 [Service]
 Type=simple
 Restart=on-failure
 RestartSec=10
 
-# User= здесь НЕ указывается намеренно: пользовательский юнит и так исполняется
-# от владельца сессии. Директива User= в --user юните — ошибка запуска.
+# User= не указывается: юнит системный, исполняется от root.
 
 EnvironmentFile=%h/.hermes/.env
+ExecStopPost=-/bin/sh -c '[ "$$SERVICE_RESULT" = success ] || systemctl start --no-block health-alert@%n.service'
 
 # ЗАМЕНИТЬ на реальный путь клона репозитория на VPS (тот же PROJECT_DIR,
 # что передавался в install.sh) — admin/ и plugin/ не копируются в ~/.hermes,
