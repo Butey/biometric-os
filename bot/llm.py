@@ -21,6 +21,7 @@ from typing import Any, Callable, TypedDict
 import aiohttp
 
 from bot.history import clean_message
+from health_core.config import local_now
 
 log = logging.getLogger(__name__)
 
@@ -288,6 +289,40 @@ def _build_clean_messages(messages: list[dict], is_google: bool = False, force_t
     return clean
 
 
+def _record_usage(model: str, body: dict) -> None:
+    """Одна строка llm_calls на каждый успешный ответ провайдера. Живёт в chat(), а не в
+    run_loop: через chat идут и цикл агента, и консилиум (bot/council.py), и сжатие
+    истории — так считаются все вызовы, и ровно по разу (фолбэк на другого провайдера
+    не успевает записать: запись только после 200 с валидным message).
+    Синхронная, вызывается через to_thread: тот копирует ContextVar, а из него берём
+    звонящего и пояс (local_now). Никогда не бросает: учёт не должен ломать ход."""
+    try:
+        from health_core.db import connect
+        from plugin import tools as _tools
+
+        usage = body.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        caller = _tools._CALLER_FALLBACK.get()
+        conn = connect()
+        try:
+            conn.execute("PRAGMA busy_timeout=500")  # не держим ход из-за занятой БД
+            user_id = None
+            if caller:
+                row = conn.execute("SELECT id FROM users WHERE telegram_user_id=?", (caller,)).fetchone()
+                user_id = row["id"] if row else None
+            conn.execute(
+                "INSERT INTO llm_calls(user_id, created_at, model, tokens_in, tokens_out) VALUES (?, ?, ?, ?, ?)",
+                (user_id, local_now().strftime("%Y-%m-%d %H:%M:%S"), model,
+                 usage.get("prompt_tokens"), usage.get("completion_tokens")),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        log.warning("не удалось записать llm_calls", exc_info=True)
+
+
 async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict],
                 providers: list[Provider], timeout_s: float = DEFAULT_TIMEOUT_S) -> dict:
     """Идёт по providers по порядку, ротирует API-ключи для каждого провайдера,
@@ -382,12 +417,14 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                 state.failure_count = 0
                 state.last_status = 200
                 try:
-                    return dict(body["choices"][0]["message"])
+                    message = dict(body["choices"][0]["message"])
                 except (KeyError, IndexError, TypeError) as exc:
                     msg = f"{provider['model']} (key {_mask_key(key)}): 200, но битый ответ — {exc!r}, тело={body!r}"
                     log.warning(msg)
                     failures.append(msg)
                     continue
+                await asyncio.to_thread(_record_usage, provider["model"], body)
+                return message
 
             # Обработка ошибок по ключу
             state.last_status = status
@@ -443,9 +480,12 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                             state.failure_count = 0
                             state.last_status = 200
                             try:
-                                return dict(retry_body["choices"][0]["message"])
+                                message = dict(retry_body["choices"][0]["message"])
                             except (KeyError, IndexError, TypeError) as exc:
                                 log.warning("%s (key %s): 200 на повторе, но битый ответ — %r", provider["model"], _mask_key(key), exc)
+                            else:
+                                await asyncio.to_thread(_record_usage, provider["model"], retry_body)
+                                return message
 
                 # Ошибка схемы/параметров (не поддерживаются tools или thinking) — переход к след. провайдеру
                 log.warning("%s (key %s): HTTP %s ошибка запроса, переход к следующему провайдеру — %s",
@@ -489,6 +529,26 @@ async def _run_one(call: dict, dispatch: Callable[[str, dict], str]) -> str:
     return result
 
 
+def _call_key(call: dict) -> tuple[str, str] | None:
+    """(имя, канонические аргументы) — порядок ключей модель между повторами меняет.
+    Битый JSON -> None: такой вызов handler всё равно не запускает."""
+    try:
+        args = json.loads(call["function"].get("arguments") or "{}")
+    except json.JSONDecodeError:
+        return None
+    return call["function"]["name"], json.dumps(args, sort_keys=True, ensure_ascii=False)
+
+
+def _error_text(result: str) -> str | None:
+    """Текст ошибки, если результат инструмента - JSON-объект с ключом "error".
+    {"saved": true, "warning": ...} ошибкой не считается."""
+    try:
+        data = json.loads(result)
+    except (ValueError, TypeError):
+        return None
+    return str(data["error"]) if isinstance(data, dict) and "error" in data else None
+
+
 async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict],
                     providers: list[Provider], dispatch: Callable[[str, dict], str],
                     max_iters: int = 6, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[str, list[dict]]:
@@ -501,6 +561,7 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
     """
     messages = list(messages)
     last_text = ""
+    failed: dict[tuple[str, str], str] = {}  # вызовы с ошибкой в ЭТОМ ходе -> текст ошибки
 
     for _ in range(max_iters):
         message = await chat(session, messages, tools, providers, timeout_s=timeout_s)
@@ -528,7 +589,20 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
 
         results = []
         for call in tool_calls:
+            key = _call_key(call)
+            if key in failed:
+                # Модель долбит упавший вызов (12 раз food_lookup по лежащему сервису): не исполняем повторно
+                result = json.dumps({"error": (
+                    f"Вызов {key[0]} с этими же аргументами уже завершился ошибкой в этом ходе: {failed[key]}. "
+                    "Повтор не поможет: измени аргументы или скажи человеку, что пошло не так.")}, ensure_ascii=False)
+                log.info("tool %s(%s) -> подавлен повтор упавшего вызова: %s",
+                         key[0], _short(call["function"].get("arguments")), _short(failed[key]))
+                results.append(result)
+                continue
             results.append(await _run_one(call, dispatch))
+            err = _error_text(results[-1])
+            if key and err is not None:
+                failed[key] = err
         for call, result in zip(tool_calls, results, strict=True):
             messages.append({
                 "role": "tool",
@@ -543,7 +617,29 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
 
 
 if __name__ == "__main__":
+    import tempfile
+    from pathlib import Path
     from unittest.mock import patch
+
+    # chat() пишет в llm_calls: БД строго временная, ДО первого обращения к health_core.db
+    # (его DB_PATH считается при импорте; присваиваем и явно на случай раннего импорта).
+    os.environ["HEALTH_DB"] = str(Path(tempfile.mkdtemp()) / "health.db")
+    import health_core.db as db
+    db.DB_PATH = Path(os.environ["HEALTH_DB"])
+    assert db.DB_PATH != Path.home() / ".hermes" / "health.db", db.DB_PATH
+    _c = db.connect()
+    db.migrate(_c)
+    _c.execute("INSERT INTO users(telegram_user_id, created_at) VALUES (777, '2026-08-20 00:00:00')")
+    _c.commit()
+    _c.close()
+    from plugin import tools as _plugin_tools
+
+    def _usage_rows() -> list:
+        c = db.connect()
+        try:
+            return c.execute("SELECT * FROM llm_calls ORDER BY id").fetchall()
+        finally:
+            c.close()
 
     PROVIDERS: list[Provider] = [
         {"base_url": "https://p1.example/v1", "api_key_env": "TEST_KEY_1", "model": "model-1"},
@@ -830,6 +926,101 @@ if __name__ == "__main__":
                 assert google_400_calls[0]["messages"][1].get("tool_calls")
                 assert not any(m.get("tool_calls") for m in google_400_calls[1]["messages"])
             print("OK: 11) HTTP 400 thought_signature от Google успешно перезапрашивается с конвертацией в текст")
+
+            # --- 12. повтор упавшего вызова (те же аргументы, другой порядок ключей) не исполняется ---
+            def _tcw(i: int, args: str) -> dict:
+                return {"id": f"w{i}", "type": "function", "function": {"name": "log_water", "arguments": args}}
+
+            queue = [
+                _resp(200, _msg(tool_calls=[_tcw(1, '{"ml": 250, "note": "x"}')])),
+                _resp(200, _msg(tool_calls=[_tcw(2, '{"note": "x", "ml": 250}')])),
+                _resp(200, _msg(tool_calls=[_tcw(3, '{"ml":250,"note":"x"}'), _tcw(4, '{"ml": 300}')])),
+                _resp(200, _msg(content="не вышло, скажу человеку")),
+            ]
+            ran: list = []
+
+            def _dispatch_fails(name, args):
+                ran.append(args)
+                return json.dumps({"error": "БД недоступна"}, ensure_ascii=False)
+
+            with patch(__name__ + "._post", _post_ok):
+                text, msgs = await run_loop(session, [{"role": "user", "content": "выпил"}], [{"type": "function"}],
+                                             PROVIDERS, _dispatch_fails)
+                assert text == "не вышло, скажу человеку", text
+                assert ran == [{"ml": 250, "note": "x"}, {"ml": 300}], ran  # 2 и 3 вызовы не исполнялись, другие аргументы - да
+                tool_msgs = [m["content"] for m in msgs if m.get("role") == "tool"]
+                assert len(tool_msgs) == 4, tool_msgs
+                assert json.loads(tool_msgs[0]) == {"error": "БД недоступна"}, tool_msgs[0]
+                for suppressed in (tool_msgs[1], tool_msgs[2]):
+                    err = json.loads(suppressed)["error"]
+                    assert "уже завершился ошибкой" in err and "БД недоступна" in err and "Повтор не поможет" in err, err
+                assert json.loads(tool_msgs[3]) == {"error": "БД недоступна"}, tool_msgs[3]
+            print("OK: 12) повтор упавшего вызова подавлен, модель получила пояснение с исходной ошибкой, ход завершён")
+
+            # --- 13. успешные (и saved+warning) повторы исполняются все ---
+            for ok_result in ({"ok": True}, {"saved": True, "warning": "частично"}):
+                queue = [
+                    _resp(200, _msg(tool_calls=[_tcw(5, '{"ml": 250}'), _tcw(6, '{"ml": 250}')])),
+                    _resp(200, _msg(tool_calls=[_tcw(7, '{"ml": 250}')])),
+                    _resp(200, _msg(content="записал")),
+                ]
+                ran = []
+
+                def _dispatch_saves(name, args, _r=ok_result):
+                    ran.append(args)
+                    return json.dumps(_r)
+
+                with patch(__name__ + "._post", _post_ok):
+                    text, msgs = await run_loop(session, [{"role": "user", "content": "выпил"}], [{"type": "function"}],
+                                                 PROVIDERS, _dispatch_saves)
+                    assert text == "записал", text
+                    assert len(ran) == 3, ran
+            print("OK: 13) одинаковые успешные вызовы (в том числе saved+warning) исполняются каждый раз")
+
+            # --- 14. llm_calls: usage, фолбэк-модель, отсутствие usage, NULL-пользователь ---
+            _plugin_tools._CALLER_FALLBACK.set("777")
+            before = len(_usage_rows())
+            queue = [
+                _resp(500, error={"error": "down"}),
+                {"status": 200, "body": {"choices": [{"message": _msg(content="привет")}],
+                                         "usage": {"prompt_tokens": 123, "completion_tokens": 45}}},
+            ]
+            with patch(__name__ + "._post", _post_ok):
+                text, _ = await run_loop(session, [{"role": "user", "content": "hi"}], [], PROVIDERS, lambda n, a: "{}")
+            rows = _usage_rows()[before:]
+            assert text == "привет" and len(rows) == 1, (text, [dict(r) for r in rows])
+            r = rows[0]
+            assert (r["model"], r["tokens_in"], r["tokens_out"], r["cost_usd"]) == ("model-2", 123, 45, None), dict(r)
+            assert r["user_id"] == 1 and len(r["created_at"]) == 19, dict(r)
+
+            queue = [_resp(200, _msg(content="без usage"))]
+            with patch(__name__ + "._post", _post_ok):
+                await run_loop(session, [{"role": "user", "content": "hi"}], [], PROVIDERS, lambda n, a: "{}")
+            r = _usage_rows()[-1]
+            assert (r["model"], r["tokens_in"], r["tokens_out"]) == ("model-1", None, None), dict(r)
+
+            _plugin_tools._CALLER_FALLBACK.set(None)
+            queue = [_resp(200, _msg(content="аноним"))]
+            with patch(__name__ + "._post", _post_ok):
+                await run_loop(session, [{"role": "user", "content": "hi"}], [], PROVIDERS, lambda n, a: "{}")
+            assert _usage_rows()[-1]["user_id"] is None, dict(_usage_rows()[-1])
+
+            # одна строка на каждый ответ модели: tool_call + финал = 2
+            before = len(_usage_rows())
+            queue = [_resp(200, _msg(tool_calls=[tc])), _resp(200, _msg(content="готово"))]
+            with patch(__name__ + "._post", _post_ok):
+                await run_loop(session, [{"role": "user", "content": "hi"}], [{"type": "function"}], PROVIDERS, _dispatch_ok)
+            assert len(_usage_rows()) - before == 2, len(_usage_rows()) - before
+            print("OK: 14) llm_calls: токены, модель после фолбэка, NULL без usage, NULL без пользователя, по строке на ответ")
+
+            # --- 15. сбой записи usage не ломает ход ---
+            before = len(_usage_rows())
+            queue = [_resp(200, _msg(content="ответ при сломанной БД"))]
+            with patch(__name__ + "._post", _post_ok), patch("health_core.db.connect", side_effect=RuntimeError("disk")):
+                text, _ = await run_loop(session, [{"role": "user", "content": "hi"}], [], PROVIDERS, lambda n, a: "{}")
+            assert text == "ответ при сломанной БД", text
+            assert len(_usage_rows()) == before
+            print("OK: 15) исключение при записи llm_calls проглочено, ход вернул ответ")
 
         del os.environ["TEST_KEY_1"]
         del os.environ["TEST_KEY_2"]
