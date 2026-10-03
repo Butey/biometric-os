@@ -641,6 +641,8 @@ pantry_schema = {
         "name": {"type": "string", "description": "Название продукта (для add/remove)"},
         "qty": {"type": "number", "description": "Количество или вес. Для remove без qty — списать позицию целиком."},
         "unit": {"type": "string", "description": "Единица: г, шт, мл и т.п."},
+        "piece_weight_g": {"type": "number", "description": "Для add в штуках/банках: вес (мл для жидкостей) ОДНОЙ штуки или банки - код сам переведёт запас в граммы. Спроси у человека, не выдумывай."},
+        "no_weight": {"type": "boolean", "description": "true только если человек на вопрос о весе ответил, что не знает или не хочет называть: тогда запас останется в штуках"},
         "category": {"type": "string", "enum": ["Белковые", "Молочка/Сыры", "Овощи/Фрукты", "Сложные углеводы", "Прочее"], "description": "Категория продукта"},
         "user_id": {"type": "integer", "description": "ID пользователя"}
     },

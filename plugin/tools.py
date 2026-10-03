@@ -4400,6 +4400,27 @@ def handle_pantry(params: dict) -> str:
         except (TypeError, ValueError):
             conn.close()
             return json.dumps({"error": "Количество должно быть числом"}, ensure_ascii=False)
+        # Запас в штуках/банках без веса не даёт посчитать ни списание, ни варианты еды:
+        # вес берём из параметра или из названия («ст.250мл», «185 г»); типовой вес штуки
+        # (яйцо, рыбные консервы) допустим; иначе просим спросить человека. Отказался -
+        # no_weight, тогда остаётся в штуках.
+        unit_in = (params.get("unit") or "").strip().lower().rstrip(".")
+        if qty is not None and unit_in in ("", "шт", "банка", "банки", "банок", "уп", "пачка", "пачки", "бутылка", "бутылки", "пакет", "пакеты"):
+            from health_core.meal_options import grams_per_unit
+            pw = params.get("piece_weight_g")
+            if pw and float(pw) > 0:
+                qty, params["unit"] = qty * float(pw), ("мл" if unit_in in ("бутылка", "бутылки") else "г")
+            else:
+                m = re.search(r"(\d+(?:[.,]\d+)?)\s*(кг|гр|г|мл|л)\b", name.lower())
+                if m:
+                    amount = float(m.group(1).replace(",", ".")) * (1000 if m.group(2) in ("кг", "л") else 1)
+                    qty, params["unit"] = qty * amount, ("мл" if m.group(2) in ("мл", "л") else "г")
+                elif grams_per_unit(unit_in, name)[0] is None and not params.get("no_weight"):
+                    conn.close()
+                    return json.dumps({"need_weight": True, "name": name,
+                                       "ask": f"Спроси человека, сколько весит (или сколько мл в) одна штука/банка «{name}». "
+                                              f"Назвал - повтори add с piece_weight_g. Не знает или не хочет - повтори add с no_weight=true."},
+                                      ensure_ascii=False)
         existing = _pantry_find(conn, user_id, name, loose=False)
         if existing is not None:
             # Пополнение существующего: складываем количества; None-qty у любой из
@@ -7245,7 +7266,18 @@ if __name__ == "__main__":
         # Списание отсутствующего — ошибка, а не молчаливый успех.
         assert "error" in _pan(action="remove", name="Нет такого"), "remove несуществующего должен вернуть error"
         # Группировка в списке по категориям.
-        _pan(action="add", name="Огурец", qty=2, unit="шт", category="Овощи/Фрукты")
+        _nw = _pan(action="add", name="Огурец", qty=2, unit="шт", category="Овощи/Фрукты")
+        assert _nw.get("need_weight") and "ask" in _nw, "штуки без веса - сначала спросить вес"
+        assert conn.execute("SELECT COUNT(*) c FROM pantry WHERE user_id=? AND name='Огурец'", (p_uid,)).fetchone()["c"] == 0
+        assert "ok" in _pan(action="add", name="Огурец", qty=2, unit="шт", category="Овощи/Фрукты", no_weight=True)
+        assert conn.execute("SELECT qty, unit FROM pantry WHERE user_id=? AND name='Огурец'", (p_uid,)).fetchone()["unit"] == "шт"
+        assert "ok" in _pan(action="add", name="Кефир", qty=3, unit="бутылка", piece_weight_g=900, category="Молочка/Сыры")
+        _kf = conn.execute("SELECT qty, unit FROM pantry WHERE user_id=? AND name='Кефир'", (p_uid,)).fetchone()
+        assert (_kf["qty"], _kf["unit"]) == (2700, "мл"), dict(_kf)
+        assert "ok" in _pan(action="add", name="Масло олив ст.250мл", qty=2, unit="шт", category="Прочее")
+        _ol = conn.execute("SELECT qty, unit FROM pantry WHERE user_id=? AND name LIKE 'Масло%'", (p_uid,)).fetchone()
+        assert (_ol["qty"], _ol["unit"]) == (500, "мл"), "вес из названия считает код"
+        assert "ok" in _pan(action="add", name="Тунец Лента", qty=2, unit="банка", category="Белковые"), "типовой вес банки известен - не спрашиваем"
         _pan(action="add", name="Творог", qty=200, unit="г", category="Молочка/Сыры")
         listing = _pan(action="list")["pantry"]
         assert "Молочка/Сыры" in listing and "Овощи/Фрукты" in listing, "список группируется по категориям"
