@@ -471,6 +471,27 @@ def login_page(csrf_token: str, error: str | None = None) -> str:
     return _document("Вход", body)
 
 
+def login_code_page(csrf_token: str, error: str | None = None) -> str:
+    err_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+    body = f"""
+<main style="max-width:380px;margin:80px auto;padding:16px">
+  <div class="card" style="padding:28px 24px">
+    <h1 style="margin:0 0 16px;font-size:22px">Код подтверждения</h1>
+    {err_html}
+    <p>Код отправлен администраторам в Telegram и действует 5 минут.</p>
+    <form method="post" action="/login/code">
+      {_csrf_field(csrf_token)}
+      <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px">
+        <label for="code">Код из Telegram</label>
+        <input type="text" id="code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" maxlength="6" style="width:100%" autofocus required>
+      </div>
+      <button type="submit" style="width:100%;padding:10px;font-size:15px">Войти</button>
+    </form>
+  </div>
+</main>"""
+    return _document("Код подтверждения", body)
+
+
 def login_ok_page() -> str:
     body = '<main style="max-width:360px;margin:80px auto;padding:16px"><div class="card"><p class="msg">Вход выполнен.</p><p><a href="/">Перейти в панель</a></p></div></main>'
     return _document("Вход выполнен", body)

@@ -610,6 +610,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             routes = {
                 "/login": self._post_login,
+                "/login/code": self._post_login_code,
                 "/logout": self._post_logout,
                 "/guards/save": self._post_guards_save,
                 "/milestones": self._post_milestones,
@@ -648,6 +649,8 @@ class Handler(BaseHTTPRequestHandler):
             token = SESSIONS.create(authed=False)
             sess = SESSIONS.get(token)
             set_cookie = self._make_cookie(token)
+        if auth.code_pending(sess):  # page reload between the two steps
+            return self._html(200, pages.login_code_page(csrf_token=sess["csrf"]), set_cookie)
         self._html(200, pages.login_page(csrf_token=sess["csrf"]), set_cookie)
 
     def _post_login(self):
@@ -669,6 +672,30 @@ class Handler(BaseHTTPRequestHandler):
         if not password_hash or not password_salt or not auth.verify_password(password, password_salt, password_hash):
             RATE_LIMITER.record_failure(ip)
             return self._html(200, pages.login_page(csrf_token=sess["csrf"], error=auth.LOGIN_ERROR_MSG))
+
+        # Right password is only step 1: the session stays authed=False until
+        # _post_login_code. Per-IP failures are NOT reset here, only after step 2.
+        if not auth.begin_login_code(sess, ip, RATE_LIMITER):
+            return self._html(200, pages.login_page(csrf_token=sess["csrf"], error=auth.CODE_SEND_ERROR_MSG))
+        self._html(200, pages.login_code_page(csrf_token=sess["csrf"]))
+
+    def _post_login_code(self):
+        form = self._read_form()
+        token, sess = self._session()
+        if sess is None:
+            return self._error_page(403, "Сессия не найдена. Обновите страницу входа.")
+        if not auth.csrf_ok(sess, form.get("csrf_token")):
+            return self._error_page(403, "Неверный CSRF-токен.")
+
+        ip = self._client_ip()
+        if RATE_LIMITER.is_locked(ip):
+            return self._html(200, pages.login_code_page(csrf_token=sess["csrf"], error=auth.LOGIN_ERROR_MSG))
+        if not auth.check_login_code(sess, form.get("code")):
+            RATE_LIMITER.record_failure(ip)  # same bucket as a wrong password
+            if auth.code_pending(sess):
+                return self._html(200, pages.login_code_page(csrf_token=sess["csrf"], error=auth.CODE_ERROR_MSG))
+            # expired or out of attempts: pending state is gone, start from the password
+            return self._html(200, pages.login_page(csrf_token=sess["csrf"], error=auth.CODE_ERROR_MSG))
 
         RATE_LIMITER.record_success(ip)
         new_token = SESSIONS.authenticate(token)  # rotates token: session-fixation defense

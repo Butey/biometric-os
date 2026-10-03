@@ -7,10 +7,14 @@ section; env vars live in the same ~/.hermes/.env channel as the password hash.
 """
 import hashlib
 import hmac
+import json
 import os
 import secrets
+import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 SCRYPT_N = 2 ** 14
@@ -27,6 +31,11 @@ def _session_timeout_sec() -> int:
 # Same message for "wrong password" and "IP/globally locked" — a different
 # message would let an attacker distinguish the two and time a retry.
 LOGIN_ERROR_MSG = "Неверный пароль или вход временно заблокирован."
+CODE_ERROR_MSG = "Неверный или просроченный код."
+# Plain on purpose: no ids, no token, no hint which of the two things is missing.
+CODE_SEND_ERROR_MSG = "Не удалось отправить код подтверждения, вход невозможен."
+CODE_TTL_SEC = 300
+CODE_MAX_ATTEMPTS = 5
 
 
 def load_env_file(path: Path = ENV_PATH, force: bool = False) -> None:
@@ -198,6 +207,14 @@ class RateLimiter:
         with self._lock:
             self._per_ip.pop(ip, None)
 
+    def record_issue(self) -> None:
+        """An issued login code = Telegram messages sent. Counted in the global
+        window only (same 20 / 15 min as failures), so a correct password cannot
+        be used as an unlimited message cannon. Not per-IP: a legit login must
+        not eat the 5 wrong-code attempts of its own IP."""
+        with self._lock:
+            self._global.append(time.time())
+
 
 class SessionStore:
     """token -> {"expires": epoch, "csrf": str, "authed": bool}. In-memory only
@@ -272,6 +289,88 @@ def csrf_ok(session: dict | None, submitted: str | None) -> bool:
     if session is None or not submitted:
         return False
     return hmac.compare_digest(session["csrf"], submitted)
+
+
+# ---- second factor: one-time code delivered through the Telegram Bot API.
+# Pending state lives in the session dict: sess["pending"] = {code, expires, attempts}.
+# The sess dict is shared between handler threads, hence one lock for all pending ops.
+_pending_lock = threading.Lock()
+
+
+def _telegram_send(token: str, chat_id: str, text: str) -> None:
+    """One sendMessage (same approach as scripts/notify.py). Self-check replaces this."""
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        if not json.loads(resp.read()).get("ok"):
+            raise OSError("telegram refused the message")
+
+
+def _admin_ids() -> list[str]:
+    from health_core.config import load as load_config
+    return [str(i) for i in (load_config().get("admin", {}) or {}).get("telegram_admin_ids") or []]
+
+
+def begin_login_code(sess: dict, ip: str, limiter: "RateLimiter") -> bool:
+    """Call after the password was verified. True = the code-entry page can be
+    shown; False = fail closed (no admins / no token / Telegram refused everyone).
+
+    A live pending code is never replaced and nothing is sent again: re-posting
+    the password only re-shows the code form. A new code needs the old one to
+    expire (or be used up), and every issue is counted by the rate limiter."""
+    with _pending_lock:
+        pending = sess.get("pending")
+        if pending and pending["expires"] > time.time():
+            return True
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        ids = _admin_ids()
+        if not token or not ids:
+            sess.pop("pending", None)
+            return False
+        code = f"{secrets.randbelow(10 ** 6):06d}"
+        sess["pending"] = {"code": code, "expires": time.time() + CODE_TTL_SEC, "attempts": 0}
+        limiter.record_issue()
+    text = (
+        "Запрошен вход в админ-панель Health Admin.\n"
+        f"Код: {code}\n"
+        f"Действует {CODE_TTL_SEC // 60} минут. IP запроса: {ip[:64]}.\n"
+        "Если это были не вы - смените пароль администратора."
+    )
+    sent = 0
+    for chat_id in ids:  # sent outside the lock: each call may take up to the timeout
+        try:
+            _telegram_send(token, chat_id, text)
+            sent += 1
+        except Exception as e:
+            # Class name only: the message of a urllib error can carry the URL, i.e. the token.
+            print(f"admin login code: send failed ({type(e).__name__})", file=sys.stderr)
+    if not sent:
+        with _pending_lock:
+            sess.pop("pending", None)
+    return bool(sent)
+
+
+def code_pending(sess: dict | None) -> bool:
+    with _pending_lock:
+        pending = (sess or {}).get("pending")
+        return bool(pending and pending["expires"] > time.time())
+
+
+def check_login_code(sess: dict, submitted: str | None) -> bool:
+    """True once, for the right live code. Wrong guess: counted; the CODE_MAX_ATTEMPTS-th
+    wrong one, expiry and success all destroy the pending state (single use)."""
+    with _pending_lock:
+        pending = sess.get("pending")
+        if not pending:
+            return False
+        if pending["expires"] <= time.time():
+            del sess["pending"]
+            return False
+        pending["attempts"] += 1
+        ok = hmac.compare_digest(pending["code"].encode(), (submitted or "").strip().encode())
+        if ok or pending["attempts"] >= CODE_MAX_ATTEMPTS:
+            del sess["pending"]
+        return ok
 
 
 if __name__ == "__main__":
@@ -375,6 +474,80 @@ if __name__ == "__main__":
     assert real_cfg_after == real_cfg_before, "the self-check must never touch the real config.yaml"
     print(f"OK: /thresholds surgical edit preserves all {comments_before} comment lines; real config.yaml untouched")
 
+    # --- 8. second factor. `python -m admin.auth` runs this file as __main__, while
+    # admin.server imports a separate admin.auth: patch the imported copy (A). ---
+    import admin.auth as A
+
+    sent = []  # (chat_id, text)
+    send_mode = {"fail": False}
+
+    def fake_send(token, chat_id, text):
+        if send_mode["fail"]:
+            raise OSError("boom")
+        sent.append((chat_id, text))
+
+    A._telegram_send = fake_send
+    A._admin_ids = lambda: ["900111222", "900333444"]
+    os.environ["TELEGRAM_BOT_TOKEN"] = "test-token"
+
+    def fresh():
+        sent.clear()
+        send_mode["fail"] = False
+        return {"csrf": "c", "authed": False}, A.RateLimiter()
+
+    sess, lim = fresh()
+    assert A.begin_login_code(sess, "198.51.100.1", lim)
+    assert [c for c, _ in sent] == ["900111222", "900333444"], "one message per admin id"
+    code = sess["pending"]["code"]
+    assert len(code) == 6 and code.isdigit() and code in sent[0][1] and "198.51.100.1" in sent[0][1]
+    assert "смените пароль" in sent[0][1]
+    assert sess["authed"] is False, "the password step must not authenticate"
+    # a live code is not replaced and nothing is sent again
+    assert A.begin_login_code(sess, "198.51.100.1", lim) and len(sent) == 2
+    assert sess["pending"]["code"] == code
+    assert len(lim._global) == 1, "one issue counted"
+    print("OK: code issued once per admin id, session still unauthenticated, no re-issue while pending")
+
+    assert not A.check_login_code(sess, "000000" if code != "000000" else "000001")
+    assert not A.check_login_code(sess, "\u0663\u0662\u0661\u0660\u0661\u0662"), "non-ASCII must not raise"
+    assert sess["pending"]["attempts"] == 2
+    assert A.check_login_code(sess, code), "right code accepted"
+    assert "pending" not in sess
+    assert not A.check_login_code(sess, code), "a used code cannot be used twice"
+    print("OK: right code accepted once, reuse rejected")
+
+    sess, lim = fresh()
+    A.begin_login_code(sess, "x", lim)
+    code = sess["pending"]["code"]
+    wrong = "000000" if code != "000000" else "000001"
+    for i in range(5):
+        assert "pending" in sess
+        assert not A.check_login_code(sess, wrong)
+    assert "pending" not in sess, "5 wrong codes destroy the pending state"
+    assert not A.check_login_code(sess, code), "even the right code is dead after that"
+    sess, lim = fresh()
+    A.begin_login_code(sess, "x", lim)
+    sess["pending"]["expires"] = time.time() - 1
+    assert not A.check_login_code(sess, sess["pending"]["code"]) and "pending" not in sess
+    print("OK: 5 wrong codes and expiry destroy the pending state")
+
+    sess, lim = fresh()
+    sess["pending"] = {"code": "000042", "expires": time.time() + 99, "attempts": 0}
+    assert A.check_login_code(sess, " 000042 "), "leading zeros kept, whitespace trimmed"
+    print("OK: leading-zero code verified")
+
+    sess, lim = fresh()
+    A._admin_ids = lambda: []
+    assert not A.begin_login_code(sess, "x", lim) and not sent and "pending" not in sess
+    A._admin_ids = lambda: ["900111222", "900333444"]
+    os.environ.pop("TELEGRAM_BOT_TOKEN")
+    assert not A.begin_login_code(sess, "x", lim) and not sent and "pending" not in sess
+    os.environ["TELEGRAM_BOT_TOKEN"] = "test-token"
+    send_mode["fail"] = True
+    assert not A.begin_login_code(sess, "x", lim) and "pending" not in sess
+    send_mode["fail"] = False
+    print("OK: no admin ids / no token / every send failing -> fail closed, no pending state")
+
     # --- integration: real server on an ephemeral localhost port, driven by urllib ---
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["HEALTH_DB"] = str(_Path(tmp) / "health.db")
@@ -428,23 +601,152 @@ if __name__ == "__main__":
             assert m, "login form missing csrf token"
             login_csrf = m.group(1)
 
-            # login with the right password -> 200, session cookie set
-            data = urllib.parse.urlencode({"password": password, "csrf_token": login_csrf}).encode()
-            resp = opener.open(urllib.request.Request(base + "/login", data=data, method="POST"), timeout=5)
-            assert resp.status == 200, f"login expected 200, got {resp.status}"
-            assert any(c.name == "session" for c in cj), "no session cookie set after login"
-            print("OK: login with the right password returns 200 and sets a session cookie")
+            import admin.server as srv
 
-            # "/" with the cookie -> 200 containing the status bar
-            resp = opener.open(base + "/", timeout=5)
-            body = resp.read().decode("utf-8")
-            assert resp.status == 200
-            assert "сегодня" in body.lower(), "dashboard should contain the status bar"
-            print("OK: authenticated / returns 200 containing the status bar")
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a, **k):
+                    return None
+
+            def client():
+                jar = CookieJar()
+                op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), _NoRedirect)
+                return jar, op
+
+            def post(op, path, **fields):
+                try:
+                    r = op.open(urllib.request.Request(
+                        base + path, data=urllib.parse.urlencode(fields).encode(), method="POST"), timeout=5)
+                    return r.status, r.read().decode("utf-8"), r.headers
+                except urllib.error.HTTPError as e:
+                    return e.code, e.read().decode("utf-8", errors="replace"), e.headers
+
+            def get(op, path):
+                try:
+                    r = op.open(base + path, timeout=5)
+                    return r.status, r.read().decode("utf-8"), r.headers
+                except urllib.error.HTTPError as e:
+                    return e.code, "", e.headers
+
+            def start():
+                jar, op = client()
+                _, body, _ = get(op, "/login")
+                return jar, op, re.search(r'name="csrf_token" value="([^"]+)"', body).group(1)
+
+            def reset():
+                srv.RATE_LIMITER = A.RateLimiter()
+                sent.clear()
+                send_mode["fail"] = False
+
+            def last_code():
+                return re.search(r"Код: (\d{6})", sent[-1][1]).group(1)
+
+            reset()
+            # wrong password -> nothing sent
+            jar, op, csrf = start()
+            st, body, _ = post(op, "/login", password="nope", csrf_token=csrf)
+            assert st == 200 and "Неверный пароль" in body and not sent
+            print("OK: wrong password sends nothing")
+
+            # right password -> one message per admin id, code form, NOT authenticated
+            st, body, _ = post(op, "/login", password=password, csrf_token=csrf)
+            assert st == 200 and 'action="/login/code"' in body and len(sent) == 2
+            for path in ("/", "/guards", "/milestones", "/thresholds", "/keys", "/personas", "/actions",
+                         "/knowledge", "/drafts", "/alerts", "/plans", "/workouts", "/forecast"):
+                st, _, h = get(op, path)
+                assert st == 303 and h["Location"] == "/login", f"pending session reached GET {path}: {st}"
+            for path in ("/guards/save", "/milestones", "/thresholds", "/keys", "/keys/test", "/personas",
+                         "/actions", "/actions/import-scale", "/knowledge/upload", "/knowledge/delete",
+                         "/plans/save", "/plans/delete", "/plans/template/save", "/plans/template/delete",
+                         "/workouts/save", "/workouts/delete", "/drafts"):
+                st, _, h = post(op, path, csrf_token=csrf)
+                assert st == 303 and h["Location"] == "/login", f"pending session reached POST {path}: {st}"
+            print("OK: right password sends one message per admin id; pending session is refused by every protected route")
+
+            # code form: CSRF required, wrong code counted, right code authenticates + rotates the cookie
+            st, _, _ = post(op, "/login/code", code=last_code())
+            assert st == 403, "code form without CSRF token"
+            n_fail = len(srv.RATE_LIMITER._per_ip.get("127.0.0.1", []))
+            st, body, _ = post(op, "/login/code", code="12345x", csrf_token=csrf)
+            assert st == 200 and "Неверный или просроченный код" in body
+            assert len(srv.RATE_LIMITER._per_ip["127.0.0.1"]) == n_fail + 1, "wrong code counted like a wrong password"
+            before = [c.value for c in jar if c.name == "session"]
+            st, body, _ = post(op, "/login/code", code=last_code(), csrf_token=csrf)
+            after = [c.value for c in jar if c.name == "session"]
+            assert st == 200 and "Вход выполнен" in body and after != before, "token must rotate"
+            st, body, _ = get(op, "/")
+            assert st == 200 and "сегодня" in body.lower()
+            op_authed = op
+            print("OK: right code authenticates, session token rotates, dashboard opens, CSRF enforced on the code form")
+
+            # reused code on a fresh session cannot be replayed on another one
+            reset()
+            jar1, op1, csrf1 = start()
+            post(op1, "/login", password=password, csrf_token=csrf1)
+            code1 = last_code()
+            jar2, op2, csrf2 = start()
+            st, body, _ = post(op2, "/login/code", code=code1, csrf_token=csrf2)
+            assert "Неверный или просроченный код" in body and get(op2, "/")[0] == 303
+            post(op1, "/login/code", code=code1, csrf_token=csrf1)
+            st, body, _ = post(op1, "/login/code", code=code1, csrf_token=csrf1)
+            assert "Неверный или просроченный код" in body, "used code rejected the second time"
+            print("OK: a code works only in its own session and only once")
+
+            # five wrong codes through HTTP: pending destroyed, right code no longer works
+            reset()
+            jar, op, csrf = start()
+            post(op, "/login", password=password, csrf_token=csrf)
+            good = last_code()
+            wrong = "000000" if good != "000000" else "000001"
+            for _ in range(5):
+                post(op, "/login/code", code=wrong, csrf_token=csrf)
+            st, body, _ = post(op, "/login/code", code=good, csrf_token=csrf)
+            assert 'name="password"' in body or "заблокирован" in body
+            assert get(op, "/")[0] == 303
+            print("OK: five wrong codes over HTTP kill the code (lockout applies as for passwords)")
+
+            # expired code
+            reset()
+            srv.RATE_LIMITER = A.RateLimiter(max_per_ip=50)
+            jar, op, csrf = start()
+            post(op, "/login", password=password, csrf_token=csrf)
+            good = last_code()
+            for s_ in srv.SESSIONS._sessions.values():
+                if "pending" in s_:
+                    s_["pending"]["expires"] = time.time() - 1
+            st, body, _ = post(op, "/login/code", code=good, csrf_token=csrf)
+            assert 'name="password"' in body and get(op, "/")[0] == 303
+            print("OK: expired code rejected, back to the password step")
+
+            # repeated correct passwords on one session do not resend; new sessions are bounded globally
+            reset()
+            srv.RATE_LIMITER = A.RateLimiter(max_per_ip=50, global_max=3)
+            jar, op, csrf = start()
+            for _ in range(3):
+                post(op, "/login", password=password, csrf_token=csrf)
+            assert len(sent) == 2, "same session: one issue only"
+            for _ in range(6):
+                j_, o_, c_ = start()
+                post(o_, "/login", password=password, csrf_token=c_)
+            assert len(sent) == 2 * 3, f"global cap of 3 issues, got {len(sent) // 2}"
+            print("OK: no re-issue while a code is pending; fresh sessions are capped by the global limiter")
+
+            # fail closed over HTTP
+            reset()
+            A._admin_ids = lambda: []
+            jar, op, csrf = start()
+            st, body, _ = post(op, "/login", password=password, csrf_token=csrf)
+            assert "Не удалось отправить код" in body and 'action="/login/code"' not in body and not sent
+            A._admin_ids = lambda: ["900111222", "900333444"]
+            send_mode["fail"] = True
+            st, body, _ = post(op, "/login", password=password, csrf_token=csrf)
+            assert "Не удалось отправить код" in body and "900111222" not in body and "test-token" not in body
+            assert get(op, "/")[0] == 303
+            print("OK: no admin ids / Telegram failing for everyone -> plain error page, no way in")
+            reset()
 
             # POST without CSRF -> 403
             try:
-                opener.open(
+                op_authed.open(
                     urllib.request.Request(base + "/actions", data=b"action=recalc", method="POST"), timeout=5
                 )
                 assert False, "POST without CSRF should have failed"

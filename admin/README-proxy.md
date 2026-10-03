@@ -26,6 +26,32 @@ Once a proxy terminates TLS in front of the app:
    - `X-Forwarded-For` is trusted (last hop only) for rate-limiting by real client IP
 3. Restart `health-admin.service` after changing `.env`.
 
+## Login: password plus a Telegram code
+
+Reachable from the internet, the panel is meant to run behind the TLS proxy
+with `ADMIN_BEHIND_TLS=1` (see above). Login is two steps, with no bypass: the
+same two steps apply to a request that arrives straight on `127.0.0.1` through
+an ssh tunnel.
+
+1. The shared admin password. A correct password does not log anyone in; it
+   makes the panel send a 6-digit one-time code to every id in
+   `HEALTH_ADMIN_IDS` through the Telegram Bot API (the panel does this itself,
+   the bot process does not need to be running).
+2. The code, valid for 5 minutes. 5 wrong codes or expiry mean starting over
+   from the password. A new code is not sent while a live one is pending.
+
+Needed in `~/.hermes/.env`:
+
+- `TELEGRAM_BOT_TOKEN` - the same bot token the bot uses
+- `HEALTH_ADMIN_IDS` - comma-separated Telegram ids that receive the codes
+
+If no ids are configured, the token is missing, or Telegram is unreachable, the
+login fails closed with a "could not send the code" message. There is
+deliberately no way in through the web in that case: no backup codes, no
+"remember this device". Recovery is on the server itself (fix `.env`, restart
+`health-admin.service`, or use the ssh tunnel once Telegram works again - the
+tunnel does not skip the code either).
+
 ## Caddy
 
 ```
