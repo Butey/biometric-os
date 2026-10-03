@@ -83,6 +83,10 @@ def import_dir(conn: sqlite3.Connection, user_id: int, root: Path | None = None)
         rec = parse(path)
         if rec is None or not rec["meals"]:
             continue
+        # id позиций переиспользуются SQLite: осиротевшее списание запаса вернуло бы чужую еду в запас
+        conn.execute("DELETE FROM pantry_deductions WHERE food_item_id IN (SELECT fi.id FROM food_items fi "
+                     "JOIN food_log fl ON fl.id=fi.food_log_id WHERE fl.user_id=? AND date(fl.eaten_at)=?)",
+                     (user_id, rec["date"]))
         conn.execute("DELETE FROM food_log WHERE user_id=? AND date(eaten_at)=?", (user_id, rec["date"]))
         for meal in rec["meals"]:
             cur = conn.execute("INSERT INTO food_log(user_id, eaten_at, meal_slot) VALUES (?,?,?)",

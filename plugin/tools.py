@@ -4473,6 +4473,13 @@ def handle_pantry(params: dict) -> str:
                                       ensure_ascii=False)
         existing = _pantry_find(conn, user_id, name, loose=False)
         if existing is not None:
+            from health_core.meal_options import _UNIT_G
+            eu = ((conn.execute("SELECT unit FROM pantry WHERE id=?", (existing["id"],)).fetchone()["unit"]) or "").strip().lower().rstrip(".")
+            nu = (params.get("unit") or "").strip().lower().rstrip(".")
+            if qty is not None and existing["qty"] and eu and nu and (eu in _UNIT_G) != (nu in _UNIT_G):
+                conn.close()
+                return json.dumps({"error": f"'{name}' уже в запасе в «{eu}», а добавляется в «{nu}» - количества не сложить. "
+                                            f"Добавь в тех же единицах или сначала убери позицию (remove) и добавь заново."}, ensure_ascii=False)
             # Пополнение существующего: складываем количества; None-qty у любой из
             # сторон означает «без счёта», тогда просто сохраняем что есть.
             new_qty = existing["qty"] if qty is None else (existing["qty"] or 0.0) + qty
@@ -7390,6 +7397,9 @@ if __name__ == "__main__":
             "кусочки без известного веса - ошибка, не выдумываем вес"
         assert _pan(action="add", name="Сыр нарезка", qty=10, unit="ломтик", category="Молочка/Сыры").get("need_weight")
         assert "ok" in _pan(action="add", name="Сыр нарезка", qty=10, unit="ломтик", category="Молочка/Сыры", no_weight=True)
+        # разные единицы одной позиции не складываются молча (2 шт + 300 г = «302 г»)
+        assert "error" in _pan(action="add", name="Огурец", qty=3, unit="шт", piece_weight_g=100), "шт без веса + граммы - ошибка"
+        assert conn.execute("SELECT qty, unit FROM pantry WHERE user_id=? AND name='Огурец'", (p_uid,)).fetchone()["unit"] == "шт"
         print("OK: pantry list/add/remove — сумма при пополнении, декремент, удаление на нуле, ошибка на отсутствующем, группировка")
 
         print("\n" + "="*60)
