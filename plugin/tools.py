@@ -4379,19 +4379,34 @@ def handle_sick(params: dict) -> str:
 _SLICE_UNITS = ("кусок", "кусочек", "кусочка", "кусочков", "куска", "ломтик", "ломтика", "ломтиков", "ломоть", "слайс", "слайсов")
 
 
+_EGG_GRADE_RE = re.compile(r"(?<!\w)(?:св|с[0о])(?!\w)")
+
+
+def _pantry_stems(name: str) -> set:
+    """name_stems + сорт яиц: СВ = XXL, С0 = c0 = со - разные подвиды (короткие слова
+    name_stems отбрасывает), яйцо/яйца, куриное/куриные - одно слово."""
+    from health_core import foods
+    stems = foods.name_stems(name)
+    low = (name or "").casefold().translate(str.maketrans("c", "с")).replace("xxl", "св")
+    if "яйц" not in low:
+        return stems
+    grade = _EGG_GRADE_RE.search(low)
+    stems = {"яйц" if x.startswith("яйц") else "кури" if x.startswith("кури") else x for x in stems} - {"xxl"}
+    return stems | {"сорт_" + grade.group().replace("о", "0")} if grade else stems
+
+
 def _pantry_find(conn, user_id: int, name: str, loose: bool):
     """Позиция запаса по названию без учёта регистра и формулировки (основы слов,
     как у моих продуктов). Точное совпадение основ; при loose, если его нет, -
     единственная позиция, чьи основы вложены в запрос или содержат его
     («творог» ~ «Творог Анфискино 5%»). Неоднозначность - None, а не угадывание."""
-    from health_core import foods
-    q = foods.name_stems(name)
+    q = _pantry_stems(name)
     rows = conn.execute("SELECT id, name, qty FROM pantry WHERE user_id=?", (user_id,)).fetchall()
-    exact = [r for r in rows if foods.name_stems(r["name"]) == q]
+    exact = [r for r in rows if _pantry_stems(r["name"]) == q]
     if exact or not loose:
         return exact[0] if exact else conn.execute(
             "SELECT id, name, qty FROM pantry WHERE user_id=? AND name=?", (user_id, name)).fetchone()
-    near = [r for r in rows if q and (foods.name_stems(r["name"]) <= q or q <= foods.name_stems(r["name"]))]
+    near = [r for r in rows if q and (_pantry_stems(r["name"]) <= q or q <= _pantry_stems(r["name"]))]
     return near[0] if len(near) == 1 else None
 
 
@@ -7391,6 +7406,13 @@ if __name__ == "__main__":
         _took = {d["name"]: d for d in _lf["pantry_deducted"]}
         assert _took["Куриное филе"]["left"] == 250 and _took["Яйца СВ XXL"]["took"] == 2 and _took["Яйца СВ XXL"]["left"] == 8, _lf
         assert _lf["pantry_not_deducted"] == ["Огурец"], "шт без известного веса не списываем наугад"
+        # сорта яиц: СВ = XXL, С0 = c0 = со; разные сорта не путаются
+        _pan(action="add", name="Яйца куриные С0", qty=10, unit="шт", category="Белковые")
+        for _q, _want in [("Яйца СВ (АО Птицефабрика?)", "Яйца СВ XXL"), ("яйца xxl", "Яйца СВ XXL"),
+                          ("Яйцо куриное c0", "Яйца куриные С0"), ("Яйцо куриное со упаковка", "Яйца куриные С0")]:
+            _row = _pantry_find(conn, p_uid, _q, loose=True)
+            assert _row and _row["name"] == _want, (_q, _row and _row["name"])
+        _pan(action="remove", name="Яйца куриные С0")
         assert conn.execute("SELECT qty FROM pantry WHERE user_id=? AND name='Огурец'", (p_uid,)).fetchone()["qty"] == 2
         _lf2 = json.loads(handle_log_food({"user_id": p_uid, "meal_slot": "dinner", "items": [
             {"name": "куриное филе", "grams": 900, "kcal": 1000, "protein_g": 100, "fat_g": 20, "carbs_g": 0}]}))
