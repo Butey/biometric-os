@@ -1826,6 +1826,32 @@ def test_pantry_tuna_inflected_stems_and_product_weight():
         _water_rows(7806)
 
 
+def test_pantry_no_egg_grams_conversion_and_loose_merge():
+    _water_user(7807)
+    try:
+        # Adding eggs with piece_weight_g=60 keeps unit='шт' and does not convert to 600g
+        out = json.loads(registry.dispatch("pantry", {"action": "add", "name": "Яйцо куриное со упаковка", "qty": 10, "unit": "шт", "piece_weight_g": 60, "category": "Белковые", "user_id": 7807}))
+        assert "ok" in out, out
+        conn = connect()
+        r = conn.execute("SELECT qty, unit, piece_g FROM pantry WHERE user_id=7807 AND (name LIKE '%Яйц%' OR name LIKE '%яйц%')").fetchone()
+        assert r["qty"] == 10 and r["unit"] == "шт" and r["piece_g"] == 60, dict(r)
+
+        # Adding same eggs with near name merges into existing item instead of creating duplicate
+        out2 = json.loads(registry.dispatch("pantry", {"action": "add", "name": "Яйца куриные С0", "qty": 10, "unit": "шт", "piece_weight_g": 60, "category": "Белковые", "user_id": 7807}))
+        assert "ok" in out2, out2
+        rows = conn.execute("SELECT qty, unit FROM pantry WHERE user_id=7807 AND (name LIKE '%Яйц%' OR name LIKE '%яйц%')").fetchall()
+        assert len(rows) == 1, f"Не должно быть дублирования строк: {rows}"
+        assert rows[0]["qty"] == 20 and rows[0]["unit"] == "шт", dict(rows[0])
+        conn.close()
+    finally:
+        conn = connect()
+        conn.execute("DELETE FROM pantry WHERE user_id=7807")
+        conn.commit()
+        conn.close()
+        _water_rows(7807)
+
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

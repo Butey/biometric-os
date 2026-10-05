@@ -4515,7 +4515,10 @@ def handle_pantry(params: dict) -> str:
         elif qty is not None and unit_in in ("", "шт", "банка", "банки", "банок", "уп", "пачка", "пачки", "бутылка", "бутылки", "пакет", "пакеты"):
             from health_core.meal_options import grams_per_unit
             pw = params.get("piece_weight_g")
-            if pw and float(pw) > 0:
+            if pw and float(pw) > 0 and "яйц" in name.lower():
+                piece_g = float(pw)
+                params["unit"] = "шт"
+            elif pw and float(pw) > 0:
                 qty, params["unit"] = qty * float(pw), ("мл" if unit_in in ("бутылка", "бутылки") else "г")
             else:
                 m = re.search(r"(\d+(?:[.,]\d+)?)\s*(кг|гр|г|мл|л)\b", name.lower())
@@ -4542,7 +4545,7 @@ def handle_pantry(params: dict) -> str:
                                        "ask": f"Спроси человека, сколько весит (или сколько мл в) одна штука/банка «{name}». "
                                               f"Назвал - повтори add с piece_weight_g. Не знает или не хочет - повтори add с no_weight=true."},
                                       ensure_ascii=False)
-        existing = _pantry_find(conn, user_id, name, loose=False)
+        existing = _pantry_find(conn, user_id, name, loose=True)
         if existing is not None:
             from health_core.meal_options import _UNIT_G
             eu = ((conn.execute("SELECT unit FROM pantry WHERE id=?", (existing["id"],)).fetchone()["unit"]) or "").strip().lower().rstrip(".")
