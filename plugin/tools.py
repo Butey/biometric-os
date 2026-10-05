@@ -4519,10 +4519,24 @@ def handle_pantry(params: dict) -> str:
                 qty, params["unit"] = qty * float(pw), ("мл" if unit_in in ("бутылка", "бутылки") else "г")
             else:
                 m = re.search(r"(\d+(?:[.,]\d+)?)\s*(кг|гр|г|мл|л)\b", name.lower())
-                if m:
+                if not m:
+                    from health_core import foods as _foods
+                    prod = _foods.find_mine(conn, user_id, name)
+                    if prod:
+                        if prod["piece_g"] and float(prod["piece_g"]) > 0:
+                            amount = float(prod["piece_g"])
+                            qty, params["unit"] = qty * amount, ("мл" if unit_in in ("бутылка", "бутылки") else "г")
+                            m = True
+                        elif prod["display_name"]:
+                            pm = re.search(r"(\d+(?:[.,]\d+)?)\s*(кг|гр|г|мл|л)\b", prod["display_name"].lower())
+                            if pm:
+                                amount = float(pm.group(1).replace(",", ".")) * (1000 if pm.group(2) in ("кг", "л") else 1)
+                                qty, params["unit"] = qty * amount, ("мл" if pm.group(2) in ("мл", "л") else "г")
+                                m = True
+                if m and not isinstance(m, bool):
                     amount = float(m.group(1).replace(",", ".")) * (1000 if m.group(2) in ("кг", "л") else 1)
                     qty, params["unit"] = qty * amount, ("мл" if m.group(2) in ("мл", "л") else "г")
-                elif grams_per_unit(unit_in, name)[0] is None and not params.get("no_weight"):
+                elif not m and grams_per_unit(unit_in, name)[0] is None and not params.get("no_weight"):
                     conn.close()
                     return json.dumps({"need_weight": True, "name": name,
                                        "ask": f"Спроси человека, сколько весит (или сколько мл в) одна штука/банка «{name}». "
@@ -7393,6 +7407,8 @@ if __name__ == "__main__":
         _ol = conn.execute("SELECT qty, unit FROM pantry WHERE user_id=? AND name LIKE 'Масло%'", (p_uid,)).fetchone()
         assert (_ol["qty"], _ol["unit"]) == (500, "мл"), "вес из названия считает код"
         assert "ok" in _pan(action="add", name="Тунец Лента", qty=2, unit="банка", category="Белковые"), "типовой вес банки известен - не спрашиваем"
+        assert "ok" in _pan(action="add", name="Филе тунца в собственном соке", qty=4, unit="шт", category="Белковые"), "форма 'тунц' распознает типовой вес банки"
+        _pan(action="remove", name="Филе тунца в собственном соке")
         _pan(action="add", name="Творог", qty=200, unit="г", category="Молочка/Сыры")
         listing = _pan(action="list")["pantry"]
         assert "Молочка/Сыры" in listing and "Овощи/Фрукты" in listing, "список группируется по категориям"

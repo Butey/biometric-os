@@ -1798,6 +1798,34 @@ def test_log_food_string_items_is_validation_error():
     assert n == 0, "строки в items не должны ничего записывать"
 
 
+def test_pantry_tuna_inflected_stems_and_product_weight():
+    _water_user(7806)
+    try:
+        # 1. "Филе тунца в собственном соке" matches inflected stem "тунц" -> typical weight 140g without need_weight
+        out = json.loads(registry.dispatch("pantry", {"action": "add", "name": "Филе тунца в собственном соке", "qty": 4, "unit": "шт", "category": "Белковые", "user_id": 7806}))
+        assert "ok" in out, f"Филе тунца должно добавиться без need_weight: {out}"
+
+        # 2. meal_options should plan with it instead of putting into uncounted
+        from health_core.meal_options import grams_per_unit
+        g, assumed = grams_per_unit("шт", "Филе тунца в собственном соке")
+        assert g == 140 and assumed is True
+
+        # 3. Product with weight in display_name or piece_g in my_products is resolved automatically
+        conn = connect()
+        from health_core import foods
+        foods.remember(conn, 7806, "Экспонента черника (банка 250г)", source="label", kcal_100g=60, protein_100g=12)
+        conn.close()
+        out2 = json.loads(registry.dispatch("pantry", {"action": "add", "name": "Экспонента черника", "qty": 2, "unit": "банка", "category": "Молочка/Сыры", "user_id": 7806}))
+        assert "ok" in out2, f"Продукт из my_products с граммовкой в имени должен добавиться: {out2}"
+    finally:
+        conn = connect()
+        conn.execute("DELETE FROM pantry WHERE user_id=7806")
+        conn.execute("DELETE FROM my_products WHERE user_id=7806")
+        conn.commit()
+        conn.close()
+        _water_rows(7806)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

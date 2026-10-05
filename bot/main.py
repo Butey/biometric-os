@@ -1419,8 +1419,10 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
             "- Тонометр (давление): вызови log_bp(action='add', systolic=<верхнее>, diastolic=<нижнее>, pulse=<пульс, если виден>).\n"
             "- Еда: оцени КБЖУ, назови оценку и вызови log_food или предложи запись.\n"
             f"- {_RECEIPT_RULE}\n"
-            "- Этикетка/состав: разбери состав и КБЖУ на 100 г."
+            "- Этикетка/состав: разбери состав и КБЖУ на 100 г (сохрани через food_lookup remember); "
+            "если фото этикетки прислано в ответ на уточнение веса/состава для запасов (need_weight) — ОБЯЗАТЕЛЬНО также добавь позицию в запас через pantry(action='add', ...).\n"
         )
+
 
     content = [
         {"type": "text", "text": text_part},
