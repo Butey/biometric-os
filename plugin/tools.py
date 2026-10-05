@@ -749,6 +749,11 @@ def _pantry_deduct(conn, user_id: int, items: list, item_ids: list) -> tuple[lis
         except (TypeError, ValueError):
             continue
         row = _pantry_find(conn, user_id, it.get("name") or "", loose=True) if grams > 0 else None
+        if row is None and grams > 0:
+            cands = _pantry_near(conn.execute("SELECT name FROM pantry WHERE user_id=?", (user_id,)).fetchall(),
+                                 _pantry_stems(it.get("name") or ""))
+            if len(cands) > 1:
+                skipped.append(f"{it.get('name')} (неоднозначно: {' / '.join(c['name'] for c in cands)})")
         if row is None or row["qty"] is None:
             continue
         meta = conn.execute("SELECT unit, category, piece_g FROM pantry WHERE id=?", (row["id"],)).fetchone()
@@ -4406,8 +4411,12 @@ def _pantry_find(conn, user_id: int, name: str, loose: bool):
     if exact or not loose:
         return exact[0] if exact else conn.execute(
             "SELECT id, name, qty FROM pantry WHERE user_id=? AND name=?", (user_id, name)).fetchone()
-    near = [r for r in rows if q and (_pantry_stems(r["name"]) <= q or q <= _pantry_stems(r["name"]))]
+    near = _pantry_near(rows, q)
     return near[0] if len(near) == 1 else None
+
+
+def _pantry_near(rows, q: set) -> list:
+    return [r for r in rows if q and (_pantry_stems(r["name"]) <= q or q <= _pantry_stems(r["name"]))]
 
 
 @_handler_wrapper
@@ -7406,6 +7415,13 @@ if __name__ == "__main__":
         _took = {d["name"]: d for d in _lf["pantry_deducted"]}
         assert _took["Куриное филе"]["left"] == 250 and _took["Яйца СВ XXL"]["took"] == 2 and _took["Яйца СВ XXL"]["left"] == 8, _lf
         assert _lf["pantry_not_deducted"] == ["Огурец"], "шт без известного веса не списываем наугад"
+        _pan(action="add", name="Хлеб белый", qty=500, unit="г", category="Прочее")
+        _pan(action="add", name="Хлеб ржаной", qty=500, unit="г", category="Прочее")
+        _lf3 = json.loads(handle_log_food({"user_id": p_uid, "meal_slot": "snack", "items": [
+            {"name": "хлеб", "grams": 30, "kcal": 80, "protein_g": 3, "fat_g": 1, "carbs_g": 15}]}))
+        assert len(_lf3["pantry_not_deducted"]) == 1 and "неоднозначно" in _lf3["pantry_not_deducted"][0], _lf3
+        _pan(action="remove", name="Хлеб белый")
+        _pan(action="remove", name="Хлеб ржаной")
         # сорта яиц: СВ = XXL, С0 = c0 = со; разные сорта не путаются
         _pan(action="add", name="Яйца куриные С0", qty=10, unit="шт", category="Белковые")
         for _q, _want in [("Яйца СВ (АО Птицефабрика?)", "Яйца СВ XXL"), ("яйца xxl", "Яйца СВ XXL"),
