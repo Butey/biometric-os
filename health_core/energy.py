@@ -142,8 +142,9 @@ def fat_share(conn: sqlite3.Connection, user_id: int, fat_pct: float) -> float:
     """Допустимая доля предела Alpert — линейная интерполяция по шкале
     процента жира от fat_share_lean (≤ нижней границы) до fat_share_fat
     (≥ верхней). Шкала своя для пола, неизвестный пол — мужская (осторожнее).
-    На жирном конце цель интерполяции — fat_share_fat_proven вместо
-    fat_share_fat, если lean_share доказывает малую долю мышц в потере."""
+    На жирном конце цель интерполяции сдвигается от fat_share_fat к
+    fat_share_fat_proven пропорционально тому, насколько lean_share ниже порога
+    lbm_ratio_threshold (на пороге сдвига нет, при нуле — полный)."""
     policy = load()["policy"]
     urow = conn.execute("SELECT sex FROM users WHERE id=?", (user_id,)).fetchone()
     sex = urow["sex"] if urow else None
@@ -151,8 +152,12 @@ def fat_share(conn: sqlite3.Connection, user_id: int, fat_pct: float) -> float:
 
     fat_end = policy["fat_share_fat"]
     proven = lean_share(conn, user_id)
-    if proven is not None and proven < load()["guards"]["lbm_ratio_threshold"]:
-        fat_end = policy["fat_share_fat_proven"]
+    threshold = load()["guards"]["lbm_ratio_threshold"]
+    if proven is not None and proven < threshold:
+        # Линейно от fat_share_fat на пороге до fat_share_fat_proven при нуле мышц
+        # в потере: рёбро порога не даёт цели прыгать на сотни ккал за день.
+        # ponytail: None (мало точек/давно не мерили) по-прежнему обрыв к fat_share_fat.
+        fat_end += (1 - proven / threshold) * (policy["fat_share_fat_proven"] - fat_end)
 
     lean_val = policy["fat_share_lean"]
     if fat_pct <= lo:
@@ -1066,12 +1071,13 @@ if __name__ == "__main__":
         proven2 = lean_share(conn, uid)
         assert proven2 is not None and proven2 < 0.15, proven2
         share2 = fat_share(conn, uid, 33.3)
-        assert abs(share2 - 0.4) < 1e-9, share2
+        expect2 = 0.3 + (1 - proven2 / 0.15) * 0.1
+        assert abs(share2 - expect2) < 1e-9 and 0.3 < share2 < 0.4, (share2, expect2)
         floor2, reason2 = kcal_floor(conn, uid, tdee)
         assert reason2 == "fat_supply", reason2
-        assert abs((tdee - floor2) - 1095.69) < 1, tdee - floor2
-        print(f"OK: доказанная доля мышц {proven2:.3f}<0.15 -> доля {share2}, "
-              f"дефицит {tdee - floor2:.0f} (ожидание ~1096)")
+        assert abs((tdee - floor2) - fat_mass_kg(conn, uid) * 69.3 * share2) < 0.01, tdee - floor2
+        print(f"OK: доля мышц {proven2:.3f}<0.15 -> доля сдвинута плавно до {share2:.3f}, "
+              f"дефицит {tdee - floor2:.0f}")
 
         # 2b) тощая масса растёт на фоне потери веса — доля мышц в потере 0, а не |Δ|
         _reset_metrics()
@@ -1126,7 +1132,7 @@ if __name__ == "__main__":
         proven5 = lean_share(conn, uid)
         assert proven5 is not None and proven5 < 0.15, proven5
         share5 = fat_share(conn, uid, 50.0)
-        assert abs(share5 - 0.4) < 1e-9, share5
+        assert abs(share5 - (0.3 + (1 - proven5 / 0.15) * 0.1)) < 1e-9, share5
         big_tdee = 3200.0
         floor5, reason5 = kcal_floor(conn, uid, big_tdee)
         assert reason5 == "deficit_cap", reason5
