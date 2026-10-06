@@ -278,6 +278,19 @@ def _today_iso(conn: sqlite3.Connection | None = None, user_id: int | None = Non
     return config.local_now().date().isoformat()
 
 
+def _fix_event_ts(raw: str | None, conn, user_id: int) -> str:
+    """Нормализует метку события: исправляет устаревший год (2024/2025 → текущий),
+    затем вызывает _norm_event_ts. Бросает ValueError если метка невалидна.
+    Используется во всех инструментах, принимающих «at»/«measured_at» события.
+    В handle_log_food логика дублируется напрямую ради разрыва зависимости с eaten_at."""
+    if raw:
+        today = _today_iso(conn, user_id)
+        if _year_is_stale(raw, today):
+            cur_year = str(config.user_now(conn, user_id).year)
+            raw = cur_year + raw[4:]
+    return _norm_event_ts(raw, conn, user_id) or _now_iso(conn, user_id)
+
+
 def _as_float(name: str, value) -> float:
     """Числовое поле, обязанное быть числом. SQLite не отказывает сама на TEXT
     в REAL-колонке — она просто хранит мусор, и он тихо всплывает при первом
@@ -536,10 +549,13 @@ def handle_log_food(params: dict) -> str:
         per100 = i.get("per_100g")
         src = i.get("source")
         if src is not None and src not in _ITEM_SOURCES:
-            conn.close()
-            return json.dumps(
-                {"error": f"{i['name']}: source должен быть одним из {_ITEM_SOURCES}, получено {src!r}"},
-                ensure_ascii=False)
+            if src in ("myproduct", "my-product"):
+                src = "my_product"
+            elif src in ("estimated", "approx"):
+                src = "estimate"
+            else:
+                src = "estimate"
+            i["source"] = src
         # Модель (GPT) заполняет необязательные поля нулями: per_100g из нулей
         # затирал присланный kcal нулём. Но per100.kcal==0 — легитимное
         # значение для реального продукта (вода, чёрный кофе) из food_lookup:
@@ -559,15 +575,20 @@ def handle_log_food(params: dict) -> str:
             return json.dumps({"error": f"{i['name']}: per_100g требует grams"}, ensure_ascii=False)
         try:
             factor = _as_float("grams", i["grams"]) / 100.0
-            i["kcal"] = _as_float("per_100g.kcal", per100.get("kcal")) * factor
-            i["protein_g"] = _as_float("per_100g.protein_g", per100.get("protein_g")) * factor
-            i["fat_g"] = _as_float("per_100g.fat_g", per100.get("fat_g")) * factor
-            i["carbs_g"] = _as_float("per_100g.carbs_g", per100.get("carbs_g")) * factor
+            p_kcal = per100.get("kcal") if per100.get("kcal") is not None else per100.get("kcal_100g")
+            p_prot = per100.get("protein_g") if per100.get("protein_g") is not None else per100.get("protein_100g")
+            p_fat = per100.get("fat_g") if per100.get("fat_g") is not None else per100.get("fat_100g")
+            p_carb = per100.get("carbs_g") if per100.get("carbs_g") is not None else per100.get("carbs_100g")
+            p_fib = per100.get("fiber_g") if per100.get("fiber_g") is not None else per100.get("fiber_100g")
+            i["kcal"] = _as_float("per_100g.kcal", p_kcal) * factor
+            i["protein_g"] = _as_float("per_100g.protein_g", p_prot) * factor
+            i["fat_g"] = _as_float("per_100g.fat_g", p_fat) * factor
+            i["carbs_g"] = _as_float("per_100g.carbs_g", p_carb) * factor
             # Тот же нулевой автозаполнитель модели, что и у per_100g выше: она
             # шлёт fiber_g=0 рядом с per_100g.fiber_g=5, и «is None» этот ноль
             # пропускал — клетчатка дня выходила 0 при заполненной этикетке.
-            if per100.get("fiber_g") is not None and not i.get("fiber_g"):
-                i["fiber_g"] = _as_float("per_100g.fiber_g", per100["fiber_g"]) * factor
+            if p_fib is not None and not i.get("fiber_g"):
+                i["fiber_g"] = _as_float("per_100g.fiber_g", p_fib) * factor
         except ValueError as e:
             conn.close()
             return json.dumps({"error": f"{i['name']}: {e}"}, ensure_ascii=False)
@@ -991,7 +1012,7 @@ def handle_log_water(params: dict) -> str:
         }, ensure_ascii=False)
 
     ml = params.get("ml")
-    at = _norm_event_ts(params.get("at"), conn, user_id) or _now_iso(conn, user_id)
+    at = _fix_event_ts(params.get("at"), conn, user_id)
 
     # Ноль и отрицательные миллилитры — не запись, а мусор в логе: они портят
     # суточную сумму и выглядят как выполненное действие. В базе уже лежала
@@ -1259,7 +1280,7 @@ def handle_log_glucose(params: dict) -> str:
 
     mmol_l = params.get("mmol_l")
     context = params.get("context")
-    at = _norm_event_ts(params.get("at"), conn, user_id) or _now_iso(conn, user_id)
+    at = _fix_event_ts(params.get("at"), conn, user_id)
     confirmed = params.get("confirmed", False)
 
     # mmol_l required в схеме — подсказка, не гарантия: без гейта здесь NULL-запись
@@ -1380,7 +1401,7 @@ def handle_log_bp(params: dict) -> str:
         conn.close()
         return json.dumps({"error": f"pulse={pulse} вне диапазона 30-220"}, ensure_ascii=False)
 
-    at = _norm_event_ts(params.get("at"), conn, user_id) or _now_iso(conn, user_id)
+    at = _fix_event_ts(params.get("at"), conn, user_id)
     if "T" in at and at.count(":") == 1:
         at += ":00"
     cur = conn.execute(
@@ -1477,7 +1498,7 @@ def handle_log_side_effect(params: dict) -> str:
     if severity is not None and severity not in ("mild", "moderate", "severe"):
         conn.close()
         return json.dumps({"error": "severity должен быть mild, moderate или severe"}, ensure_ascii=False)
-    at = _norm_event_ts(params.get("at"), conn, user_id) or _now_iso(conn, user_id)
+    at = _fix_event_ts(params.get("at"), conn, user_id)
 
     cur = conn.execute(
         "INSERT INTO side_effects(user_id, at, symptom, severity, notes) VALUES (?, ?, ?, ?, ?)",
@@ -1751,7 +1772,7 @@ def handle_log_weight(params: dict) -> str:
         }, ensure_ascii=False)
 
     weight_kg = params.get("weight_kg")
-    measured_at = _norm_event_ts(params.get("measured_at"), conn, user_id) or _now_iso(conn, user_id)
+    measured_at = _fix_event_ts(params.get("measured_at"), conn, user_id)
 
     # weight_kg REAL NOT NULL в body_metrics отказывает на None, но не на мусорную
     # строку — SQLite хранит TEXT в REAL-колонке как есть, и она тихо всплывает
@@ -2063,7 +2084,7 @@ def handle_log_med(params: dict) -> str:
     unit = params.get("unit")
     site = params.get("site")
     notes = params.get("notes")
-    at = _norm_event_ts(params.get("at"), conn, user_id) or _now_iso(conn, user_id)
+    at = _fix_event_ts(params.get("at"), conn, user_id)
 
     # Normalize timestamp
     if "T" in at and at.count(":") == 1:
@@ -2228,7 +2249,7 @@ def handle_log_workout(params: dict) -> str:
         except (TypeError, ValueError):
             avg_hr = None
 
-    started_at = _norm_event_ts(params.get("started_at"), conn, user_id) or _now_iso(conn, user_id)
+    started_at = _fix_event_ts(params.get("started_at"), conn, user_id)
     notes = (params.get("notes") or "").strip() or None
     source = "manual"
 
@@ -2435,6 +2456,122 @@ def _sparkline(vals: list[float]) -> str:
     return "".join(_SPARK[round((v - lo) / (hi - lo) * (len(_SPARK) - 1))] for v in vals)
 
 
+def _monotone_cubic_spline(pts: list[float], num_samples: int) -> list[float]:
+    """Монотонная кубическая интерполяция (алгоритм Фритча — Карлсона / PCHIP).
+    Строит гладкую C1-кривую через опорные точки, гарантируя отсутствие паразитных
+    выбросов (overshoot) выше локального максимума или ниже локального минимума."""
+    n = len(pts)
+    if n < 2:
+        return pts
+    if n == 2:
+        return [pts[0] + (pts[1] - pts[0]) * (i / (num_samples - 1)) for i in range(num_samples)]
+
+    d = [0.0] * n
+    m = [pts[i + 1] - pts[i] for i in range(n - 1)]
+
+    for i in range(1, n - 1):
+        if m[i - 1] * m[i] <= 0:
+            d[i] = 0.0
+        else:
+            d[i] = (m[i - 1] + m[i]) / 2.0
+
+    d[0] = m[0]
+    d[n - 1] = m[n - 2]
+
+    for i in range(n - 1):
+        if m[i] == 0:
+            d[i] = 0.0
+            d[i + 1] = 0.0
+        else:
+            alpha = d[i] / m[i]
+            beta = d[i + 1] / m[i]
+            dist = alpha * alpha + beta * beta
+            if dist > 9.0:
+                tau = 3.0 / (dist ** 0.5)
+                d[i] = tau * alpha * m[i]
+                d[i + 1] = tau * beta * m[i]
+
+    result = []
+    n_segments = n - 1
+    for k in range(num_samples):
+        total_t = k / (num_samples - 1) * n_segments
+        seg = min(int(total_t), n_segments - 1)
+        t = total_t - seg
+        t2 = t * t
+        t3 = t2 * t
+        h00 = 2 * t3 - 3 * t2 + 1
+        h10 = t3 - 2 * t2 + t
+        h01 = -2 * t3 + 3 * t2
+        h11 = t3 - t2
+        val = h00 * pts[seg] + h10 * d[seg] + h01 * pts[seg + 1] + h11 * d[seg + 1]
+        result.append(val)
+    return result
+
+
+def _line_chart(series: list[float], height: int = 3, width: int = 27) -> str:
+    """Гладкий аппроксимированный линейный график тренда веса для консоли пульта.
+    Использует монотонный кубический сплайн (PCHIP) и субпиксельные символы Брайля
+    (2x4 точки на символ), давая гладкую плавную кривую без угловатых прямоугольных ступеней.
+    Вписывается в _CONSOLE_W (34 симв)."""
+    if not series:
+        return ""
+    if len(series) == 1:
+        return f"{series[0]:5.1f}┤" + "─" * width
+
+    minimum = min(series)
+    maximum = max(series)
+    interval = abs(maximum - minimum)
+    if interval < 1e-6:
+        return f"{minimum:5.1f}┤" + "─" * width
+
+    sub_w = width * 2
+    sub_h = height * 4
+
+    samples = _monotone_cubic_spline(series, sub_w)
+
+    grid = [[False for _ in range(sub_w)] for _ in range(sub_h)]
+
+    pts = []
+    for x in range(sub_w):
+        val = samples[x]
+        y = int(round((maximum - val) / interval * (sub_h - 1)))
+        y = max(0, min(sub_h - 1, y))
+        pts.append((x, y))
+
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        grid[y0][x0] = True
+        grid[y1][x1] = True
+        dy = y1 - y0
+        if abs(dy) > 1:
+            step = 1 if dy > 0 else -1
+            for y in range(y0 + step, y1, step):
+                grid[y][x0] = True
+
+    lines = []
+    for cy in range(height):
+        row = []
+        for cx in range(width):
+            code = 0
+            for col_idx in (0, 1):
+                sx = cx * 2 + col_idx
+                bit_map = [(0, 0x01), (1, 0x02), (2, 0x04), (3, 0x40)] if col_idx == 0 else [(0, 0x08), (1, 0x10), (2, 0x20), (3, 0x80)]
+                for row_idx, bit in bit_map:
+                    sy = cy * 4 + row_idx
+                    if sx < sub_w and sy < sub_h and grid[sy][sx]:
+                        code |= bit
+            row.append(" " if code == 0 else chr(0x2800 | code))
+        if cy == 0:
+            prefix = f"{maximum:5.1f}┤"
+        elif cy == height - 1:
+            prefix = f"{minimum:5.1f}┤"
+        else:
+            prefix = "     │"
+        lines.append((prefix + "".join(row)).rstrip())
+    return "\n".join(lines)
+
+
 def _wide_bar(value: float, target: float, cells: int = 10) -> str:
     """Бар на `cells` клеток + процент, для строк бюджета КБЖУ в консоли."""
     frac = max(0.0, min(1.0, value / target)) if target else 0.0
@@ -2504,8 +2641,10 @@ def _render_console(conn, user_id: int, date_str: str) -> str:
         # ② ТРЕНД ВЕСА
         if len(weights) >= 2:
             vals = [w for _, w in weights]
-            lines += [rule, f"② ВЕС {len(vals)} дн  {vals[0]:.1f}→{vals[-1]:.1f}",
-                      _sparkline(vals)]
+            lines += [rule, f"② ВЕС {len(vals)} дн  {vals[0]:.1f}→{vals[-1]:.1f}"]
+            chart = _line_chart(vals)
+            if chart:
+                lines.extend(chart.split("\n"))
 
     # ③ БЮДЖЕТ КБЖУ / ВОДА
     d = day_summary(conn, user_id, date_str)
@@ -4577,11 +4716,33 @@ def handle_pantry(params: dict) -> str:
             conn.close()
             return json.dumps({"error": f"'{name}' нет в холодильнике или название подходит к нескольким позициям - уточни, какую"}, ensure_ascii=False)
         name = existing["name"]
+        meta = conn.execute("SELECT unit, piece_g FROM pantry WHERE id=?", (existing["id"],)).fetchone()
+        eu = ((meta["unit"] if meta else "") or "").strip().lower().rstrip(".")
+        piece_g = meta["piece_g"] if meta else None
+        nu = (params.get("unit") or "").strip().lower().rstrip(".")
         try:
             amount = _qty_or_none() or None   # 0 от модели = "не задано" -> убрать целиком
         except (TypeError, ValueError):
             conn.close()
             return json.dumps({"error": "Количество должно быть числом"}, ensure_ascii=False)
+
+        # Конвертация единиц списания в единицы хранения запаса, чтобы списание 188 г
+        # не удаляло 0.801 кг курицы или 10 шт яиц целиком (188 >= 0.801).
+        if amount is not None and existing["qty"] is not None:
+            if nu in ("г", "гр", "g") and eu in ("кг", "kg"):
+                amount = amount / 1000.0
+            elif nu in ("кг", "kg") and eu in ("г", "гр", "g"):
+                amount = amount * 1000.0
+            elif nu in ("мл", "ml") and eu in ("л", "l"):
+                amount = amount / 1000.0
+            elif nu in ("л", "l") and eu in ("мл", "ml"):
+                amount = amount * 1000.0
+            elif nu in _MASS_UNITS and eu not in _MASS_UNITS and eu:
+                from health_core.meal_options import grams_per_unit
+                gpu, _ = grams_per_unit(eu, name, piece_g)
+                if gpu and gpu > 0:
+                    amount = amount / gpu
+
         # Без количества, либо без учёта остатка, либо списываем больше чем есть —
         # убираем позицию целиком; иначе уменьшаем остаток.
         if amount is None or existing["qty"] is None or amount >= existing["qty"]:
@@ -4589,8 +4750,9 @@ def handle_pantry(params: dict) -> str:
             msg = f"Списано полностью: {name}"
         else:
             left = existing["qty"] - amount
-            conn.execute("UPDATE pantry SET qty=?, updated_at=? WHERE id=?", (left, _now_iso(), existing["id"]))
-            msg = f"Списано {amount:g}, осталось {left:g}: {name}"
+            conn.execute("UPDATE pantry SET qty=?, updated_at=? WHERE id=?", (round(left, 3), _now_iso(), existing["id"]))
+            unit_suffix = f" {eu}" if eu else ""
+            msg = f"Списано {amount:g}{unit_suffix}, осталось {round(left, 3):g}{unit_suffix}: {name}"
         conn.commit()
         conn.close()
         return json.dumps({"ok": msg}, ensure_ascii=False)

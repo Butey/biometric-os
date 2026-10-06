@@ -198,16 +198,18 @@ def strip_panels(text: str) -> str:
 # Тогда log_food(add) отклоняется кодом: правило промпта «записывать только съеденное»
 # модель нарушала («тунец можем добавить к яйцам» -> завтрак записан как съеденный).
 _PLAN_RE = re.compile(
-    r"можем|можно|давай|может\b|предлаг|планир|план\b|собери|придума|что\s+(на|если|взять|приготов)|"
-    r"а\s+если|стоит\s+ли|как\s+насчёт|вариант|собираюсь|хочу|хотел|буду|будем|завтра|\?", re.IGNORECASE)
+    r"\bможем\b|\bможно\b|\bдавай|\bможет\b|\bпредлаг|\bпланир|\bплан[ы]?\b|\bсобери\b|\bпридума|"
+    r"что\s+(на|если|взять|приготов)|а\s+если|стоит\s+ли|как\s+насчёт|\bвариант|"
+    r"\bсобираюсь\b|\bхочу\b|\bхотел|\bбуду\b|\bбудем\b|\bзавтра\b|\?", re.IGNORECASE)
 _EATEN_RE = re.compile(
-    r"съел|поел|позавтракал|пообедал|поужинал|перекусил|выпил|доел|\bел[а]?\b|\bпил[а]?\b|записыв|запиши|записал|внеси",
+    r"\bсъел|\bпоел|\bпозавтракал|\bпообедал|\bпоужинал|\bперекусил|\bвыпил|\bдоел|"
+    r"\bел[аи]?\b|\bпил[аи]?\b|\bзапис|\bвнес|\bзанес",
     re.IGNORECASE)
 _PLAN_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar("plan_only", default=False)
 
 
 def is_plan_only(text: str) -> bool:
-    return bool(_PLAN_RE.search(text)) and not _EATEN_RE.search(text)
+    return bool(_PLAN_RE.search(text)) and not bool(_EATEN_RE.search(text))
 
 
 def dispatch(name: str, args: dict) -> str:
@@ -218,7 +220,8 @@ def dispatch(name: str, args: dict) -> str:
     if name == "knowledge":
         result = knowledge.read(args.get("topic", ""), args.get("query"))
     elif name == "log_food" and (args.get("action") or "add") == "add" and _PLAN_ONLY.get():
-        return json.dumps({"error": "Сообщение человека - обсуждение плана или вопрос, а не «съел». НЕ записывай приём пищи. "
+        return json.dumps({"error": "ОТКЛОНЕНО КОДОМ: Сообщение человека — обсуждение плана или вопрос, а не факт съеденного. "
+                                    "Приём пищи НЕ ЗАПИСАН в базу! НЕ записывай приём пищи и не говори человеку, что записал. "
                                     "Ответь по сути и спроси одной строкой: записать как съеденное?"}, ensure_ascii=False)
     else:
         result = registry.dispatch(name, args)
@@ -1332,7 +1335,16 @@ async def _handle_document(message: Message, uid: str) -> None:
             if out is None:
                 await message.answer(_NOT_REGISTERED, parse_mode=None)
             else:
-                await message.answer(f"Разобран zip-архив {filename}:\n\n{out}", parse_mode=None)
+                ans_text = f"Разобран zip-архив {filename}:\n\n{out}"
+                await message.answer(ans_text, parse_mode=None)
+                def _save_zip_history():
+                    c = connect()
+                    try:
+                        history.append(c, uid, {"role": "user", "content": f"[Архив: {filename}]"})
+                        history.append(c, uid, {"role": "assistant", "content": ans_text})
+                    finally:
+                        c.close()
+                await asyncio.to_thread(_save_zip_history)
             return
 
         # Иначе пробуем стандартный импорт файла (TCX, XLSX, CSV)
@@ -1361,14 +1373,32 @@ async def _handle_document(message: Message, uid: str) -> None:
                             parts.append(f"пульс {act['avg_hr']} уд/мин")
                         summary_act = ", ".join(parts)
                         details_str = f"\n\n🏃 **{sport}**: {summary_act}\nКалории учтены в дневном расходе (TDEE)."
-                    await message.answer(
-                        f"✅ Файл `{filename}` успешно импортирован! (добавлено: {added}, пропущено дублей: {skipped}){details_str}",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
+                    ans_text = f"✅ Файл `{filename}` успешно импортирован! (добавлено: {added}, пропущено дублей: {skipped}){details_str}"
+                    try:
+                        await message.answer(ans_text, parse_mode=ParseMode.MARKDOWN)
+                    except Exception:
+                        await message.answer(ans_text, parse_mode=None)
+
+                    def _save_doc_history():
+                        c = connect()
+                        try:
+                            history.append(c, uid, {"role": "user", "content": f"[Файл: {filename}]"})
+                            history.append(c, uid, {"role": "assistant", "content": ans_text})
+                        finally:
+                            c.close()
+                    await asyncio.to_thread(_save_doc_history)
                 elif skipped > 0:
-                    await message.answer(f"ℹ️ Данные из файла `{filename}` уже есть в базе (пропущено существующих записей: {skipped}).", parse_mode=ParseMode.MARKDOWN)
+                    ans_text = f"ℹ️ Данные из файла `{filename}` уже есть в базе (пропущено существующих записей: {skipped})."
+                    try:
+                        await message.answer(ans_text, parse_mode=ParseMode.MARKDOWN)
+                    except Exception:
+                        await message.answer(ans_text, parse_mode=None)
                 else:
-                    await message.answer(f"ℹ️ В файле `{filename}` новых данных не найдено.", parse_mode=ParseMode.MARKDOWN)
+                    ans_text = f"ℹ️ В файле `{filename}` новых данных не найдено."
+                    try:
+                        await message.answer(ans_text, parse_mode=ParseMode.MARKDOWN)
+                    except Exception:
+                        await message.answer(ans_text, parse_mode=None)
         except Exception as e:
             log.exception("ошибка при импорте файла")
             await message.answer(f"❌ Не удалось обработать файл: {e}")

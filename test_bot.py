@@ -373,7 +373,9 @@ def test_plan_talk_is_not_logged_as_eaten():
               "давай запланируем творог на завтра"):
         assert main.is_plan_only(t), t
     for t in ("съел тунец 100г", "яичница 2 яйца СВ XXL, кабачок 290г", "+30 белка", "да", "можем записать: я съел яйца",
-              "выпил 0.5 воды", "запиши завтрак: творог 120г"):
+              "выпил 0.5 воды", "запиши завтрак: творог 120г",
+              "завтрак: 2 яйца С0, тунец 140гр без сока, картофель baby 150гр, фасоль 200гр 365 дней, капуста квашеная 200гр в 11:37",
+              "на завтрак 2 яйца", "завтрак 100г творога", "хочу записать 2 яйца", "хочу внести 2 яйца"):
         assert not main.is_plan_only(t), t
     main._PLAN_ONLY.set(True)
     try:
@@ -776,6 +778,61 @@ def test_log_weight_with_id_list_delete():
         assert not found2, f"weight_id {weight_id} всё ещё есть в list после удаления"
 
     finally:
+        conn.close()
+
+
+def test_log_weight_stale_year_is_fixed():
+    """Регрессия: модель присылает measured_at с устаревшим годом (2024) —
+    год исправляется на текущий, запись сохраняется. До фикса handle_log_weight
+    не вызывал _year_is_stale, и _norm_event_ts отклоняла запись как
+    «дата старше 400 дней»."""
+    import json
+    from datetime import date
+
+    def _dispatch_json(name, args):
+        return json.loads(main.strip_tool_rules(main.dispatch(name, args)))
+
+    registry.set_caller("985")
+    conn = connect()
+    migrate(conn)
+    try:
+        conn.execute("DELETE FROM alerts WHERE user_id=985")
+        conn.execute("DELETE FROM body_metrics WHERE user_id=985")
+        conn.execute("DELETE FROM users WHERE id=985")
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(985,'985',175,'1985-01-01',"
+            "'male','UTC',80,'2026-01-01','2026-01-01 00:00:00')")
+        conn.commit()
+
+        cur_year = date.today().year
+        # Метка с устаревшим годом: 2024, тот же месяц и день что сегодня
+        today_mmdd = date.today().strftime("%m-%d")
+        stale_ts = f"2024-{today_mmdd} 08:00:00"
+
+        result = _dispatch_json("log_weight", {
+            "weight_kg": 82.3,
+            "measured_at": stale_ts,
+        })
+        assert "error" not in result, (
+            f"log_weight с устаревшим годом вернул ошибку вместо исправления: {result}"
+        )
+        assert "weight_id" in result, f"нет weight_id в ответе: {result}"
+
+        # Запись должна лежать с текущим годом, не 2024
+        saved = conn.execute(
+            "SELECT measured_at FROM body_metrics WHERE user_id=985 AND id=?",
+            (result["weight_id"],)
+        ).fetchone()
+        assert saved is not None, "запись не найдена в БД"
+        assert saved["measured_at"].startswith(str(cur_year)), (
+            f"год в базе должен быть {cur_year}, а не 2024: {saved['measured_at']}"
+        )
+    finally:
+        conn.execute("DELETE FROM alerts WHERE user_id=985")
+        conn.execute("DELETE FROM body_metrics WHERE user_id=985")
+        conn.execute("DELETE FROM users WHERE id=985")
+        conn.commit()
         conn.close()
 
 
@@ -1677,6 +1734,7 @@ def test_check_stale_calib_streak():
 
 def _water_user(uid: int):
     conn = connect()
+    migrate(conn)
     conn.execute(f"DELETE FROM water_log WHERE user_id={uid}")
     conn.execute(f"DELETE FROM users WHERE id={uid}")
     conn.execute(
@@ -1850,6 +1908,83 @@ def test_pantry_no_egg_grams_conversion_and_loose_merge():
         conn.close()
         _water_rows(7807)
 
+
+def test_pantry_remove_unit_conversion():
+    _water_user(7808)
+    try:
+        # Добавляем 1 кг куриного филе
+        out = json.loads(registry.dispatch("pantry", {"action": "add", "name": "Куриное филе", "qty": 1.0, "unit": "кг", "category": "Белковые", "user_id": 7808}))
+        assert "ok" in out, out
+
+        # Списываем 200 г (не должно удалять позицию полностью из-за 200 >= 1.0)
+        out2 = json.loads(registry.dispatch("pantry", {"action": "remove", "name": "Куриное филе", "qty": 200, "unit": "г", "user_id": 7808}))
+        assert "ok" in out2, out2
+        assert "осталось 0.8" in out2["ok"], out2
+
+        conn = connect()
+        r = conn.execute("SELECT qty, unit FROM pantry WHERE user_id=7808 AND name='Куриное филе'").fetchone()
+        assert r is not None, "позиция не должна удаляться"
+        assert abs(r["qty"] - 0.8) < 1e-4, f"должно остаться 0.8 кг, получено {r['qty']}"
+
+        # Добавляем 10 яиц
+        out3 = json.loads(registry.dispatch("pantry", {"action": "add", "name": "Яйца куриные С0", "qty": 10, "unit": "шт", "category": "Белковые", "user_id": 7808}))
+        assert "ok" in out3, out3
+
+        # Списываем 120 г яиц (120 г / 60 г = 2 шт)
+        out4 = json.loads(registry.dispatch("pantry", {"action": "remove", "name": "Яйца куриные С0", "qty": 120, "unit": "г", "user_id": 7808}))
+        assert "ok" in out4, out4
+        assert "осталось 8" in out4["ok"], out4
+        r_egg = conn.execute("SELECT qty, unit FROM pantry WHERE user_id=7808 AND name='Яйца куриные С0'").fetchone()
+        assert r_egg is not None, "яйца не должны удаляться"
+        assert abs(r_egg["qty"] - 8.0) < 1e-4, f"должно остаться 8 шт, получено {r_egg['qty']}"
+        conn.close()
+    finally:
+        conn = connect()
+        conn.execute("DELETE FROM pantry WHERE user_id=7808")
+        conn.commit()
+        conn.close()
+        _water_rows(7808)
+
+def test_console_weight_line_chart():
+    """Тест линейного графика веса в пульте: проверка _line_chart и отсутствия блочных спарклайнов в секции ВЕС."""
+    from plugin import tools
+
+    assert tools._line_chart([]) == ""
+    one = tools._line_chart([80.0])
+    assert "80.0┤" in one and "─" in one
+
+    flat = tools._line_chart([80.0, 80.0, 80.0])
+    assert "80.0┤" in flat and "─" in flat
+
+    chart = tools._line_chart([117.2, 116.6, 117.0, 114.9, 116.2])
+    assert "117.2┤" in chart
+    assert "114.9┤" in chart
+    for line in chart.split("\n"):
+        assert len(line) <= tools._CONSOLE_W, f"Строка графика длиннее {tools._CONSOLE_W}: {line!r}"
+
+    # Проверка вызова через get_day_summary(format='console')
+    _water_user(7809)
+    conn = connect()
+    try:
+        conn.execute("INSERT INTO body_metrics(user_id, burst_key, measured_at, weight_kg) VALUES (7809, 'k1', '2026-10-01 08:00:00', 82.0)")
+        conn.execute("INSERT INTO body_metrics(user_id, burst_key, measured_at, weight_kg) VALUES (7809, 'k2', '2026-10-02 08:00:00', 80.5)")
+        conn.commit()
+        res = json.loads(registry.dispatch("get_day_summary", {"format": "console", "user_id": 7809}))
+        summary = res["day_summary"]
+        assert "② ВЕС 2 дн  82.0→80.5" in summary
+        assert "82.0┤" in summary
+        assert "80.5┤" in summary
+        # Проверяем, что в блоке веса нет блочной столбчатой диаграммы
+        weight_section = summary.partition("② ВЕС")[2].partition("③")[0]
+        assert "█" not in weight_section and "▇" not in weight_section
+    finally:
+        conn.execute("DELETE FROM body_metrics WHERE user_id=7809")
+        conn.execute("DELETE FROM daily_targets WHERE user_id=7809")
+        conn.execute("DELETE FROM alerts WHERE user_id=7809")
+        conn.execute("DELETE FROM users WHERE id=7809")
+        conn.commit()
+        conn.close()
+        _water_rows(7809)
 
 
 if __name__ == "__main__":
