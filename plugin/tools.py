@@ -1,6 +1,7 @@
 """Thin wrappers over health_core — parameter unpacking and response serialization."""
 import functools
 import json
+import math
 import os
 import re
 import shutil
@@ -2531,34 +2532,42 @@ def _monotone_cubic_spline(pts: list[float], num_samples: int) -> list[float]:
     return result
 
 
-def _line_chart(series: list[float], height: int = 4, width: int = 27) -> str:
-    """Тренд веса для консоли пульта: непрерывная линия с заливкой снизу.
-    Сглаживание - монотонный кубический сплайн (PCHIP) на `width` колонок, высота
-    линии в колонке - в восьмых долях клетки (▁..█), под линией заливка ░.
+def _smooth(series: list[float], sigma: float = 1.5) -> list[float]:
+    """Гауссово сглаживание ряда: шум замеров (±1 кг за день) иначе рвёт кромку графика."""
+    n = len(series)
+    out = []
+    for i in range(n):
+        ws = [math.exp(-((j - i) ** 2) / (2 * sigma ** 2)) for j in range(n)]
+        out.append(sum(w * v for w, v in zip(ws, series)) / sum(ws))
+    return out
+
+
+def _line_chart(series: list[float], height: int = 7, width: int = 27) -> str:
+    """Тренд веса для консоли пульта: непрерывная область с заливкой снизу.
+    Ряд сглаживается гауссом, затем PCHIP-сплайном на `width` колонок; кромка - в
+    восьмых долях клетки (▁..█), под ней сплошная заливка █. Подписи - границы
+    кривой тренда (не сырых замеров); сырые первое и последнее значения - в заголовке блока.
     Вписывается в _CONSOLE_W (34 симв)."""
     if not series:
         return ""
     if len(series) == 1:
         return f"{series[0]:5.1f}┤" + "─" * width
 
-    minimum = min(series)
-    maximum = max(series)
+    trend = _smooth(series) if len(series) >= 6 else series
+    samples = _monotone_cubic_spline(trend, width)
+    minimum, maximum = min(samples), max(samples)
     interval = maximum - minimum
     if interval < 1e-6:
         return f"{minimum:5.1f}┤" + "─" * width
 
     levels = height * 8
-    samples = _monotone_cubic_spline(series, width)
-    # минимум не обнуляется: самая низкая колонка всё равно видна одной восьмой клетки
+    # самая низкая колонка не обнуляется: видна хотя бы одной восьмой клетки
     cols = [1 + round((v - minimum) / interval * (levels - 1)) for v in samples]
 
     lines = []
     for cy in range(height):
         base = (height - 1 - cy) * 8   # уровни, лежащие ниже этой строки
-        row = []
-        for h in cols:
-            k = h - base
-            row.append(" " if k <= 0 and h <= base else "░" if k > 8 else " ▁▂▃▄▅▆▇█"[k] if k > 0 else " ")
+        row = ["█" if h - base > 8 else " ▁▂▃▄▅▆▇█"[max(0, h - base)] for h in cols]
         if cy == 0:
             prefix = f"{maximum:5.1f}┤"
         elif cy == height - 1:
