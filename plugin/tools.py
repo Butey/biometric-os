@@ -8159,8 +8159,8 @@ if __name__ == "__main__":
         print("="*60)
         print("TEST 28: метка события проверяется на правдоподобность")
         print("="*60)
-        _wrong_year = (config.local_now().replace(tzinfo=None)
-                       - timedelta(days=730)).strftime("%Y-%m-%d %H:%M:%S")
+        # 2020, а не «сейчас минус N дней»: 2024/2025 код сам правит на текущий год (_year_is_stale)
+        _wrong_year = "2020-06-15 12:00:00"
         _r = json.loads(handle_log_water({"user_id": 1, "ml": 500, "at": _wrong_year}))
         assert "error" in _r and "год" in _r["error"], f"ошибка в годе должна отклоняться: {_r}"
         _future = (config.local_now().replace(tzinfo=None)
