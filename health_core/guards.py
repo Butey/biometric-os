@@ -204,10 +204,8 @@ def check_undereating(conn: sqlite3.Connection, user_id: int):
 def check_plateau(conn: sqlite3.Connection, user_id: int):
     """Утренние замеры (06:00-11:00, как везде в проекте) в окне, дни рефида
     исключены — там рост веса плановый (гликоген/вода), не сигнал плато.
-    С 6+ точками размах — max(|медиана первых 3 − медиана последних 3|, просадка до
-    минимума окна) (гасит один
-    шумный замер, тот же приём, что в check_rate_high/check_weight_regain);
-    меньше 6 точек — старый max-min, медианное окно на них не выигрывает."""
+    С 6+ точками размах — |наклон линейного тренда по всем замерам| * окно в днях
+    (один шумный замер или откат тренд не ломают); меньше 6 точек — max-min."""
     from health_core.energy import _is_refeed
 
     cfg = _cfg()
@@ -221,11 +219,9 @@ def check_plateau(conn: sqlite3.Connection, user_id: int):
     if len(rows) < cfg["plateau_min_points"]:
         return None
     weights = [r["weight_kg"] for r in rows]
-    if len(weights) >= 6:
-        first = statistics.median(weights[:3])
-        # новый минимум окна ниже начала = вес двигался, даже если откат после него
-        # вернул последние 3 замера к уровню начала (минимум 114.9 -> скачок -> 115.0)
-        spread = max(abs(first - statistics.median(weights[-3:])), first - min(weights))
+    days = [datetime.strptime(r["measured_at"], "%Y-%m-%d %H:%M:%S").timestamp() / 86400 for r in rows]
+    if len(weights) >= 6 and days[-1] > days[0]:
+        spread = abs(statistics.linear_regression(days, weights).slope) * cfg["plateau_window_days"]
     else:
         spread = max(weights) - min(weights)
     threshold = cfg["plateau_range_kg"]
@@ -2216,7 +2212,7 @@ if __name__ == "__main__":
             # ---------------------------------------------------------------- PLATEAU (задача 3)
             # Одиночный всплеск +0.6 кг (вода/рефид-подобный шум) НЕ должен ломать
             # детектор: старый max-min давал 0.7 кг > порога 0.5 и молчал бы.
-            # Медианы первых/последних 3 из 7 точек не видят всплеск в середине.
+            # Наклон тренда по всем 7 точкам всплеск почти не чувствует.
             u_plat = make_user(200, height_cm=185, created_days_ago=30)
             add_metric(u_plat, 9, 100.0, None)
             add_metric(u_plat, 8, 99.9, None)
@@ -2230,7 +2226,7 @@ if __name__ == "__main__":
             assert any(a["code"] == "PLATEAU" for a in alerts_plat), (
                 f"PLATEAU должен сработать: медианы 100.0/100.0 несмотря на всплеск +0.6 кг, получили {alerts_plat}"
             )
-            print("OK: PLATEAU — одиночный всплеск +0.6 кг не срывает детектор (медианное окно)")
+            print("OK: PLATEAU — одиночный всплеск +0.6 кг не срывает детектор (регрессия по всем замерам)")
 
             # новый минимум окна, потом откат: медианы краёв почти равны, но вес двигался
             u_plat2 = make_user(201, height_cm=185, created_days_ago=30)
@@ -2238,7 +2234,7 @@ if __name__ == "__main__":
                 add_metric(u_plat2, d, w, None)
             conn.commit()
             assert not any(a["code"] == "PLATEAU" for a in check_all(conn, u_plat2)), "PLATEAU при новом минимуме окна"
-            print("OK: PLATEAU молчит, если в окне был новый минимум ниже начала")
+            print("OK: PLATEAU молчит при минимуме окна и откате (тренд вниз)")
 
             # ---------------------------------------------------------------- BMR_FLOOR (задача 2)
             u_floor = make_user(192, height_cm=185, created_days_ago=30)
