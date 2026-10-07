@@ -2002,6 +2002,28 @@ def test_console_weight_line_chart():
         _water_rows(7809)
 
 
+def test_weight_history_chart():
+    """График за всё время: нужен минимум 2 дня, строки не шире пульта, подписаны даты."""
+    from plugin import tools
+    _water_user(7810)
+    conn = connect()
+    try:
+        assert "хотя бы 2" in tools._render_weight_history(conn, 7810)
+        for day, w in [(1, 82.0), (2, 81.0), (3, 80.5)]:
+            conn.execute("INSERT INTO body_metrics(user_id, burst_key, measured_at, weight_kg) VALUES (7810, ?, ?, ?)",
+                         (f"k{day}", f"2026-09-0{day} 08:00:00", w))
+        conn.commit()
+        out = tools._render_weight_history(conn, 7810)
+        assert "3 дн" in out and "01.09.26" in out and "03.09.26" in out and "мин 80.5" in out, out
+        assert all(len(l) <= tools._CONSOLE_W for l in out.split("\n")), out
+    finally:
+        conn.execute("DELETE FROM body_metrics WHERE user_id=7810")
+        conn.execute("DELETE FROM users WHERE id=7810")
+        conn.commit()
+        conn.close()
+        _water_rows(7810)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

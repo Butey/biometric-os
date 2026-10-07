@@ -573,8 +573,8 @@ get_day_summary_schema = {
         },
         "format": {
             "type": "string",
-            "enum": ["bar", "dashboard", "journal", "console"],
-            "description": "bar — исходный JSON-payload; dashboard (по умолчанию) — сводка КБЖУ дня; journal — журнал питания по приёмам; console — единый метаболический пульт (тело, вес, КБЖУ/вода, еда, гарды, фарма)"
+            "enum": ["bar", "dashboard", "journal", "console", "weight_history"],
+            "description": "bar — исходный JSON-payload; dashboard (по умолчанию) — сводка КБЖУ дня; journal — журнал питания по приёмам; console — единый метаболический пульт (тело, вес, КБЖУ/вода, еда, гарды, фарма); weight_history — график веса за всё время с первого замера"
         }
     }
 }

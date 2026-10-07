@@ -2600,6 +2600,25 @@ def _daily_weights(conn, user_id: int, days: int = 14) -> list[tuple[str, float]
     return [(r["d"], r["w"]) for r in reversed(rows)]
 
 
+def _render_weight_history(conn, user_id: int) -> str:
+    """График веса за всё время наблюдений (с первого замера), по отдельной команде."""
+    weights = _daily_weights(conn, user_id, 100000)
+    if len(weights) < 2:
+        return "Для графика нужно хотя бы 2 дня с замерами веса."
+    dates = [d for d, _ in weights]
+    vals = [w for _, w in weights]
+    fmt_d = lambda d: f"{d[8:10]}.{d[5:7]}.{d[2:4]}"
+    first, last = fmt_d(dates[0]), fmt_d(dates[-1])
+    axis = "     └" + first + " " * max(1, _CONSOLE_W - 6 - len(first) - len(last)) + last
+    lo, hi = min(vals), max(vals)
+    lines = [f"📈 ВЕС ЗА ВСЁ ВРЕМЯ, {len(vals)} дн",
+             f"{vals[0]:.1f}→{vals[-1]:.1f} ({vals[-1] - vals[0]:+.1f} кг)",
+             *_line_chart(vals).split("\n"), axis,
+             f"мин {lo:.1f} ({fmt_d(dates[vals.index(lo)])})",
+             f"макс {hi:.1f} ({fmt_d(dates[vals.index(hi)])})"]
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
 def _render_console(conn, user_id: int, date_str: str) -> str:
     """Единый метаболический пульт под телефон (~34 симв): тело, тренд веса,
     бюджет КБЖУ/вода, лог еды, гарды. Ничего не считает заново — собирает из
@@ -2886,6 +2905,10 @@ def handle_get_day_summary(params: dict) -> str:
         console = _render_console(conn, user_id, date_str)
         conn.close()
         return json.dumps({"day_summary": console}, ensure_ascii=False)
+    if fmt == "weight_history":
+        text = _render_weight_history(conn, user_id)
+        conn.close()
+        return json.dumps({"day_summary": text}, ensure_ascii=False)
     if fmt == "journal":
         journal = _render_food_log(conn, user_id, date_str)
         conn.close()

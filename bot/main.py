@@ -374,6 +374,8 @@ _FAST_REPLIES = {
     "пульт": ("get_day_summary", {"format": "console"}), "консоль": ("get_day_summary", {"format": "console"}),
     "дашборд": ("get_day_summary", {"format": "dashboard"}), "dashboard": ("get_day_summary", {"format": "dashboard"}),
     "статус": ("get_status_bar", {}), "status": ("get_status_bar", {}),
+    "график": ("get_day_summary", {"format": "weight_history"}),
+    "график веса": ("get_day_summary", {"format": "weight_history"}),
 }
 
 
@@ -1148,6 +1150,9 @@ def run_command(uid: str, text: str) -> str | None:
         registry.set_caller(uid)
         fmt = "console" if name in ("пульт", "console") else "dashboard"
         return _plain(registry.dispatch("get_day_summary", {"format": fmt}))
+    if name in ("chart", "weights"):
+        registry.set_caller(uid)
+        return _plain(registry.dispatch("get_day_summary", {"format": "weight_history"}))
     if name == "status":
         return _plain(registry.dispatch("get_status_bar", {}))
     if name == "help":
