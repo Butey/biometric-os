@@ -370,6 +370,13 @@ async def _answer_md(message: Message, text: str, kb: InlineKeyboardMarkup | Non
         await message.answer(text, reply_markup=kb, parse_mode=None)
 
 
+_FAST_REPLIES = {
+    "пульт": ("get_day_summary", {"format": "console"}), "консоль": ("get_day_summary", {"format": "console"}),
+    "дашборд": ("get_day_summary", {"format": "dashboard"}), "dashboard": ("get_day_summary", {"format": "dashboard"}),
+    "статус": ("get_status_bar", {}), "status": ("get_status_bar", {}),
+}
+
+
 def _plain(raw: str) -> str:
     """Инструменты отдают JSON — человеку он не нужен. Достаём текстовое поле,
     а нет его — показываем как есть: молча проглотить ответ хуже."""
@@ -379,7 +386,7 @@ def _plain(raw: str) -> str:
         return raw
     if not isinstance(data, dict):
         return raw
-    for key in ("text", "help", "status_bar", "error"):
+    for key in ("text", "help", "status_bar", "day_summary", "error"):
         value = data.get(key)
         if isinstance(value, str):
             return value
@@ -1130,13 +1137,17 @@ def run_command(uid: str, text: str) -> str | None:
     name, _, args = text[1:].partition(" ")
     name = name.split("@")[0].lower()          # /help@botname в группах
 
-    if name == "new":
+    if name in ("new", "clear", "reset"):
         conn = connect()
         try:
             history.clear(conn, uid)
         finally:
             conn.close()
         return "Контекст забыт. Записи в базе на месте."
+    if name in ("пульт", "console", "dashboard"):
+        registry.set_caller(uid)
+        fmt = "console" if name in ("пульт", "console") else "dashboard"
+        return _plain(registry.dispatch("get_day_summary", {"format": fmt}))
     if name == "status":
         return _plain(registry.dispatch("get_status_bar", {}))
     if name == "help":
@@ -1251,7 +1262,7 @@ def _close_turn(uid: str, new_messages: list[dict]) -> None:
     try:
         for m in new_messages:
             if m.get("role") == "tool" and isinstance(m.get("content"), str):
-                m = {**m, "content": strip_tool_rules(m["content"])}
+                m = {**m, "content": strip_panels(strip_tool_rules(m["content"]))}
             elif m.get("role") == "assistant" and isinstance(m.get("content"), str):
                 m = {**m, "content": strip_panels(m["content"])}
             history.append(conn, uid, m)
@@ -1607,6 +1618,13 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
         if answer is not None:
             await send_long(message, answer)
             return
+
+    # Точные команды сводок отвечаем без модели: быстрее и без устаревших копий пульта из истории.
+    fast = _FAST_REPLIES.get(text.strip().lower())
+    if fast:
+        answer = _plain(await asyncio.to_thread(registry.dispatch, *fast))
+        await send_long(message, answer)
+        return
 
     rewritten = registry.quick_macro(text)
     if rewritten:

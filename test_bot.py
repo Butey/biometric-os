@@ -364,6 +364,8 @@ def test_slash_commands_run_without_model():
     assert out and "```" not in out[:5], out
     assert main.run_command("111", "/hebrew") is None, "чужая команда должна уходить модели"
     assert "Контекст забыт" in main.run_command("111", "/new")
+    assert "Контекст забыт" in main.run_command("111", "/clear")
+    assert main._plain('{"day_summary": "сводка"}') == "сводка"
     assert "только администраторам" in main.run_command("111", "/model")
 
 
