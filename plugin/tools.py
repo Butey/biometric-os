@@ -786,6 +786,14 @@ def _pantry_deduct(conn, user_id: int, items: list, item_ids: list) -> tuple[lis
                                  _pantry_stems(it.get("name") or ""))
             if len(cands) > 1:
                 skipped.append(f"{it.get('name')} (неоднозначно: {' / '.join(c['name'] for c in cands)})")
+            elif not cands:
+                # «Куриное филе» против «Филе грудки охлажденное Петелинка»: общая основа есть,
+                # вложенности нет - не угадываем, но и не молчим, иначе запас тихо расходится с едой
+                q = _pantry_stems(it.get("name") or "")
+                like = [r["name"] for r in conn.execute("SELECT name FROM pantry WHERE user_id=?", (user_id,)).fetchall()
+                        if q & _pantry_stems(r["name"])]
+                if like:
+                    skipped.append(f"{it.get('name')} (в запасе нет такого названия, похожее: {' / '.join(like)})")
         if row is None or row["qty"] is None:
             continue
         meta = conn.execute("SELECT unit, category, piece_g FROM pantry WHERE id=?", (row["id"],)).fetchone()
@@ -7618,6 +7626,11 @@ if __name__ == "__main__":
         assert len(_lf3["pantry_not_deducted"]) == 1 and "неоднозначно" in _lf3["pantry_not_deducted"][0], _lf3
         _pan(action="remove", name="Хлеб белый")
         _pan(action="remove", name="Хлеб ржаной")
+        _pan(action="add", name="Филе грудки охлажденное", qty=0.5, unit="кг", category="Белковые")
+        _lf4 = json.loads(handle_log_food({"user_id": p_uid, "meal_slot": "dinner", "items": [
+            {"name": "Филе индейки", "grams": 100, "kcal": 110, "protein_g": 22, "fat_g": 2, "carbs_g": 0}]}))
+        assert any("похожее" in x and "Филе грудки" in x for x in _lf4["pantry_not_deducted"]), _lf4
+        _pan(action="remove", name="Филе грудки охлажденное")
         # сорта яиц: СВ = XXL, С0 = c0 = со; разные сорта не путаются
         _pan(action="add", name="Яйца куриные С0", qty=10, unit="шт", category="Белковые")
         for _q, _want in [("Яйца СВ (АО Птицефабрика?)", "Яйца СВ XXL"), ("яйца xxl", "Яйца СВ XXL"),
