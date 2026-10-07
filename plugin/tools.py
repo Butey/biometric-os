@@ -2532,9 +2532,10 @@ def _monotone_cubic_spline(pts: list[float], num_samples: int) -> list[float]:
     return result
 
 
-def _smooth(series: list[float], sigma: float = 1.5) -> list[float]:
+def _smooth(series: list[float]) -> list[float]:
     """Гауссово сглаживание ряда: шум замеров (±1 кг за день) иначе рвёт кромку графика."""
     n = len(series)
+    sigma = max(1.0, n / 12)   # 30 замеров -> 2.5 дня
     out = []
     for i in range(n):
         ws = [math.exp(-((j - i) ** 2) / (2 * sigma ** 2)) for j in range(n)]
@@ -2545,8 +2546,8 @@ def _smooth(series: list[float], sigma: float = 1.5) -> list[float]:
 def _line_chart(series: list[float], height: int = 7, width: int = 27) -> str:
     """Тренд веса для консоли пульта: непрерывная область с заливкой снизу.
     Ряд сглаживается гауссом, затем PCHIP-сплайном на `width` колонок; кромка - в
-    восьмых долях клетки (▁..█), под ней сплошная заливка █. Подписи - границы
-    кривой тренда (не сырых замеров); сырые первое и последнее значения - в заголовке блока.
+    восьмых долях клетки (▁..█), под ней сплошная заливка █. Подписи - реальные
+    минимум и максимум замеров, кривая (тренд) их может не касаться.
     Вписывается в _CONSOLE_W (34 симв)."""
     if not series:
         return ""
@@ -2555,14 +2556,14 @@ def _line_chart(series: list[float], height: int = 7, width: int = 27) -> str:
 
     trend = _smooth(series) if len(series) >= 6 else series
     samples = _monotone_cubic_spline(trend, width)
-    minimum, maximum = min(samples), max(samples)
+    minimum, maximum = min(series), max(series)
     interval = maximum - minimum
     if interval < 1e-6:
         return f"{minimum:5.1f}┤" + "─" * width
 
     levels = height * 8
     # самая низкая колонка не обнуляется: видна хотя бы одной восьмой клетки
-    cols = [1 + round((v - minimum) / interval * (levels - 1)) for v in samples]
+    cols = [max(1, 1 + round((v - minimum) / interval * (levels - 1))) for v in samples]
 
     lines = []
     for cy in range(height):
@@ -2616,7 +2617,7 @@ def _render_console(conn, user_id: int, date_str: str) -> str:
     # ① ТЕЛО
     if m is not None:
         base = _base_weight(conn, user_id)
-        weights = _daily_weights(conn, user_id)
+        weights = _daily_weights(conn, user_id, 30)
         day_delta = None
         if len(weights) >= 2:
             day_delta = weights[-1][1] - weights[-2][1]
