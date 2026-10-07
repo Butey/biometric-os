@@ -268,7 +268,14 @@ def _year_is_stale(raw: str, today_iso: str) -> bool:
         age = (datetime.strptime(today_iso[:10], "%Y-%m-%d") - datetime.strptime(raw[:10], "%Y-%m-%d")).days
     except ValueError:
         return False
-    return age > _EVENT_TS_PAST_DAYS
+    if age > _EVENT_TS_PAST_DAYS:
+        return True
+    # ровно год назад (в окне 400 дней) = модель подставила прошлый год к сегодняшней дате
+    try:
+        fixed = datetime.strptime(today_iso[:4] + raw[4:10], "%Y-%m-%d")
+    except ValueError:
+        return False
+    return -2 <= (datetime.strptime(today_iso[:10], "%Y-%m-%d") - fixed).days <= 30
 
 
 def _today_iso(conn: sqlite3.Connection | None = None, user_id: int | None = None) -> str:
@@ -8161,6 +8168,8 @@ if __name__ == "__main__":
         print("="*60)
         # 2020, а не «сейчас минус N дней»: 2024/2025 код сам правит на текущий год (_year_is_stale)
         _wrong_year = "2020-06-15 12:00:00"
+        _t = _today_iso()
+        assert _year_is_stale(f"2025-{_t[5:]} 13:11:00", _t), "прошлый год к сегодняшней дате должен правиться"
         _r = json.loads(handle_log_water({"user_id": 1, "ml": 500, "at": _wrong_year}))
         assert "error" in _r and "год" in _r["error"], f"ошибка в годе должна отклоняться: {_r}"
         _future = (config.local_now().replace(tzinfo=None)
