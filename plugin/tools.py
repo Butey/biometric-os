@@ -520,8 +520,12 @@ def handle_log_food(params: dict) -> str:
             ensure_ascii=False)
 
     for i in items:
-        nm = str(i.get("name") or "").strip()
-        i["name"] = nm if nm else "Блюдо"
+        i["name"] = str(i.get("name") or "").strip()
+    # Позиция без названия - мусорная запись ("Блюдо" 200 г): слабая модель теряет name.
+    if any(not i["name"] for i in items):
+        conn.close()
+        return json.dumps({"error": "У позиции нет name. Укажи название каждого продукта и повтори запись."},
+                          ensure_ascii=False)
 
     # per_100g + grams (CONTEXT.md «Состав продукта»): код, а не модель, считает
     # kcal/protein_g/fat_g/carbs_g позиции из состава на 100 г (food_lookup
@@ -751,7 +755,7 @@ def _pantry_restore(conn, user_id: int, item_ids: list) -> list:
                 conn.execute("INSERT INTO pantry(user_id, name, qty, unit, category, updated_at, piece_g) VALUES (?,?,?,?,?,?,?)",
                              (user_id, d["name"], d["qty"], d["unit"], d["category"] or "Прочее", _now_iso(), d["piece_g"]))
             conn.execute("DELETE FROM pantry_deductions WHERE id=?", (d["id"],))
-            back.append({"name": d["name"], "returned": round(d["qty"], 2), "unit": d["unit"]})
+            back.append({"name": d["name"], "returned": round(d["qty"], 3), "unit": d["unit"]})
     return back
 
 
@@ -789,7 +793,8 @@ def _pantry_deduct(conn, user_id: int, items: list, item_ids: list) -> tuple[lis
         except (TypeError, ValueError):
             pcs = 0
         counted = pcs > 0 and (pu or "").strip().lower().rstrip(".") not in _MASS_UNITS
-        take = min(pcs if counted else grams / gpu, row["qty"])  # вернуть можно только то, что реально списали
+        want = pcs if counted else grams / gpu
+        take = min(want, row["qty"])  # вернуть можно только то, что реально списали
         conn.execute("INSERT INTO pantry_deductions(user_id, food_item_id, name, qty, unit, category, piece_g) VALUES (?,?,?,?,?,?,?)",
                      (user_id, item_id, row["name"], take, pu, meta["category"], meta["piece_g"]))
         left = row["qty"] - take
@@ -798,7 +803,10 @@ def _pantry_deduct(conn, user_id: int, items: list, item_ids: list) -> tuple[lis
             left = 0.0
         else:
             conn.execute("UPDATE pantry SET qty=?, updated_at=? WHERE id=?", (round(left, 3), _now_iso(), row["id"]))
-        done.append({"name": row["name"], "took": round(take, 2), "unit": pu, "left": round(left, 2)})
+        rec = {"name": row["name"], "took": round(take, 3), "unit": pu, "left": round(left, 3)}
+        if want - take > 1e-6:
+            rec["short"] = round(want - take, 3)  # запаса было меньше съеденного: остаток в базе, скорее всего, занижен
+        done.append(rec)
     conn.commit()
     return done, skipped
 
@@ -7614,6 +7622,10 @@ if __name__ == "__main__":
         _lf2 = json.loads(handle_log_food({"user_id": p_uid, "meal_slot": "dinner", "items": [
             {"name": "куриное филе", "grams": 900, "kcal": 1000, "protein_g": 100, "fat_g": 20, "carbs_g": 0}]}))
         assert _lf2["pantry_deducted"][0]["left"] == 0, _lf2
+        assert _lf2["pantry_deducted"][0]["short"] == 650, _lf2   # запаса 250 г, съедено 900 - недостача видна
+        _nn = json.loads(handle_log_food({"user_id": p_uid, "meal_slot": "snack", "items": [
+            {"grams": 200, "kcal": 30, "protein_g": 2, "fat_g": 0, "carbs_g": 8}]}))
+        assert "error" in _nn and "name" in _nn["error"], _nn
         assert conn.execute("SELECT COUNT(*) c FROM pantry WHERE user_id=? AND name='Куриное филе'", (p_uid,)).fetchone()["c"] == 0
         # удаление приёма возвращает списанное: и в существующую позицию, и в уже удалённую (ушла в ноль)
         _lid = lambda slot: conn.execute("SELECT id FROM food_log WHERE user_id=? AND meal_slot=? ORDER BY id DESC",

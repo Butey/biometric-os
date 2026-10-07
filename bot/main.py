@@ -200,7 +200,10 @@ def strip_panels(text: str) -> str:
 _PLAN_RE = re.compile(
     r"\bможем\b|\bможно\b|\bдавай|\bможет\b|\bпредлаг|\bпланир|\bплан[ы]?\b|\bсобери\b|\bпридума|"
     r"что\s+(на|если|взять|приготов)|а\s+если|стоит\s+ли|как\s+насчёт|\bвариант|"
-    r"\bсобираюсь\b|\bхочу\b|\bхотел|\bбуду\b|\bбудем\b|\bзавтра\b|\?", re.IGNORECASE)
+    r"\bсобираюсь\b|\bхочу\b|\bхотел|\bбуду\b|\bбудем\b|\bзавтра\b|\?|"
+    # поправка к запасам/расчётам ("там 0,27 кг", "ошибся ноликом") - не приём пищи
+    r"\bошиб|\bнеправильн|\bисправ|\bпоправ|\bпочему\b|\bсколько\b|\bостат", re.IGNORECASE)
+_NEG_LOG_RE = re.compile(r"\bне\s+(записывай|вноси|заноси|добавляй|пиши)", re.IGNORECASE)
 _EATEN_RE = re.compile(
     r"\bсъел|\bпоел|\bпозавтракал|\bпообедал|\bпоужинал|\bперекусил|\bвыпил|\bдоел|"
     r"\bел[аи]?\b|\bпил[аи]?\b|\bзапис|\bвнес|\bзанес",
@@ -209,6 +212,8 @@ _PLAN_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar("plan_only", d
 
 
 def is_plan_only(text: str) -> bool:
+    if _NEG_LOG_RE.search(text):
+        return True
     return bool(_PLAN_RE.search(text)) and not bool(_EATEN_RE.search(text))
 
 
