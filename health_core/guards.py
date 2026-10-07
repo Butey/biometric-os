@@ -204,7 +204,8 @@ def check_undereating(conn: sqlite3.Connection, user_id: int):
 def check_plateau(conn: sqlite3.Connection, user_id: int):
     """Утренние замеры (06:00-11:00, как везде в проекте) в окне, дни рефида
     исключены — там рост веса плановый (гликоген/вода), не сигнал плато.
-    С 6+ точками размах — |медиана первых 3 − медиана последних 3| (гасит один
+    С 6+ точками размах — max(|медиана первых 3 − медиана последних 3|, просадка до
+    минимума окна) (гасит один
     шумный замер, тот же приём, что в check_rate_high/check_weight_regain);
     меньше 6 точек — старый max-min, медианное окно на них не выигрывает."""
     from health_core.energy import _is_refeed
@@ -221,7 +222,10 @@ def check_plateau(conn: sqlite3.Connection, user_id: int):
         return None
     weights = [r["weight_kg"] for r in rows]
     if len(weights) >= 6:
-        spread = abs(statistics.median(weights[:3]) - statistics.median(weights[-3:]))
+        first = statistics.median(weights[:3])
+        # новый минимум окна ниже начала = вес двигался, даже если откат после него
+        # вернул последние 3 замера к уровню начала (минимум 114.9 -> скачок -> 115.0)
+        spread = max(abs(first - statistics.median(weights[-3:])), first - min(weights))
     else:
         spread = max(weights) - min(weights)
     threshold = cfg["plateau_range_kg"]
@@ -2227,6 +2231,14 @@ if __name__ == "__main__":
                 f"PLATEAU должен сработать: медианы 100.0/100.0 несмотря на всплеск +0.6 кг, получили {alerts_plat}"
             )
             print("OK: PLATEAU — одиночный всплеск +0.6 кг не срывает детектор (медианное окно)")
+
+            # новый минимум окна, потом откат: медианы краёв почти равны, но вес двигался
+            u_plat2 = make_user(201, height_cm=185, created_days_ago=30)
+            for d, w in [(9, 116.4), (8, 116.4), (7, 115.9), (5, 115.1), (4, 114.9), (2, 116.1), (1, 116.2), (0, 115.0)]:
+                add_metric(u_plat2, d, w, None)
+            conn.commit()
+            assert not any(a["code"] == "PLATEAU" for a in check_all(conn, u_plat2)), "PLATEAU при новом минимуме окна"
+            print("OK: PLATEAU молчит, если в окне был новый минимум ниже начала")
 
             # ---------------------------------------------------------------- BMR_FLOOR (задача 2)
             u_floor = make_user(192, height_cm=185, created_days_ago=30)
