@@ -332,6 +332,10 @@ bot:
   # Ключи здесь НЕ хранятся, только имя переменной окружения из ~/.hermes/.env.
   # На free tier цепочка обязательна: выбив лимит, бот иначе просто замолкает.
   providers:
+    - base_url: https://api.tkbk.online/openai/v1
+      api_key_env: TKBK_API_KEY
+      model: gpt-6-sol
+      timeout_s: 60
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
       model: gemini-3.5-flash-lite
