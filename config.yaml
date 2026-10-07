@@ -332,12 +332,6 @@ bot:
   # Ключи здесь НЕ хранятся, только имя переменной окружения из ~/.hermes/.env.
   # На free tier цепочка обязательна: выбив лимит, бот иначе просто замолкает.
   providers:
-    # Пробный день: GPT-5.6 Terra через платный прокси (ключ в OPENAI_API_KEY).
-    # Шаг идёт 5–10 с, свой таймаут с запасом; при сбое — цепочка Gemini ниже.
-    - base_url: https://claude-n-codex.com:8443/v1
-      api_key_env: OPENAI_API_KEY
-      model: gpt-5.6-terra
-      timeout_s: 60
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
       model: gemini-3.5-flash-lite
