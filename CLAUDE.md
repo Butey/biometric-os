@@ -35,7 +35,6 @@
 - Code output must be copy-paste safe.
 
 ## Workflow
-- Work in the dev worktree `/opt/webapps/health_agent_dev` (branch `dev`), never in the live directory `/opt/webapps/health_agent_system`.
-- Commit to `dev`. Merge into `main` only on the user's explicit command.
-- "Merge" means: all checks green on `dev`, merge, restart bot and admin panel, verify both came up.
+- The `dev` branch and the dev worktree are abandoned (2026-10-07). Work and commit directly on `main` in `/opt/webapps/health_agent_system`.
+- All checks green before committing; after a change that affects the running bot, restart bot and admin panel and verify both came up, but only on the user's explicit command (a restart cuts an in-flight reply).
 - Tests never write to the live DB: set `HEALTH_DB` to a temp path before importing anything that pulls in `health_core.db`.
