@@ -632,6 +632,11 @@ async def _run_one(call: dict, dispatch: Callable[[str, dict], str]) -> str:
         # Модель сама прислала битый JSON в аргументах — отдаём ей ошибку как результат инструмента
         log.warning("битые arguments у tool_call %s: %r (%s)", name, raw_args, exc)
         return json.dumps({"error": f"не удалось разобрать arguments: {exc}"}, ensure_ascii=False)
+    # Модель (GPT) заполняет необязательные id нулями (water_id=0, user_id=0). Id в SQLite с 1,
+    # а 0 хендлеры читают как «id указан» и ищут запись #0 вместо «последней».
+    if isinstance(args, dict):
+        args = {k: v for k, v in args.items()
+                if not (k.endswith("_id") and v == 0 and not isinstance(v, bool))}
     try:
         result = await asyncio.to_thread(dispatch, name, args)
     except Exception as e:
@@ -1176,6 +1181,13 @@ if __name__ == "__main__":
         del os.environ["TEST_KEY_1"]
         del os.environ["TEST_KEY_2"]
         os.environ.pop("MULTI_KEYS", None)
+
+        seen: list = []
+        await _run_one({"function": {"name": "log_water", "arguments":
+                        '{"ml": 5, "water_id": 0, "user_id": 0, "clear_day": false, "food_log_id": 7}'}},
+                       lambda n, a: seen.append(a) or "{}")
+        assert seen == [{"ml": 5, "clear_day": False, "food_log_id": 7}], seen
+        print("OK: нулевые *_id от модели отбрасываются перед хендлером")
 
         print("=" * 60)
         print("ALL TESTS PASSED")
