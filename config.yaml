@@ -336,6 +336,12 @@ bot:
       api_key_env: TKBK_API_KEY
       model: gpt-6-sol
       timeout_s: 60
+    # Claude через тот же прокси: формат Anthropic Messages (bot/llm.py::_to_anthropic)
+    - base_url: https://api.tkbk.online/claude
+      api: anthropic
+      api_key_env: TKBK_API_KEY
+      model: claude-sonnet-5
+      timeout_s: 60
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
       model: gemini-3.5-flash-lite

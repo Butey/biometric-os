@@ -324,6 +324,95 @@ def _record_usage(model: str, body: dict) -> None:
         log.warning("не удалось записать llm_calls", exc_info=True)
 
 
+# --- Anthropic Messages API (provider.api == "anthropic") -------------------------
+# Остальная часть бота говорит на формате OpenAI chat/completions: переводим туда-обратно
+# на границе chat(), чтобы run_loop, история и тулы ничего не знали о втором формате.
+_ANTHROPIC_VERSION = "2023-06-01"
+
+
+def _anthropic_blocks(content: Any) -> list[dict]:
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    blocks = []
+    for part in content or []:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text" and part.get("text"):
+            blocks.append({"type": "text", "text": part["text"]})
+        elif part.get("type") == "image_url":
+            url = (part.get("image_url") or {}).get("url", "")
+            head, _, data = url.partition(",")
+            if head.startswith("data:") and ";base64" in head:
+                blocks.append({"type": "image", "source": {
+                    "type": "base64", "media_type": head[5:].split(";")[0], "data": data}})
+    return blocks
+
+
+def _to_anthropic(provider: dict, messages: list[dict], tools: list[dict] | None) -> tuple[str, dict]:
+    """(url, payload) запроса к Messages API из сообщений/тулов в формате OpenAI."""
+    system, out = [], []
+
+    def push(role: str, blocks: list[dict]) -> None:
+        if not blocks:
+            return
+        if out and out[-1]["role"] == role:   # tool_result-ы одного хода и соседние реплики — одним сообщением
+            out[-1]["content"].extend(blocks)
+        else:
+            out.append({"role": role, "content": list(blocks)})
+
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            system.append(m.get("content") or "")
+        elif role == "user":
+            push("user", _anthropic_blocks(m.get("content")))
+        elif role == "assistant":
+            blocks = _anthropic_blocks(m.get("content"))
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                blocks.append({"type": "tool_use", "id": tc.get("id"), "name": fn.get("name"),
+                               "input": args if isinstance(args, dict) else {}})
+            push("assistant", blocks)
+        elif role == "tool":
+            push("user", [{"type": "tool_result", "tool_use_id": m.get("tool_call_id"),
+                           "content": str(m.get("content") or "")}])
+
+    payload: dict[str, Any] = {"model": provider["model"], "messages": out,
+                               "max_tokens": provider.get("max_tokens", 4096)}
+    if system:
+        payload["system"] = "\n\n".join(system)
+    for k in ("temperature", "top_p"):
+        if k in provider:
+            payload[k] = provider[k]
+    if tools and not provider.get("disable_tools"):
+        payload["tools"] = [{"name": t["function"]["name"], "description": t["function"].get("description", ""),
+                             "input_schema": t["function"].get("parameters") or {"type": "object", "properties": {}}}
+                            for t in tools]
+        payload["tool_choice"] = {"type": "auto"}
+    return f"{provider['base_url'].rstrip('/')}/v1/messages", payload
+
+
+def _from_anthropic(body: dict) -> dict:
+    """Ответ Messages API -> тело в формате OpenAI chat/completions."""
+    text, calls = [], []
+    for b in body["content"]:
+        if b.get("type") == "text":
+            text.append(b.get("text", ""))
+        elif b.get("type") == "tool_use":
+            calls.append({"id": b["id"], "type": "function", "function": {
+                "name": b["name"], "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False)}})
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(text) or None}
+    if calls:
+        message["tool_calls"] = calls
+    u = body.get("usage") or {}
+    return {"choices": [{"message": message}],
+            "usage": {"prompt_tokens": u.get("input_tokens"), "completion_tokens": u.get("output_tokens")}}
+
+
 # Модели, реально ответившие в текущем ходе (бот кладёт сюда список перед run_loop):
 # по нему человеку сообщают, что основная модель не отвечала и ход вела запасная.
 USED_MODELS: contextvars.ContextVar[list | None] = contextvars.ContextVar("used_models", default=None)
@@ -396,6 +485,10 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
         elif not tools or disable_tools:
             payload.pop("tool_choice", None)
 
+        anthropic = provider.get("api") == "anthropic"
+        if anthropic:
+            url, payload = _to_anthropic(provider, clean_messages, tools)
+
         for key in ordered_keys:
             state = _get_key_state(key, model=scope)
             now = time.time()
@@ -411,9 +504,16 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                 "Authorization": f"Bearer {key}",
                 "Accept": "application/json",
             }
+            if anthropic:
+                headers["anthropic-version"] = _ANTHROPIC_VERSION
 
             try:
                 status, body = await _post(session, url, headers, payload, timeout_s=prov_timeout)
+                if anthropic and status == 200:
+                    try:
+                        body = _from_anthropic(body)
+                    except (KeyError, TypeError):
+                        pass  # битый ответ: ниже сработает штатная ветка «200, но битый ответ»
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 msg = f"{provider['model']} (key {_mask_key(key)}): сетевая ошибка/таймаут — {exc!r}"
                 log.warning(msg)
@@ -726,6 +826,43 @@ if __name__ == "__main__":
                 assert len(auth_seen) == 2, auth_seen
                 assert "key_alpha" in auth_seen[0] and "key_beta" in auth_seen[1], auth_seen
             print("OK: 2b) ротация ключей: первый ключ 429 -> второй ключ той же модели отработал успешно")
+
+            # --- 2c. Anthropic Messages: перевод запроса и ответа ---
+            _KEY_STATES.clear()
+            os.environ["ANTH_KEY"] = "key_anth"
+            anth_provider: list[Provider] = [
+                {"base_url": "https://anth.example/claude", "api_key_env": "ANTH_KEY", "model": "claude-x", "api": "anthropic"}
+            ]
+            anth_seen = {}
+
+            async def _post_anth(session, url, headers, payload, timeout_s=None):
+                anth_seen.update(url=url, headers=headers, payload=payload)
+                return 200, {"content": [{"type": "text", "text": "ок"},
+                                         {"type": "tool_use", "id": "tu1", "name": "log_water", "input": {"ml": 250}}],
+                             "usage": {"input_tokens": 7, "output_tokens": 3}}
+
+            anth_msgs = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "выпил"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{\"x\": 1}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "b", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+                {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+            ]
+            anth_tools = [{"type": "function", "function": {"name": "a", "description": "d", "parameters": {"type": "object"}}}]
+            with patch(__name__ + "._post", _post_anth):
+                m = await chat(session, anth_msgs, anth_tools, anth_provider)
+            pl = anth_seen["payload"]
+            assert anth_seen["url"] == "https://anth.example/claude/v1/messages", anth_seen["url"]
+            assert anth_seen["headers"]["anthropic-version"] and pl["system"] == "sys" and pl["max_tokens"] > 0, pl
+            assert [x["role"] for x in pl["messages"]] == ["user", "assistant", "user"], pl["messages"]
+            assert [b["type"] for b in pl["messages"][1]["content"]] == ["tool_use", "tool_use"], pl["messages"][1]
+            assert [b["tool_use_id"] for b in pl["messages"][2]["content"]] == ["c1", "c2"], pl["messages"][2]
+            assert pl["tools"][0]["input_schema"] == {"type": "object"} and pl["tool_choice"] == {"type": "auto"}, pl
+            assert m["content"] == "ок" and m["tool_calls"][0]["function"]["name"] == "log_water", m
+            assert json.loads(m["tool_calls"][0]["function"]["arguments"]) == {"ml": 250}, m
+            print("OK: 2c) Anthropic Messages: system/tool_use/tool_result и ответ переведены в формат OpenAI")
 
             # --- 3. все провайдеры упали -> RuntimeError с перечислением ---
             queue = [_resp(500, error={"error": "server1 down"}), _resp(503, error={"error": "server2 down"})]
@@ -1083,6 +1220,9 @@ async def check_balances(session: aiohttp.ClientSession, providers: list[Provide
             "messages": [{"role": "user", "content": "1"}],
             "max_tokens": 1
         }
+        if p.get("api") == "anthropic":
+            url, payload = _to_anthropic({**p, "max_tokens": 1}, payload["messages"], None)
+            headers["anthropic-version"] = _ANTHROPIC_VERSION
         try:
             status, body = await _post(session, url, headers, payload, timeout_s=10.0)
             if status == 200:
