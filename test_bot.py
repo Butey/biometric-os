@@ -386,6 +386,13 @@ def test_plan_talk_is_not_logged_as_eaten():
         main._PLAN_ONLY.set(False)
 
 
+def test_model_switch_note():
+    prov = [{"model": "a"}, {"model": "b"}]
+    assert main.model_switch_note(["a"], prov) == ""
+    assert main.model_switch_note([], prov) == ""
+    assert "a не ответила" in main.model_switch_note(["b"], prov)
+
+
 def test_admin_switch_model():
     admin_id = "900000001"
     out = main.run_command(admin_id, "/model")

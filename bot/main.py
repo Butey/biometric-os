@@ -211,6 +211,14 @@ _EATEN_RE = re.compile(
 _PLAN_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar("plan_only", default=False)
 
 
+def model_switch_note(used: list[str], providers: list[dict]) -> str:
+    """Пусто, если ход вела основная модель; иначе строка-предупреждение."""
+    primary = providers[0]["model"] if providers else None
+    if not used or primary in used:
+        return ""
+    return f"\n\n⚠️ Модель переключена: {primary} не ответила, ход вела {', '.join(used)}."
+
+
 def is_plan_only(text: str) -> bool:
     if _NEG_LOG_RE.search(text):
         return True
@@ -1473,6 +1481,8 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
     load_env_file()
     current_cfg = load_config()
     bot_cfg = current_cfg.get("bot", cfg.get("bot", {}))
+    used_models: list[str] = []
+    llm.USED_MODELS.set(used_models)
     try:
         answer, full = await llm.run_loop(
             session, prefix, tool_specs(), bot_cfg["providers"],
@@ -1488,7 +1498,7 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
 
     await asyncio.to_thread(_close_turn, uid, full[len(prefix):])
     await _flush_pending_notifications(message.bot)
-    await send_long(message, answer)
+    await send_long(message, answer + model_switch_note(used_models, bot_cfg["providers"]))
 
 
 async def handle_message(message: Message, session: aiohttp.ClientSession, cfg: dict) -> None:
@@ -1620,6 +1630,8 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
             log.warning("автосжатие истории не удалось: %s", e)
 
     prefix = await asyncio.to_thread(_open_turn, uid, text)
+    used_models: list[str] = []
+    llm.USED_MODELS.set(used_models)
     try:
         answer, full = await llm.run_loop(
             session, prefix, tool_specs(), bot_cfg["providers"],
@@ -1643,7 +1655,7 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
     # только после run_command, потому что модель зовёт этот тул из обычного
     # хода диалога, не только из слэш-команды.
     await _flush_pending_notifications(message.bot)
-    await send_long(message, answer)
+    await send_long(message, answer + model_switch_note(used_models, bot_cfg["providers"]))
 
 
 def _admin_port_busy(host: str, port: int) -> bool:

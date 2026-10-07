@@ -11,6 +11,7 @@
 - Стриминга нет: телеграм всё равно отдаёт сообщение целиком.
 """
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -323,6 +324,17 @@ def _record_usage(model: str, body: dict) -> None:
         log.warning("не удалось записать llm_calls", exc_info=True)
 
 
+# Модели, реально ответившие в текущем ходе (бот кладёт сюда список перед run_loop):
+# по нему человеку сообщают, что основная модель не отвечала и ход вела запасная.
+USED_MODELS: contextvars.ContextVar[list | None] = contextvars.ContextVar("used_models", default=None)
+
+
+def _note_used(model: str) -> None:
+    used = USED_MODELS.get()
+    if used is not None and model not in used:
+        used.append(model)
+
+
 async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict],
                 providers: list[Provider], timeout_s: float = DEFAULT_TIMEOUT_S) -> dict:
     """Идёт по providers по порядку, ротирует API-ключи для каждого провайдера,
@@ -424,6 +436,7 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                     failures.append(msg)
                     continue
                 await asyncio.to_thread(_record_usage, provider["model"], body)
+                _note_used(provider["model"])
                 return message
 
             # Обработка ошибок по ключу
@@ -485,6 +498,7 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                                 log.warning("%s (key %s): 200 на повторе, но битый ответ — %r", provider["model"], _mask_key(key), exc)
                             else:
                                 await asyncio.to_thread(_record_usage, provider["model"], retry_body)
+                                _note_used(provider["model"])
                                 return message
 
                 # Ошибка схемы/параметров (не поддерживаются tools или thinking) — переход к след. провайдеру
