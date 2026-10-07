@@ -2531,10 +2531,10 @@ def _monotone_cubic_spline(pts: list[float], num_samples: int) -> list[float]:
     return result
 
 
-def _line_chart(series: list[float], height: int = 3, width: int = 27) -> str:
-    """Гладкий аппроксимированный линейный график тренда веса для консоли пульта.
-    Использует монотонный кубический сплайн (PCHIP) и субпиксельные символы Брайля
-    (2x4 точки на символ), давая гладкую плавную кривую без угловатых прямоугольных ступеней.
+def _line_chart(series: list[float], height: int = 4, width: int = 27) -> str:
+    """Тренд веса для консоли пульта: непрерывная линия с заливкой снизу.
+    Сглаживание - монотонный кубический сплайн (PCHIP) на `width` колонок, высота
+    линии в колонке - в восьмых долях клетки (▁..█), под линией заливка ░.
     Вписывается в _CONSOLE_W (34 симв)."""
     if not series:
         return ""
@@ -2543,48 +2543,22 @@ def _line_chart(series: list[float], height: int = 3, width: int = 27) -> str:
 
     minimum = min(series)
     maximum = max(series)
-    interval = abs(maximum - minimum)
+    interval = maximum - minimum
     if interval < 1e-6:
         return f"{minimum:5.1f}┤" + "─" * width
 
-    sub_w = width * 2
-    sub_h = height * 4
-
-    samples = _monotone_cubic_spline(series, sub_w)
-
-    grid = [[False for _ in range(sub_w)] for _ in range(sub_h)]
-
-    pts = []
-    for x in range(sub_w):
-        val = samples[x]
-        y = int(round((maximum - val) / interval * (sub_h - 1)))
-        y = max(0, min(sub_h - 1, y))
-        pts.append((x, y))
-
-    for i in range(len(pts) - 1):
-        x0, y0 = pts[i]
-        x1, y1 = pts[i + 1]
-        grid[y0][x0] = True
-        grid[y1][x1] = True
-        dy = y1 - y0
-        if abs(dy) > 1:
-            step = 1 if dy > 0 else -1
-            for y in range(y0 + step, y1, step):
-                grid[y][x0] = True
+    levels = height * 8
+    samples = _monotone_cubic_spline(series, width)
+    # минимум не обнуляется: самая низкая колонка всё равно видна одной восьмой клетки
+    cols = [1 + round((v - minimum) / interval * (levels - 1)) for v in samples]
 
     lines = []
     for cy in range(height):
+        base = (height - 1 - cy) * 8   # уровни, лежащие ниже этой строки
         row = []
-        for cx in range(width):
-            code = 0
-            for col_idx in (0, 1):
-                sx = cx * 2 + col_idx
-                bit_map = [(0, 0x01), (1, 0x02), (2, 0x04), (3, 0x40)] if col_idx == 0 else [(0, 0x08), (1, 0x10), (2, 0x20), (3, 0x80)]
-                for row_idx, bit in bit_map:
-                    sy = cy * 4 + row_idx
-                    if sx < sub_w and sy < sub_h and grid[sy][sx]:
-                        code |= bit
-            row.append(" " if code == 0 else chr(0x2800 | code))
+        for h in cols:
+            k = h - base
+            row.append(" " if k <= 0 and h <= base else "░" if k > 8 else " ▁▂▃▄▅▆▇█"[k] if k > 0 else " ")
         if cy == 0:
             prefix = f"{maximum:5.1f}┤"
         elif cy == height - 1:

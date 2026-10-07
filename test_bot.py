@@ -1956,7 +1956,7 @@ def test_pantry_remove_unit_conversion():
         _water_rows(7808)
 
 def test_console_weight_line_chart():
-    """Тест линейного графика веса в пульте: проверка _line_chart и отсутствия блочных спарклайнов в секции ВЕС."""
+    """График веса в пульте: непрерывная линия с заливкой снизу (_line_chart)."""
     from plugin import tools
 
     assert tools._line_chart([]) == ""
@@ -1971,6 +1971,9 @@ def test_console_weight_line_chart():
     assert "114.9┤" in chart
     for line in chart.split("\n"):
         assert len(line) <= tools._CONSOLE_W, f"Строка графика длиннее {tools._CONSOLE_W}: {line!r}"
+    assert "░" in chart, "под линией должна быть заливка"
+    bottom = chart.split("\n")[-1]
+    assert " " not in bottom.partition("┤")[2], f"нижняя строка заливки не должна иметь разрывов: {bottom!r}"
 
     # Проверка вызова через get_day_summary(format='console')
     _water_user(7809)
@@ -1984,9 +1987,8 @@ def test_console_weight_line_chart():
         assert "② ВЕС 2 дн  82.0→80.5" in summary
         assert "82.0┤" in summary
         assert "80.5┤" in summary
-        # Проверяем, что в блоке веса нет блочной столбчатой диаграммы
         weight_section = summary.partition("② ВЕС")[2].partition("③")[0]
-        assert "█" not in weight_section and "▇" not in weight_section
+        assert "░" in weight_section, "заливка под линией в блоке веса"
     finally:
         conn.execute("DELETE FROM body_metrics WHERE user_id=7809")
         conn.execute("DELETE FROM daily_targets WHERE user_id=7809")
