@@ -202,6 +202,10 @@ def _norm_ts(value: str | None) -> str | None:
     if value is None:
         return None
     v = value.strip().replace("T", " ")
+    # Модель шлёт местные часы с угаданным суффиксом (+03:00 при поясе +05:00): цифры верные,
+    # суффикс шум. Переводим только настоящий UTC (Z / +00:00), остальные суффиксы отбрасываем.
+    if len(v) > 11 and _TS_OFFSET_RE.search(v[11:]) and not re.search(r"(Z|\+00(:?00)?)$", v[11:], re.IGNORECASE):
+        v = _TS_OFFSET_RE.sub("", v).rstrip()
     if len(v) > 11 and _TS_OFFSET_RE.search(v[11:]):
         name = config._TZ.get()
         try:
@@ -7796,6 +7800,9 @@ if __name__ == "__main__":
         try:
             assert _norm_ts("2026-09-20T08:00:00Z") == "2026-09-20 11:00:00"
             assert _norm_ts("2026-09-20 08:00:00+03:00") == "2026-09-20 08:00:00"
+            assert _norm_ts("2026-09-20T08:40:00+03:00") == "2026-09-20 08:40:00"
+            assert _norm_ts("2026-09-20T08:40:00-05:00") == "2026-09-20 08:40:00"
+            assert _norm_ts("2026-09-20T08:00:00+00:00") == "2026-09-20 11:00:00"
             assert _norm_ts("2026-09-20") == "2026-09-20 00:00:00"
         finally:
             config.set_tz(None)
