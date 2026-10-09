@@ -89,6 +89,18 @@ load.cache_clear = lambda: None
 _TZ: ContextVar[str | None] = ContextVar("health_user_tz", default=None)
 
 
+# Текст текущей реплики человека: по нему инструменты решают, называл ли он время события.
+_USER_TEXT: ContextVar[str | None] = ContextVar("health_user_text", default=None)
+
+
+def set_user_text(text: str | None) -> None:
+    _USER_TEXT.set(text)
+
+
+def user_text() -> str | None:
+    return _USER_TEXT.get()
+
+
 def set_tz(name: str | None) -> None:
     """Вызывается один раз на входящее сообщение, до исполнения инструментов."""
     _TZ.set(name or None)

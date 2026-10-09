@@ -1496,6 +1496,7 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
     # Use _open_turn_vision with special image content
     registry.set_caller(uid)
     _PLAN_ONLY.set(False)
+    config.set_user_text(caption or "")
     prefix = await asyncio.to_thread(_open_turn_vision, uid, content, caption or "[фото]")
 
     load_env_file()
@@ -1656,6 +1657,7 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
         except RuntimeError as e:
             log.warning("автосжатие истории не удалось: %s", e)
 
+    config.set_user_text(text)
     prefix = await asyncio.to_thread(_open_turn, uid, text)
     used_models: list[str] = []
     llm.USED_MODELS.set(used_models)

@@ -290,11 +290,25 @@ def _today_iso(conn: sqlite3.Connection | None = None, user_id: int | None = Non
     return config.local_now().date().isoformat()
 
 
+_TIME_HINT_RE = re.compile(r"\d{1,2}[:.]\d{2}|\b(?:в|к|с|около|после)\s+\d{1,2}\b|\d{1,2}\s+(?:январ|феврал|март|апрел|ма[яй]|июн|июл|август|сентябр|октябр|ноябр|декабр)|назад|вчера|позавчера|утр|вечер|ноч|днём|днем|полдень|полночь", re.IGNORECASE)
+
+
+def _drop_unnamed_ts(raw: str | None) -> str | None:
+    """Модель подставляет at из прошлых вызовов и истории (вода утром легла во вчера).
+    Реплика человека известна и в ней нет ни цифр, ни слов о времени - значит, время не называлось:
+    метку отбрасываем, код возьмёт «сейчас» по поясу человека. Вне диалога (cron, CLI) текста нет - не трогаем."""
+    text = config.user_text()
+    if raw and text is not None and not _TIME_HINT_RE.search(text):
+        return None
+    return raw
+
+
 def _fix_event_ts(raw: str | None, conn, user_id: int) -> str:
     """Нормализует метку события: исправляет устаревший год (2024/2025 → текущий),
     затем вызывает _norm_event_ts. Бросает ValueError если метка невалидна.
     Используется во всех инструментах, принимающих «at»/«measured_at» события.
     В handle_log_food логика дублируется напрямую ради разрыва зависимости с eaten_at."""
+    raw = _drop_unnamed_ts(raw)
     if raw:
         today = _today_iso(conn, user_id)
         if _year_is_stale(raw, today):
@@ -505,7 +519,7 @@ def handle_log_food(params: dict) -> str:
     items = params.get("items") or []
     meal_slot = params.get("meal_slot")
 
-    raw_eaten = params.get("eaten_at")
+    raw_eaten = _drop_unnamed_ts(params.get("eaten_at"))
     if raw_eaten:
         cur_year = str(config.user_now(conn, user_id).year)
         if _year_is_stale(raw_eaten, _today_iso(conn, user_id)):

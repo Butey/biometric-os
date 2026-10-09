@@ -1787,6 +1787,25 @@ def test_failure_after_commit_is_saved_with_warning():
     assert "error" not in out, f"сохранённая запись не должна быть ошибкой: {out}"
 
 
+def test_unnamed_time_ignores_model_at():
+    """Человек времени не называл, модель подставила at из прошлых вызовов: пишем «сейчас»."""
+    from health_core import config
+    _water_user(7802)
+    try:
+        config.set_user_text("выпил 500 мл воды")
+        a = json.loads(registry.dispatch("log_water", {"ml": 500, "at": "2026-10-08 22:11:00"}))
+        config.set_user_text("выпил 500 мл в 9:30")
+        b = json.loads(registry.dispatch("log_water", {"ml": 500, "at": "2026-10-08 09:30:00"}))
+    finally:
+        config.set_user_text(None)
+    conn = connect()
+    ats = [r["at"] for r in conn.execute("SELECT at FROM water_log WHERE user_id=7802 ORDER BY id")]
+    conn.close()
+    _water_rows(7802)
+    assert ats[0][:10] == config.local_today() and ats[0] != "2026-10-08 22:11:00", ats
+    assert ats[1] == "2026-10-08 09:30:00", ats
+
+
 def test_failure_before_commit_stays_error():
     from bot.registry import _tools
     _water_user(7802)
