@@ -160,8 +160,16 @@ def save_days(conn, user_id: int, days: list, source: str = "watch") -> dict:
         })
     conn.commit()
 
-    max_hr_update = _maybe_raise_max(conn, user_id)
-    return {"days": results, "max_hr_update": max_hr_update}
+    saved = sum("action" in row for row in results)
+    rejected = len(results) - saved
+    out = {"days": results, "saved_days": saved, "rejected_days": rejected,
+           "max_hr_update": _maybe_raise_max(conn, user_id) if saved else None}
+    if not saved:
+        out["error"] = "Ни один день не сохранён: проверь ошибки в days"
+    elif rejected:
+        out["saved"] = True
+        out["warning"] = "Часть дней отклонена; не повторяй сохранённые дни, исправь только дни с error"
+    return out
 
 
 def list_days(conn, user_id: int, limit: int = 30, since_days: int | None = None) -> list[dict]:

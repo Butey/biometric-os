@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1685,9 +1686,9 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
             providers = list((load_config().get("bot") or {}).get("providers", []))
             try:
                 await message.answer(await _compact_history(session, uid, providers))
-            except RuntimeError as e:
+            except (RuntimeError, ValueError, OSError, sqlite3.Error) as e:
                 log.error("compact не удался: %s", e)
-                await message.answer("Не смог сжать историю: модель недоступна. Попробуй позже.")
+                await message.answer("Не удалось безопасно сжать историю. Исходные сообщения сохранены; можно продолжать разговор.")
             return
 
         # Хендлеры команд синхронные и лезут в sqlite — в поток, чтобы не
@@ -1702,6 +1703,25 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
     fast = _FAST_REPLIES.get(text.strip().lower())
     if fast:
         answer = _plain(await asyncio.to_thread(registry.dispatch, *fast))
+        await send_long(message, answer)
+        return
+
+    water = re.fullmatch(r"(?:(?:выпил[а]?|ещ[её])\s+)?\+?\s*(\d+(?:[.,]\d+)?)\s*(мл|л)\s+вод[уы][.!]?", text, re.IGNORECASE)
+    if water:
+        ml = float(water[1].replace(",", ".")) * (1000 if water[2].lower() == "л" else 1)
+        config.set_user_text(text)
+        result = json.loads(await asyncio.to_thread(registry.dispatch, "log_water", {"ml": ml}))
+        if result.get("error"):
+            answer = "Воду не удалось записать: " + str(result["error"])
+        elif result.get("warning"):
+            answer = "Вода сохранена, но сводку обновить не удалось. Проверьте журнал перед повторной записью."
+        else:
+            answer = f"Записал воду: {ml:g} мл."
+            if result.get("water_ml") is not None:
+                answer += f" За день {result['water_ml'] / 1000:g} л."
+        await asyncio.to_thread(_close_turn, uid, [
+            {"role": "user", "content": text}, {"role": "assistant", "content": answer},
+        ])
         await send_long(message, answer)
         return
 
@@ -1723,7 +1743,7 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
     if await asyncio.to_thread(_rows) > bot_cfg.get("compact_rows", 80):
         try:
             await _compact_history(session, uid, bot_cfg["providers"])
-        except RuntimeError as e:
+        except (RuntimeError, ValueError, OSError, sqlite3.Error) as e:
             log.warning("автосжатие истории не удалось: %s", e)
 
     config.set_user_text(text)

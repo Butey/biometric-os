@@ -1039,6 +1039,8 @@ if __name__ == "__main__":
             )
 
         tdee = 2614.0
+        # Фикстура сценариев ниже не зависит от изменяемого рабочего config.yaml.
+        load()["policy"].update(fat_share_fat=0.3, fat_share_fat_proven=0.4)
         conn.execute("UPDATE users SET sex='m' WHERE id=?", (uid,))
 
         # 1) мужчина 118.7 кг / 33.3% жира, доля мышц не доказана -> жирный
@@ -1176,11 +1178,11 @@ if __name__ == "__main__":
             )
         conn.commit()
 
-        # плана хватает — дефицит успевает в срок (40 дней)
+        # плана хватает — дефицит успевает в срок (60 дней)
         conn.execute("DELETE FROM milestones WHERE user_id=?", (uid,))
         conn.execute(
             "INSERT INTO milestones(user_id, name, metric, threshold, deadline) VALUES (?, 'dv-loose', 'weight_kg', 92, ?)",
-            (uid, (today + timedelta(days=40)).isoformat()),
+            (uid, (today + timedelta(days=60)).isoformat()),
         )
         conn.commit()
         v_ok = deadline_verdict(conn, uid, today.isoformat())
@@ -1251,7 +1253,7 @@ if __name__ == "__main__":
         factor_de = load()["policy"].get("activity_factor") or 1.0
 
         # 1) полный лог (14/14), часов нет -> adaptive 0.6 + activity_factor 0.4 (§1 бита ADR 0004)
-        for days_ago in range(13, -1, -1):
+        for days_ago in range(14, 0, -1):
             _add_food_day(uid, (today - timedelta(days=days_ago)).isoformat(), 2600)
         conn.commit()
         exp1 = daily_expenditure(conn, uid, de_date)
@@ -1308,7 +1310,7 @@ if __name__ == "__main__":
 
         # 3) всего 3 залогированных дня -> адаптивная часть недоступна (порог blend_min_logged_days=4), 0.5/0.5
         conn.execute("DELETE FROM food_log WHERE user_id=?", (uid,))
-        for days_ago in range(2, -1, -1):
+        for days_ago in range(3, 0, -1):
             _add_food_day(uid, (today - timedelta(days=days_ago)).isoformat(), 2600)
         conn.commit()
         exp3 = daily_expenditure(conn, uid, de_date)

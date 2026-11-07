@@ -236,14 +236,17 @@ def remember(conn, user_id: int, name: str, *, source: str, off_code=None,
         if not math.isfinite(value) or not 0 <= value <= (1000 if i == 0 else 100):
             raise ValueError("Недопустимый состав на 100 г: ккал 0..1000, нутриенты 0..100; NaN/Infinity запрещены")
         values[i] = value
-    kcal_100g, protein_100g, fat_100g, carbs_100g, fiber_100g = values
-    if sum(v or 0 for v in values[1:4]) > 105:
-        raise ValueError("Сумма белков, жиров и углеводов превышает 100 г с допуском округления: проверь этикетку")
     previous = conn.execute(
         "SELECT * FROM my_products WHERE user_id=? AND name_key=?", (user_id, key)
     ).fetchone()
+    if previous:
+        values = [value if value is not None else previous[column] for value, column in zip(
+            values, ("kcal_100g", "protein_100g", "fat_100g", "carbs_100g", "fiber_100g"))]
+    kcal_100g, protein_100g, fat_100g, carbs_100g, fiber_100g = values
+    if sum(v or 0 for v in values[1:4]) > 105:
+        raise ValueError("Сумма белков, жиров и углеводов превышает 100 г с допуском округления: проверь этикетку")
     if (previous and source == previous["source"] == "label" and previous["kcal_100g"]
-            and abs(kcal_100g - previous["kcal_100g"]) > max(100, previous["kcal_100g"] * .5)):
+            and abs(kcal_100g - previous["kcal_100g"]) > max(100, previous["kcal_100g"] * 0.5)):
         raise ValueError(
             "Новая этикетка резко отличается от сохранённой; прежний состав не изменён. "
             "Проверь распознавание и название: другой продукт сохрани под точным названием. "

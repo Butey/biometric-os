@@ -456,7 +456,7 @@ def test_reasoning_only_final_response_is_not_published():
             answer, full = asyncio.run(llm.run_loop(
                 None, [{"role": "user", "content": "Почему вес стоит?"}],
                 [], PROVIDERS, lambda name, args: "{}"))
-        assert answer == "", (field, answer)
+        assert "Модель не подготовила ответ" in answer and "Внутренняя гипотеза" not in answer, (field, answer)
         assert field not in full[-1], full[-1]
 
 
@@ -2983,6 +2983,8 @@ def test_review_product_validation_and_label_conflict():
         assert foods.find_mine(conn, 1, 'сыр')['kcal_100g'] == 345
         foods.remember(conn, 1, 'сыр', source='label', kcal_100g=350, protein_100g=26, fat_100g=27, carbs_100g=0)
         assert foods.find_mine(conn, 1, 'сыр')['kcal_100g'] == 350
+        foods.remember(conn, 1, 'сыр', source='label', kcal_100g=351)
+        assert foods.find_mine(conn, 1, 'сыр')['fat_100g'] == 27
     finally:
         conn.close()
 
@@ -2997,10 +2999,13 @@ def test_review_watch_partial_updates_validate_merged_record():
             watch.save_days(conn, 1, [{'date': '2026-11-01', 'hr_min': 55, 'hr_avg': 70, 'hr_max': 120, 'steps': 5000, 'spo2_min': 95, 'spo2_avg': 97}])
             bad = watch.save_days(conn, 1, [{'date': '2026-11-01', 'hr_min': 101}, {'date': '2026-11-01', 'spo2_avg': 90}])
             assert all('error' in r for r in bad['days']), bad
+            assert bad['saved_days'] == 0 and 'error' in bad, bad
             row = conn.execute('SELECT * FROM daily_watch').fetchone()
             assert row['hr_min'] == 55 and row['spo2_avg'] == 97, dict(row)
             good = watch.save_days(conn, 1, [{'date': '2026-11-01', 'steps': 6000}])
             assert good['days'][0]['action'] == 'replaced', good
+            mixed = watch.save_days(conn, 1, [{'date':'2026-11-01','hr_min':101}, {'date':'2026-11-03','steps':6000}])
+            assert mixed['saved_days'] == mixed['rejected_days'] == 1 and 'error' not in mixed, mixed
             # Старая противоречивая запись не должна создавать ложный тренд пульса.
             conn.execute("INSERT INTO daily_watch(user_id,date,hr_min,hr_avg,hr_max,created_at) VALUES(1,'2026-11-02',101,86,114,'2026-11-02')")
             trend = watch.trend_block(conn, 1)
@@ -3106,6 +3111,92 @@ def test_review_query_metrics_keeps_timestamp_and_excludes_future():
         assert result['data'][0]['measured_at'] == '2026-11-05 09:09:19', result
     finally:
         conn.execute('DELETE FROM body_metrics WHERE user_id=?',(uid,))
+        conn.commit()
+        conn.close()
+        _water_rows(uid)
+
+
+def test_review_my_product_uses_saved_macros_and_confirms_actual_source():
+    from health_core import foods
+    uid = 7822
+    _water_user(uid)
+    conn = connect()
+    try:
+        foods.remember(conn, uid, 'Тестовый хлеб', source='label', kcal_100g=210, protein_100g=7, fat_100g=1.5, carbs_100g=42, fiber_100g=5)
+        retained = json.loads(registry.dispatch('food_lookup', {'action':'remember','name':'Тестовый хлеб','source':'estimate','kcal_100g':100}))
+        assert retained['product']['source'] == 'label' and retained['product']['kcal_100g'] == 210, retained
+        result = json.loads(registry.dispatch('log_food', {'items':[{
+            'name':'Тестовый хлеб','grams':50,'source':'my_product','kcal':1,'fiber_g':99,
+            'per_100g':{'kcal':2,'protein_g':1,'fat_g':1,'carbs_g':1}}]}))
+        assert 'error' not in result, result
+        row = conn.execute('SELECT fi.* FROM food_items fi JOIN food_log fl ON fi.food_log_id=fl.id WHERE fl.user_id=?',(uid,)).fetchone()
+        assert row['kcal'] == 105 and row['protein_g'] == 3.5 and row['fiber_g'] == 2.5, dict(row)
+    finally:
+        conn.execute('DELETE FROM food_items WHERE food_log_id IN (SELECT id FROM food_log WHERE user_id=?)',(uid,))
+        conn.execute('DELETE FROM food_log WHERE user_id=?',(uid,))
+        conn.execute('DELETE FROM my_products WHERE user_id=?',(uid,))
+        conn.commit()
+        conn.close()
+        _water_rows(uid)
+
+
+def test_review_simple_water_is_recorded_without_model_but_questions_are_not():
+    from types import SimpleNamespace
+    from unittest.mock import patch, AsyncMock
+    uid = 7823
+    _water_user(uid)
+    message = SimpleNamespace(bot=object())
+    model = AsyncMock(return_value=('Уточнение', []))
+    try:
+        with patch.object(llm, 'run_loop', model), patch.object(main, 'send_long', AsyncMock()), \
+             patch.object(main, 'load_env_file'), patch.object(main, 'load_config', return_value={'bot':{'providers':PROVIDERS,'compact_rows':1000}}), \
+             patch.object(main, '_flush_pending_council', AsyncMock()), patch.object(main, '_flush_pending_notifications', AsyncMock()):
+            for text in ['+650мл воды', 'Выпил 0,5 л воды', 'ещё +200 мл воды']:
+                asyncio.run(main._handle_turn(message, None, {}, str(uid), text))
+            model.assert_not_awaited()
+            conn = connect()
+            row = conn.execute('SELECT count(*),sum(volume_ml) FROM water_log WHERE user_id=?',(uid,)).fetchone()
+            conn.close()
+            assert tuple(row) == (3,1350), tuple(row)
+            for text in ['Можно выпить 650 мл воды?', 'Вчера выпил 650 мл воды']:
+                asyncio.run(main._handle_turn(message, None, {}, str(uid), text))
+            assert model.await_count == 2
+            conn = connect()
+            assert conn.execute('SELECT count(*) FROM water_log WHERE user_id=?',(uid,)).fetchone()[0] == 3
+            conn.close()
+    finally:
+        conn = connect()
+        conn.execute('DELETE FROM chat_history WHERE telegram_user_id=?',(str(uid),))
+        conn.commit()
+        conn.close()
+        _water_rows(uid)
+
+
+def test_review_bad_compaction_does_not_drop_new_message():
+    from types import SimpleNamespace
+    from unittest.mock import patch, AsyncMock
+    uid = 7824
+    _water_user(uid)
+    conn = connect()
+    history.append(conn, str(uid), {'role':'user','content':'Предыдущая реплика'})
+    conn.close()
+    try:
+        for failure in [ValueError('посторонняя роль'), OSError('архив недоступен')]:
+            with patch.object(main, '_compact_history', AsyncMock(side_effect=failure)), \
+                 patch.object(llm, 'run_loop', AsyncMock(return_value=('Ответ получен', []))) as model, \
+                 patch.object(main, 'send_long', AsyncMock()) as send, patch.object(main, 'load_env_file'), \
+                 patch.object(main, 'load_config', return_value={'bot':{'providers':PROVIDERS,'compact_rows':0}}), \
+                 patch.object(main, '_flush_pending_council', AsyncMock()), patch.object(main, '_flush_pending_notifications', AsyncMock()):
+                asyncio.run(main._handle_turn(SimpleNamespace(bot=object()), None, {}, str(uid), 'Продолжим разговор'))
+                model.assert_awaited_once()
+                assert send.call_args.args[1] == 'Ответ получен', send.call_args
+        conn = connect()
+        messages = [json.loads(r[0])['content'] for r in conn.execute('SELECT content FROM chat_history WHERE telegram_user_id=?',(str(uid),))]
+        conn.close()
+        assert 'Предыдущая реплика' in messages and messages.count('Продолжим разговор') == 2, messages
+    finally:
+        conn = connect()
+        conn.execute('DELETE FROM chat_history WHERE telegram_user_id=?',(str(uid),))
         conn.commit()
         conn.close()
         _water_rows(uid)

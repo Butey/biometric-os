@@ -707,7 +707,12 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
         if not tool_calls:
             # reasoning — внутреннее поле провайдера, а не ответ человеку.
             # Пустой content остаётся пустым даже при наличии reasoning.
-            return message.get("content") or "", messages
+            answer = message.get("content") or ""
+            if not answer.strip():
+                answer = ("Модель не подготовила ответ. Перед повтором записи проверьте журнал: "
+                          "часть действий могла выполниться.")
+                messages[-1]["content"] = answer
+            return answer, messages
 
         results = []
         for call in tool_calls:
@@ -964,7 +969,7 @@ if __name__ == "__main__":
             print("OK: 6) max_iters обрывает зацикливание и возвращает строку, а не виснет")
 
             # --- 7. reasoning с промежуточного хода tool_calls не протекает в
-            # легитимно пустой финальный ответ (утечка chain-of-thought) ---
+            # уведомление о пустом финальном ответе (утечка chain-of-thought) ---
             queue = [
                 _resp(200, _msg(content=None, reasoning_content="думаю над вызовом...", tool_calls=[tc])),
                 _resp(200, _msg(content="")),  # финал: пусто, без reasoning
@@ -972,8 +977,9 @@ if __name__ == "__main__":
             with patch(__name__ + "._post", _post_ok):
                 text, msgs = await run_loop(session, [{"role": "user", "content": "запиши"}], [{"type": "function"}],
                                              PROVIDERS, _dispatch_ok)
-                assert text == "", f"reasoning с прошлого хода протёк в ответ: {text!r}"
-            print("OK: 7) reasoning промежуточного хода не протекает в пустой финальный ответ")
+                assert "Модель не подготовила ответ" in text and "думаю" not in text, text
+                assert msgs[-1]["content"] == text, msgs[-1]
+            print("OK: 7) пустой финал заменён уведомлением, reasoning не раскрывается")
 
             # --- 8. устаревший снимок healthy_keys не обрывает провайдера
             # раньше времени: оба изначально здоровых ключа 429 в рамках

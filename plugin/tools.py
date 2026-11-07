@@ -582,6 +582,20 @@ def handle_log_food(params: dict) -> str:
             else:
                 src = "estimate"
             i["source"] = src
+        if src == "my_product":
+            from health_core import foods as _foods
+            product = _foods.find_mine(conn, user_id, i["name"])
+            if product is None or i.get("grams") is None:
+                conn.close()
+                return json.dumps({"error": f"{i['name']}: my_product требует сохранённый продукт и grams/pieces; проверь food_lookup match"}, ensure_ascii=False)
+            per100 = {name: product[column] for name, column in (
+                ("kcal", "kcal_100g"), ("protein_g", "protein_100g"),
+                ("fat_g", "fat_100g"), ("carbs_g", "carbs_100g"), ("fiber_g", "fiber_100g"))}
+            if any(per100[name] is None for name in ("kcal", "protein_g", "fat_g", "carbs_g")):
+                conn.close()
+                return json.dumps({"error": f"{i['name']}: сохранённый состав неполон; уточни этикетку или явно используй source=estimate, не подставляй нули"}, ensure_ascii=False)
+            # Цифры сохранённого продукта не должны зависеть от пересказа модели.
+            i["kcal"] = i["fiber_g"] = None
         # Модель (GPT) заполняет необязательные поля нулями: per_100g из нулей
         # затирал присланный kcal нулём. Но per100.kcal==0 — легитимное
         # значение для реального продукта (вода, чёрный кофе) из food_lookup:
