@@ -25,7 +25,7 @@ from health_core.db import connect, migrate, get_target_users
 from health_core.report import evening_report
 from health_core import council_data
 from bot import council as bot_council
-from admin.auth import load_env_file
+from health_core.environment import load_env_file
 import notify  # рядом лежащий скрипт (scripts/), тот же способ доставки, что и у него
 
 

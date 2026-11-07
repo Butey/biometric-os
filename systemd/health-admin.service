@@ -3,13 +3,13 @@
 # (EnvironmentFile, алерт о сбое через OnFailure= и ExecStopPost=).
 #
 # Установка (от root, подробности в DEPLOY.md):
-#   cp health-admin.service /etc/systemd/system/
+#   cp systemd/health-admin.service /etc/systemd/system/
 #   systemctl daemon-reload
 #   systemctl enable --now health-admin.service
 #
 # Пароль администратора (один раз, до первого запуска):
 #   python -m admin.server --set-password
-#   # две выведенные строки вручную добавить в /root/.hermes/.env:
+#   # две выведенные строки вручную добавить в /opt/webapps/health_agent_system/.env:
 #   #   ADMIN_PASSWORD_HASH=...
 #   #   ADMIN_PASSWORD_SALT=...
 #
@@ -38,11 +38,11 @@ RestartSec=10
 
 # User= не указывается: юнит системный, исполняется от root.
 
-EnvironmentFile=%h/.hermes/.env
+EnvironmentFile=/opt/webapps/health_agent_system/.env
 ExecStopPost=-/bin/sh -c '[ "$$SERVICE_RESULT" = success ] || systemctl start --no-block health-alert@%n.service'
 
 # ЗАМЕНИТЬ на реальный путь клона репозитория на VPS (тот же PROJECT_DIR,
-# что передавался в install.sh) — admin/ и plugin/ не копируются в ~/.hermes,
+# что передавался в install.sh) — admin/ и plugin/ находятся в проекте,
 # они запускаются прямо из чекаута.
 WorkingDirectory=/opt/webapps/health_agent_system
 ExecStart=/opt/webapps/health_agent_system/.venv/bin/python -m admin.server --host 127.0.0.1 --port 8765

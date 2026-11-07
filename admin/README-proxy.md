@@ -21,7 +21,7 @@ Once a proxy terminates TLS in front of the app:
 
 1. Keep `admin/server.py` bound to `127.0.0.1` (the proxy is the only thing
    that should reach it directly).
-2. Set `ADMIN_BEHIND_TLS=1` in `~/.hermes/.env` — this does two things:
+2. Set `ADMIN_BEHIND_TLS=1` in `.env` — this does two things:
    - the session cookie gets the `Secure` flag (see `admin/server.py::_make_cookie`)
    - `X-Forwarded-For` is trusted (last hop only) for rate-limiting by real client IP
 3. Restart `health-admin.service` after changing `.env`.
@@ -40,7 +40,7 @@ an ssh tunnel.
 2. The code, valid for 5 minutes. 5 wrong codes or expiry mean starting over
    from the password. A new code is not sent while a live one is pending.
 
-Needed in `~/.hermes/.env`:
+Needed in `.env`:
 
 - `TELEGRAM_BOT_TOKEN` - the same bot token the bot uses
 - `HEALTH_ADMIN_IDS` - comma-separated Telegram ids that receive the codes

@@ -1,10 +1,4 @@
-"""Реестр инструментов для собственного цикла агента (замена Hermes).
-
-plugin/tools.py и plugin/schemas.py — чужая, неприкасаемая территория (их
-контракт — register(ctx), больше ничего). Мы наполняем TOOLS через тот же
-register(), подсунув ему ctx-шим с register_tool/register_hook/register_command —
-образец такого шима уже есть в самотестах plugin/tools.py:3362, повторяем его
-дословно, а не изобретаем свой протокол.
+"""Локальный реестр: plugin.tools.register(ctx), описания и диспетчеризация.
 """
 import json
 import threading
@@ -17,7 +11,7 @@ TOOLS: dict[str, dict] = {}
 
 # @_handler_wrapper в plugin/tools.py не использует functools.wraps, поэтому
 # __doc__ хендлеров теряется — модели нечем объяснить, зачем нужен инструмент.
-# Список сверяется в самопроверке с provides_tools из plugin/plugin.yaml (24 шт).
+# Список сверяется в самопроверке с зарегистрированными инструментами.
 DESCRIPTIONS = {
     "log_food": "Записать приём пищи: блюда с ккал/БЖУ от модели, либо grams + per_100g (из food_lookup) + source — тогда КБЖУ считает код. Также action=delete по food_log_id.",
     "food_lookup": "Состав продукта по названию: match — найти СВОЙ сохранённый продукт; search — до 5 кандидатов из Open Food Facts; remember — сохранить/обновить свой продукт (off_code сам подтянет состав, либо числа на 100 г); list — свои продукты; forget — убрать.",
@@ -139,8 +133,7 @@ def release_connections() -> None:
     соединение остаётся с открытой пишущей транзакцией, а поток-исполнитель
     держит на него ссылку до следующей задачи. В WAL один писатель блокирует
     остальных: следующий человек получает "database is locked" на пять секунд
-    и отказ. В одном пользователе под Hermes это не всплывало, в многопользо-
-    вательском боте всплывёт обязательно.
+    и отказ. В многопользовательском боте утечка соединения блокирует другие записи.
 
     Чиним в шве, который принадлежит нам: 24 хендлера в plugin/tools.py не
     трогаем, а после каждого вызова откатываем и закрываем всё, что он открыл.
@@ -173,8 +166,7 @@ def dispatch(name: str, args: dict) -> str:
 
 def set_caller(telegram_id: str) -> None:
     """Пишем в тот же ContextVar, который plugin.tools._caller_telegram_id()
-    читает как fallback, когда gateway.session_context недоступен (мы и есть
-    этот случай — Hermes ушёл).
+    читает как единственный источник личности текущего пользователя.
 
     Заодно выставляем часовой пояс этого человека: от него зависит граница
     суток, а значит и то, в какой день лягут еда и вода. Без этого запись,
@@ -220,7 +212,7 @@ if __name__ == "__main__":
 
     # health_core.db.DB_PATH — модульная константа, посчитанная один раз при
     # импорте; plugin.tools уже успел импортировать connect/migrate с дефолтным
-    # путём (~/.hermes/health.db). reload() переисполняет health_core/db.py В
+    # путём (<проект>/health.db). reload() переисполняет health_core/db.py В
     # ТОМ ЖЕ __dict__ модуля, поэтому старые connect/migrate (уже привязанные в
     # plugin.tools) продолжают смотреть на этот же namespace и увидят новый
     # DB_PATH — ровно тот же приём, что в самопроверке plugin/tools.py.
@@ -267,7 +259,7 @@ if __name__ == "__main__":
     assert registered == expected_tools, (
         f"не хватает: {expected_tools - registered}, лишние: {registered - expected_tools}")
     assert len(TOOLS) == len(expected_tools), f"ожидалось {len(expected_tools)} инструментов, получили {len(TOOLS)}"
-    print(f"OK: зарегистрировано {len(TOOLS)} инструментов, имена совпадают с plugin.yaml")
+    print(f"OK: зарегистрировано {len(TOOLS)} инструментов, имена соответствуют реестру")
 
     for name in TOOLS:
         assert DESCRIPTIONS.get(name), f"{name}: пустое описание в DESCRIPTIONS"

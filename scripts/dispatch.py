@@ -77,7 +77,7 @@ def main() -> int:
         notify.load_env_file()
         token = os.environ.get("TELEGRAM_BOT_TOKEN")
         if not token:
-            print("TELEGRAM_BOT_TOKEN не задан (~/.hermes/.env)", file=sys.stderr)
+            print("TELEGRAM_BOT_TOKEN не задан (.env)", file=sys.stderr)
             return 1
 
     cfg = load().get("schedule", {})

@@ -1,6 +1,6 @@
 """Stdlib-only admin HTTP server: http.server.ThreadingHTTPServer + one
 BaseHTTPRequestHandler. No Flask/FastAPI/uvicorn/jinja2 — the VPS has 1 GB RAM
-and Hermes already eats 250-400 MB; html is admin/pages.py f-strings.
+and the bot shares its memory budget; html is admin/pages.py f-strings.
 
 Binds 127.0.0.1 by default. Normal access is an ssh tunnel:
 
@@ -205,7 +205,7 @@ def _run_historical_import(conn, user_id: int) -> str:
     if not (scale_path or tcx_dir or anthro_path):
         return (
             "Исторический импорт не настроен: задайте HEALTH_SCALE_IMPORT_PATH / "
-            "HEALTH_TCX_IMPORT_DIR / HEALTH_ANTHRO_IMPORT_PATH в ~/.hermes/.env"
+            "HEALTH_TCX_IMPORT_DIR / HEALTH_ANTHRO_IMPORT_PATH в .env"
         )
     import migrate as _migrate_mod  # существующий скрипт репозитория — переиспользуем как есть, не дублируем
 
@@ -1863,7 +1863,7 @@ def _refuse_exposed_bind(host: str) -> None:
 
 def _cmd_set_password() -> int:
     print("Установка пароля администратора. Эта команда НИКОГДА не пишет пароль на диск —")
-    print("две строки ниже нужно вручную добавить в ~/.hermes/.env.\n")
+    print("две строки ниже нужно вручную добавить в .env.\n")
     pw1 = getpass.getpass(f"Пароль (минимум {auth.MIN_PASSWORD_LEN} символов): ")
     if len(pw1) < auth.MIN_PASSWORD_LEN:
         print(f"Ошибка: пароль короче {auth.MIN_PASSWORD_LEN} символов.", file=sys.stderr)
@@ -1874,7 +1874,7 @@ def _cmd_set_password() -> int:
         return 1
     salt = auth.gen_salt()
     digest = auth.hash_password(pw1, salt)
-    print("\nДобавьте в ~/.hermes/.env:\n")
+    print("\nДобавьте в .env:\n")
     print(f"ADMIN_PASSWORD_HASH={digest.hex()}")
     print(f"ADMIN_PASSWORD_SALT={salt.hex()}")
     return 0

@@ -1,12 +1,11 @@
 # Health Agent Bot - системный systemd-юнит, работает от root (User= не задан).
 #
 # Установка (от root, подробности в DEPLOY.md):
-#   cp health-agent.service /etc/systemd/system/
+#   cp systemd/health-agent.service /etc/systemd/system/
 #   systemctl daemon-reload
 #   systemctl enable --now health-agent.service
 #
-# EnvironmentFile=%h/.hermes/.env: в системном юните %h - домашний каталог
-# root, то есть /root/.hermes/.env (systemctl show health-agent -p EnvironmentFiles).
+# EnvironmentFile указывает на .env проекта; замените путь при другой установке.
 #
 # Сбой уходит админам в телеграм через health-alert@.service (systemd/).
 # ExecStopPost= нужен именно здесь: при Restart=on-failure и RestartSec=10
@@ -31,14 +30,14 @@ RestartSec=10
 
 # User= не указывается: юнит системный, исполняется от root.
 
-EnvironmentFile=%h/.hermes/.env
+EnvironmentFile=/opt/webapps/health_agent_system/.env
 Environment=PYTHONUNBUFFERED=1
 # Панель поднимает только health-admin.service: иначе бот, стартовав раньше,
 # занимает 8765 сам, и health-admin падает в цикле с EADDRINUSE.
 Environment=HEALTH_ADMIN_AUTOSTART=0
 ExecStopPost=-/bin/sh -c '[ "$$SERVICE_RESULT" = success ] || systemctl start --no-block health-alert@%n.service'
 
-# Бот работает ИЗ КАТАЛОГА ПРОЕКТА, а не из копии в ~/.hermes/: персона,
+# Бот работает из каталога проекта: персона,
 # config.yaml, Knowledge/ и код читаются отсюда, и правка файла сразу боевая.
 # Путь подставить свой, если проект развёрнут не в ~/Health_agent_system.
 WorkingDirectory=/opt/webapps/health_agent_system

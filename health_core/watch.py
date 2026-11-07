@@ -126,12 +126,15 @@ def save_days(conn, user_id: int, days: list, source: str = "watch") -> dict:
         date_str = day.get("date")
         try:
             d_iso, vals = _validate_day(date_str, day, today)
+            existing = conn.execute(
+                "SELECT * FROM daily_watch WHERE user_id=? AND date=?", (user_id, d_iso)
+            ).fetchone()
+            if existing:
+                merged = {name: vals[name] if vals[name] is not None else existing[name] for name in _RANGES}
+                _validate_day(d_iso, merged, today)
         except ValueError as e:
             results.append({"date": date_str, "error": str(e)})
             continue
-        existing = conn.execute(
-            "SELECT id FROM daily_watch WHERE user_id=? AND date=?", (user_id, d_iso)
-        ).fetchone()
         conn.execute(
             "INSERT INTO daily_watch(user_id, date, hr_min, hr_avg, hr_max, steps, active_kcal, "
             "stress_avg, hrv_ms, spo2_avg, spo2_min, spo2_max, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -267,10 +270,10 @@ def trend_block(conn, user_id: int) -> dict | None:
     start_prev = (today - timedelta(days=55)).isoformat()
 
     fields = ("hr_min", "hr_avg", "steps", "stress_avg", "hrv_ms")
-    cols = ", ".join(fields)
+    cols = "date, " + ", ".join(_RANGES)
     recent = conn.execute(
-        f"SELECT {cols} FROM daily_watch WHERE user_id=? AND date>=?",
-        (user_id, start_recent),
+        f"SELECT {cols} FROM daily_watch WHERE user_id=? AND date BETWEEN ? AND ?",
+        (user_id, start_recent, today_str),
     ).fetchall()
     if not recent:
         return None
@@ -283,12 +286,27 @@ def trend_block(conn, user_id: int) -> dict | None:
         vals = [r[field] for r in rows if r[field] is not None]
         return statistics.median(vals) if vals else None
 
-    out = {"coverage_days": len(recent)}
+    def valid(rows):
+        result = []
+        for row in rows:
+            try:
+                _validate_day(row["date"], dict(row), today_str)
+            except ValueError:
+                continue
+            result.append(row)
+        return result
+
+    invalid_days = len(recent)
+    recent, prev = valid(recent), valid(prev)
+    invalid_days -= len(recent)
+    out = {"coverage_days": len(recent), "window_days": 28, "invalid_days": invalid_days}
     for field in fields:
         med = _median(recent, field)
         prev_med = _median(prev, field)
         out[f"{field}_median"] = med
         out[f"{field}_delta"] = (med - prev_med) if med is not None and prev_med is not None else None
+        out[f"{field}_coverage_days"] = sum(r[field] is not None for r in recent)
+        out[f"{field}_previous_coverage_days"] = sum(r[field] is not None for r in prev)
     out["steps_coverage_days"] = sum(1 for r in recent if r["steps"] is not None)
     out["step_goal_today"] = step_goal(conn, user_id, today_str)
     return out

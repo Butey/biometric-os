@@ -73,7 +73,7 @@ def should_exclude(rel_path_str, with_metrics=False):
 
     # Исключить .env* файлы (любые .env-подобные)
     filename = Path(rel_path_str).name
-    if filename.startswith(".env") and not rel_path_str.endswith("env.template"):
+    if filename.startswith(".env") and filename != ".env.example":
         return True
 
     return False
@@ -184,11 +184,11 @@ def build_release(with_metrics=False):
                 file_count += 1
 
             # 3. Добавить готовый env.template
-            if copy_file_to_archive(tar, root.parent / "data" / "env.template", "data/env.template"):
+            if copy_file_to_archive(tar, root / ".env.example", "data/env.template"):
                 file_count += 1
 
             # 4. Добавить готовый RESTORE.md
-            if copy_file_to_archive(tar, root.parent / "RESTORE.md", "RESTORE.md"):
+            if copy_file_to_archive(tar, root / "DEPLOY.md", "RESTORE.md"):
                 file_count += 1
 
         # Вычислить статистику
@@ -262,9 +262,9 @@ def verify_archive(archive_path, with_metrics=False):
         # ошибку — без этой проверки установочный архив может выйти без
         # инструкции по восстановлению, никак об этом не сообщив).
         root = get_project_root()
-        if (root.parent / "data" / "env.template").exists():
+        if (root / ".env.example").exists():
             assert has_env_template, "data/env.template не найден в архиве"
-        if (root.parent / "RESTORE.md").exists():
+        if (root / "DEPLOY.md").exists():
             assert has_restore_md, "RESTORE.md не найден в архиве"
 
         # Проверка: нет .env файлов вообще

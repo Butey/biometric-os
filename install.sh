@@ -4,10 +4,7 @@ set -euo pipefail
 # Health Agent System automated install for Debian VPS
 # Idempotent: safe to run multiple times
 #
-# Раскладка после перехода с Hermes на собственный цикл агента (bot/,
-# Docs/bot_design.md): venv живёт В КАТАЛОГЕ ПРОЕКТА, а не в ~/.hermes/.
-# В ~/.hermes/ остаётся только .env (секреты, общий канал с admin/).
-# База health.db находится в корне проекта. Копий кода, персоны и config.yaml туда больше не кладём.
+# Код, окружение, секреты и SQLite находятся в каталоге проекта.
 
 PROJECT_DIR="${1:-.}"
 PYTHON="${PYTHON:-python3}"
@@ -87,7 +84,40 @@ printf "${GREEN}OK${NC}: Installed\n\n"
 # ================================================================
 # Database & Secrets Setup (Data First!)
 # ================================================================
-mkdir -p "$HOME/.hermes"
+
+# Старое стандартное переопределение больше не должно направлять дочерние процессы домой.
+if [ "${HEALTH_DB:-}" = "$HOME/.hermes/health.db" ]; then
+    export HEALTH_DB="$PROJECT_DIR/health.db"
+fi
+
+# 2. Секреты остаются в проекте; существующий .env никогда не перезаписываем.
+"$TARGET_PY" - "$PROJECT_DIR" <<'PYENV'
+import os
+import sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+target = root / ".env"
+if not target.exists():
+    sources = [Path.home() / ".hermes" / ".env", root / ".env.example", root / "data" / "env.template", root.parent / "data" / "env.template"]
+    source = next((p for p in sources if p.is_file()), None)
+    data = source.read_bytes() if source else b"TELEGRAM_BOT_TOKEN=\n"
+    if source and source.parent == Path.home() / ".hermes":
+        lines = data.decode("utf-8").splitlines()
+        for i, line in enumerate(lines):
+            key, sep, value = line.partition("=")
+            value = value.split(" #", 1)[0].strip().strip("\"'")
+            if sep and key.strip() == "HEALTH_DB" and Path(value).expanduser() == Path.home() / ".hermes" / "health.db":
+                lines[i] = "HEALTH_DB=health.db"
+        data = ("\n".join(lines) + "\n").encode("utf-8")
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+    print("Project .env created; legacy source retained")
+os.chmod(target, 0o600)
+PYENV
+printf "Secrets location: %s/.env\n" "$PROJECT_DIR"
+
+# ================================================================
 
 # 1. Существующая база проекта приоритетнее восстановления из старого пути/пакета.
 # На обновлении сервисы должны быть остановлены до переноса (см. DEPLOY.md).
@@ -98,9 +128,13 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1]).resolve()
+from health_core.environment import load_env_file
+load_env_file(root / ".env")
 target = Path(os.environ.get("HEALTH_DB") or root / "health.db").expanduser()
 if not target.is_absolute():
     target = root / target
+if target == Path.home() / ".hermes" / "health.db":
+    target = root / "health.db"
 if target.exists():
     print(f"Existing database retained: {target}")
 else:
@@ -126,32 +160,6 @@ else:
         print(f"No existing database; schema will be created at {target}")
 PYDB
 
-# 2. Secrets (.env): restore template if needed
-if [ ! -f "$HOME/.hermes/.env" ]; then
-    if [ -f "$PROJECT_DIR/data/env.template" ]; then
-        cp "$PROJECT_DIR/data/env.template" "$HOME/.hermes/.env"
-        chmod 600 "$HOME/.hermes/.env"
-        printf "${GREEN}OK${NC}: ~/.hermes/.env created from env.template\n"
-    elif [ -f "$PROJECT_DIR/../data/env.template" ]; then
-        cp "$PROJECT_DIR/../data/env.template" "$HOME/.hermes/.env"
-        chmod 600 "$HOME/.hermes/.env"
-        printf "${GREEN}OK${NC}: ~/.hermes/.env created from env.template\n"
-    else
-        cat > "$HOME/.hermes/.env" << 'EOF'
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_ALLOWED_USERS=
-GOOGLE_API_KEY=
-EOF
-        chmod 600 "$HOME/.hermes/.env"
-        printf "${GREEN}OK${NC}: ~/.hermes/.env created with empty placeholders\n"
-    fi
-    printf "${YELLOW}        Edit ~/.hermes/.env and fill in real values${NC}\n"
-else
-    printf "${YELLOW}SKIPPED${NC}: ~/.hermes/.env already exists\n"
-fi
-printf "\n"
-
-# ================================================================
 # Initialize / Migrate database
 # ================================================================
 printf "Applying database migrations...\n"
@@ -213,24 +221,22 @@ printf "${GREEN}OK${NC}: test_bot.py\n\n"
 # ================================================================
 printf "\n${GREEN}=== Installation Complete ===${NC}\n\n"
 printf "Manual steps remaining:\n\n"
-printf "1. Edit ~/.hermes/.env and fill in:\n"
+printf "1. Edit $PROJECT_DIR/.env and fill in:\n"
 printf "   - TELEGRAM_BOT_TOKEN (from BotFather)\n"
 printf "   - TELEGRAM_ALLOWED_USERS (comma-separated Telegram IDs)\n"
 printf "   - GOOGLE_API_KEY (or whichever api_key_env is named in config.yaml, bot.providers)\n\n"
-printf "2. Enable autostart (systemd, user unit):\n"
-printf "   mkdir -p ~/.config/systemd/user\n"
-printf "   cp %s/health-agent.service ~/.config/systemd/user/\n" "$PROJECT_DIR"
-printf "   systemctl --user daemon-reload\n"
-printf "   loginctl enable-linger \$(whoami)   # once, as root — otherwise systemd kills the bot on ssh logout\n"
-printf "   systemctl --user enable --now health-agent.service\n\n"
+printf "2. Enable autostart (systemd, system units):\n"
+printf "   sudo mkdir -p /etc/systemd/system\n"
+printf "   sudo cp %s/systemd/*.service %s/systemd/*.timer /etc/systemd/system/\n" "$PROJECT_DIR" "$PROJECT_DIR"
+printf "   sudo systemctl daemon-reload\n"
+printf "   sudo systemctl enable --now health-agent.service health-admin.service\n\n"
 printf "3. Register via Telegram: send /start to your bot\n\n"
 printf "4. After user registration, enable the schedule (systemd, as root; jobs run on each user's local time):\n"
-printf "   systemctl link %s/systemd/health-dispatch.service %s/systemd/health-backup.service\n" "$PROJECT_DIR" "$PROJECT_DIR"
-printf "   systemctl enable --now %s/systemd/health-dispatch.timer %s/systemd/health-backup.timer\n" "$PROJECT_DIR" "$PROJECT_DIR"
+printf "   sudo systemctl enable --now health-dispatch.timer health-backup.timer\n"
 printf "   Job times: config.yaml -> schedule.jobs; preview: .venv/bin/python scripts/dispatch.py --dry-run\n\n"
 printf "Note: most of these fail silently (non-zero exit -> error sent to admins, not users)\n"
 printf "until a user is registered in the database. This is expected before step 3.\n\n"
 printf "Details and rationale: DEPLOY.md, Docs/bot_design.md, Docs/llm_config.md\n\n"
 printf "Database location: %s/health.db (or HEALTH_DB override)\n" "$PROJECT_DIR"
-printf "Secrets location:  ~/.hermes/.env\n"
+printf "Secrets location:  $PROJECT_DIR/.env\n"
 printf "Venv location:     %s\n\n" "$VENV_DIR"

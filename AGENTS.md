@@ -10,7 +10,7 @@ This Python health tracker uses SQLite as its source of truth. Keep health calcu
 - `admin/`: HTTP administration panel; `scripts/` and `systemd/`: scheduled jobs and deployment support.
 - `Core/` and `Knowledge/`: runtime prompts and knowledge assets.
 - `test_bot.py` and `test_e2e.py`: integration checks. `Metrics/` and `Nutrition/` contain ignored local data.
-- `Docs/`, `SPEC.md`, and `DEPLOY.md`: architecture and operational documentation.
+- `Docs/`, `README.md`, and `DEPLOY.md`: architecture and operational documentation.
 
 ## Build, Test, and Development Commands
 
@@ -43,4 +43,4 @@ Follow existing subjects: `fix(tools): ...`, `feat(bot): ...`, `refactor(guards)
 
 ## Security & Operations
 
-Keep credentials in `~/.hermes/.env`; never commit tokens or personal health records. Preserve Telegram allowlist checks. Restart running bot or admin services only on explicit user instruction, as restarts interrupt replies.
+Keep credentials in `.env`; never commit tokens or personal health records. Preserve Telegram allowlist checks. Restart running bot or admin services only on explicit user instruction, as restarts interrupt replies.

@@ -86,7 +86,7 @@ health_agent_system/
 ### 2.3. Инструменты (`plugin/`)
 - `tools.py`: 35 обработчиков действий (логирование еды, воды, веса, фармакотерапии, анализов, запуск консилиума и т.д.).
 - `schemas.py`: строгие JSON-схемы входных параметров для каждого инструмента.
-- `plugin.yaml`: манифест плагина со списком предоставляемых инструментов.
+- `register(ctx)`: локальная регистрация обработчиков; старый манифест сохранён в `Docs/archive/hermes/plugin.yaml`.
 
 ### 2.4. Фоновые сценарии (`scripts/`)
 Скрипты запускаются по расписанию в режиме `--no-agent` (печать отчетов в stdout). Модуль `notify.py` оборачивает их вызов и отправляет форматированные сообщения в Telegram:
@@ -130,9 +130,9 @@ health_agent_system/
    - `plugin/tools.py` (~352 КБ, >90k токенов) — содержит реализацию всех инструментов. Никогда не читайте его целиком! Используйте `grep` по имени инструмента (например, `def _handle_log_food`) и просматривайте только конкретную функцию (30-60 строк).
    - `health_core/guards.py` (~115 КБ, >30k токенов) — ищите конкретный гардрейл по названию (`grep "def check_"`) и читайте точечный срез строк.
    - `admin/pages.py` (~141 КБ) и `admin/server.py` (~90 КБ) — читайте только интересующий маршрут или страницу.
-   - `SPEC.md` (~57 КБ) и `architecture.html` (~82 КБ) — не читайте для решения рядовых задач; вся актуальная выжимка структуры уже приведена в этом документе.
+   - `Docs/archive/SPEC.md` (~57 КБ) и `architecture.html` (~82 КБ) — не читайте для решения рядовых задач; вся актуальная выжимка структуры уже приведена в этом документе.
 2. **Исключение «шумных» каталогов и логов:**
-   - Папки `_agent_swarm_analysis/`, `research/`, `llm-council/runs/`, `Nutrition/`, `Metrics/`, `Обучение/`, `gemini_edited/` содержат массивные исторические дампы и бинарные файлы. Их сканирование или поиск по ним через ripgrep без сужения области сжигает от 50k до 200k токенов за вызов. Не ищите в них код.
+   - Папки `Docs/archive/_agent_swarm_analysis/`, `Docs/archive/research/`, `Docs/archive/llm-council/runs/`, `Nutrition/`, `Metrics/`, `Docs/archive/Обучение/`, `Docs/archive/gemini_edited/` содержат массивные исторические дампы и бинарные файлы. Их сканирование или поиск по ним через ripgrep без сужения области сжигает от 50k до 200k токенов за вызов. Не ищите в них код.
 3. **Прямая маршрутизация по карте:**
    - Если нужно изменить расчет калорий или дефицита $\rightarrow$ сразу открывайте `health_core/energy.py`.
    - Если нужно изменить логику проверки титрации $\rightarrow$ сразу открывайте `health_core/guards.py` или `health_core/glp1.py`.
@@ -184,8 +184,8 @@ Python interpreter: always use `.venv/bin/python`.
 4. Tools interface: `plugin/tools.py` registered via `bot/registry.py` shim.
 
 ## Token Economy Rules:
-- NEVER read large files completely: `plugin/tools.py` (352 KB), `health_core/guards.py` (115 KB), `admin/pages.py` (141 KB), `SPEC.md` (57 KB). Use targeted grep and line slices.
-- DO NOT search in or read heavy non-code directories: `_agent_swarm_analysis/`, `research/`, `llm-council/runs/`, `Nutrition/`, `Metrics/`, `Обучение/`.
+- NEVER read large files completely: `plugin/tools.py` (352 KB), `health_core/guards.py` (115 KB), `admin/pages.py` (141 KB), `Docs/archive/SPEC.md` (57 KB). Use targeted grep and line slices.
+- DO NOT search in or read heavy non-code directories: `Docs/archive/_agent_swarm_analysis/`, `Docs/archive/research/`, `Docs/archive/llm-council/runs/`, `Nutrition/`, `Metrics/`, `Docs/archive/Обучение/`.
 - Refer to `PROJECT_MAP.md` for exact file locations rather than exploring the directory tree.
 
 ## Verification:

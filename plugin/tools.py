@@ -30,9 +30,9 @@ from health_core import config
 # Личность звонящего для слэш-команд. Шлюз разбирает слэш-команды в
 # _handle_message и возвращает ответ РАНЬШЕ, чем _handle_message_with_agent
 # выставит session-контекст (gateway/run.py: диспетчер ~17776, _set_session_env
-# ~18979) — то есть внутри команды HERMES_SESSION_USER_ID пуст, а _get_user_id
+# ~18979) — то есть внутри команды caller ContextVar пуст, а _get_user_id
 # молча падает на user_id=1 и работает не над тем человеком. Хук
-# pre_gateway_dispatch срабатывает на каждом входящем сообщении до диспетчера и
+# pre_dispatch срабатывает на каждом входящем сообщении до диспетчера и
 # несёт event.user_id (gateway/platforms/base.py:2313) — запоминаем его здесь.
 # ContextVar, а не глобальная переменная: два человека пишут одновременно, и
 # глобалка отдала бы одному личность другого. Внутри одной asyncio-задачи
@@ -68,7 +68,7 @@ def _quick_macro_rewrite(text: str) -> str | None:
     или None на выходе, без сайд-эффектов — тестируется без шлюза.
 
     Возвращаем REWRITE, а не skip. skip проглатывает сообщение без ответа
-    (см. контракт pre_gateway_dispatch в комментарии у _remember_caller) —
+    (см. контракт pre_dispatch в комментарии у _remember_caller) —
     пользователь напишет "+30 белка" и получит тишину, это хуже, чем сейчас.
     rewrite хотя бы гарантирует, что модель ответит.
 
@@ -111,7 +111,7 @@ def _quick_macro_rewrite(text: str) -> str | None:
 
 
 def _remember_caller(event=None, **_kwargs):
-    """Хук pre_gateway_dispatch: запомнить автора входящего сообщения и,
+    """Хук pre_dispatch: запомнить автора входящего сообщения и,
     отдельно, распознать быстрый ярлык добора БЖУ/воды ("+30 белка").
 
     Ничего не решает и никогда не бросает: хук стоит на пути КАЖДОГО сообщения,
@@ -137,21 +137,12 @@ def _remember_caller(event=None, **_kwargs):
 
 
 def _caller_telegram_id() -> str | None:
-    """Настоящий telegram id звонящего. Сначала session-контекст шлюза (обычный
-    путь агента), затем запомненный хуком автор входящего сообщения (путь
-    слэш-команды, где контекста ещё нет). None вне Hermes."""
-    try:
-        from gateway.session_context import get_session_env
-        caller = get_session_env("HERMES_SESSION_USER_ID", "")
-        if caller:
-            return caller
-    except ImportError:
-        pass
+    """Личность из ContextVar собственного бота; аргументы модели её не задают."""
     return _CALLER_FALLBACK.get()
 
 
 def _get_user_id(params: dict, conn=None) -> int:
-    """Extract user_id. In Hermes: resolve from Telegram caller. Otherwise: from params or default.
+    """Extract user_id. Resolve from the bot caller; CLI/tests may use explicit params.
 
     If caller_telegram_id() returns an id AND a connection is available, resolve it via:
         SELECT id FROM users WHERE telegram_user_id = ?
@@ -963,8 +954,9 @@ def handle_food_lookup(params: dict) -> str:
         except ValueError as e:
             conn.close()
             return json.dumps({"error": str(e)}, ensure_ascii=False)
+        product = conn.execute("SELECT * FROM my_products WHERE id=? AND user_id=?", (product_id, user_id)).fetchone()
         conn.close()
-        return json.dumps({"ok": True, "product_id": product_id}, ensure_ascii=False)
+        return json.dumps({"ok": True, "product_id": product_id, "product": _product_row(product)}, ensure_ascii=False)
 
     conn.close()
     return json.dumps(
@@ -1226,6 +1218,33 @@ def handle_log_sleep(params: dict) -> str:
         if spo2_avg is not None and not 70 <= spo2_avg <= 100:
             spo2_avg = None
 
+    previous = conn.execute(
+        "SELECT * FROM sleep_log WHERE user_id=? AND night_date=?", (user_id, night)
+    ).fetchone()
+    bedtime = params.get("bedtime") if params.get("bedtime") is not None else (previous["bedtime"] if previous else None)
+    wake_time = params.get("wake_time") if params.get("wake_time") is not None else (previous["wake_time"] if previous else None)
+    try:
+        for clock in (bedtime, wake_time):
+            if clock is not None:
+                datetime.strptime(clock, "%H:%M")
+        if bedtime is not None and wake_time is not None:
+            bed = datetime.strptime(bedtime, "%H:%M")
+            wake = datetime.strptime(wake_time, "%H:%M")
+            in_bed = (wake - bed).seconds / 60 or 1440
+            if duration > in_bed + 5:
+                raise ValueError("Длительность сна больше интервала между отбоем и подъёмом: проверь скриншот")
+        stages = {}
+        for field in ("deep_min", "rem_min", "awake_min"):
+            value = _stage(field) if params.get(field) is not None else (previous[field] if previous else None)
+            if params.get(field) is not None and value is None:
+                raise ValueError(f"{field}: некорректная длительность фазы сна")
+            stages[field] = value
+        if (stages["deep_min"] or 0) + (stages["rem_min"] or 0) > duration:
+            raise ValueError("Сумма глубокого и REM-сна больше общей длительности: проверь скриншот")
+    except (TypeError, ValueError) as e:
+        conn.close()
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
     conn.execute(
         "INSERT INTO sleep_log(user_id, night_date, bedtime, wake_time, duration_min, "
         "deep_min, rem_min, awake_min, quality, spo2_avg, source, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
@@ -1235,8 +1254,8 @@ def handle_log_sleep(params: dict) -> str:
         "rem_min=COALESCE(excluded.rem_min,rem_min), awake_min=COALESCE(excluded.awake_min,awake_min), "
         "quality=COALESCE(excluded.quality,quality), spo2_avg=COALESCE(excluded.spo2_avg,spo2_avg), "
         "source=COALESCE(excluded.source,source), notes=COALESCE(excluded.notes,notes)",
-        (user_id, night, params.get("bedtime"), params.get("wake_time"), duration,
-         _stage("deep_min"), _stage("rem_min"), _stage("awake_min"), quality, spo2_avg,
+        (user_id, night, bedtime, wake_time, duration,
+         stages["deep_min"], stages["rem_min"], stages["awake_min"], quality, spo2_avg,
          params.get("source"), params.get("notes")),
     )
     conn.commit()
@@ -3074,6 +3093,8 @@ def handle_get_trends(params: dict) -> str:
     # День с часов (CONTEXT.md «День с часов»): пульс/шаги/стресс/HRV, медиана за 28д против прошлых 28д
     from health_core import watch as _watch
     t["daily_watch"] = _watch.trend_block(conn, user_id)
+    from health_core.plateau import assess
+    t["current_stagnation"] = assess(conn, user_id)
 
     conn.close()
 
@@ -3094,7 +3115,7 @@ def handle_get_status_bar(params: dict) -> str:
 
     # Активный стиль персоны — отдельным полем "style", не внутри status_bar.
     # get_status_bar — единственное место, которое модель вызывает в начале ЛЮБОГО
-    # диалога (это прописано в system_promt.md), а Hermes не варьирует системный
+    # диалога (это прописано в system_promt.md), а локального бота не варьирует системный
     # промпт по Telegram-пользователю (секции промпта не знают личность и заморожены
     # на сессию) — поэтому персональная манера ответа доходит до модели только тут,
     # не как срезание угла, а как единственный доступный канал.
@@ -3707,7 +3728,13 @@ def handle_query_metrics(params: dict) -> str:
     migrate(conn)
     user_id = _get_user_id(params, conn)
     metric = params.get("metric")
-    window_days = params.get("window_days", 90)
+    try:
+        window_days = int(params.get("window_days", 90))
+        if not 1 <= window_days <= 3650:
+            raise ValueError
+    except (TypeError, ValueError):
+        conn.close()
+        return json.dumps({"error": "window_days должен быть целым числом 1..3650"}, ensure_ascii=False)
 
     # enum в схеме — подсказка, не гарантия. Без этого гейта неизвестный metric
     # раньше падал через db_field=metric напрямую в f-string SQL: не только
@@ -3719,20 +3746,22 @@ def handle_query_metrics(params: dict) -> str:
             {"error": f"metric должен быть одним из {sorted(_METRIC_MAP)}, получено {metric!r}"},
             ensure_ascii=False)
 
-    since = (config.local_now() - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    now = config.user_now(conn, user_id)
+    since = (now - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
 
     # Query historical data
     rows = conn.execute(
         f"SELECT measured_at, {db_field} FROM body_metrics "
-        f"WHERE user_id=? AND measured_at>=? AND {db_field} IS NOT NULL "
+        f"WHERE user_id=? AND measured_at>=? AND measured_at<=? AND {db_field} IS NOT NULL "
         f"ORDER BY measured_at ASC",
-        (user_id, since),
+        (user_id, since, now.strftime("%Y-%m-%d %H:%M:%S")),
     ).fetchall()
 
     data = []
     for row in rows:
         data.append({
             "date": row["measured_at"][:10],
+            "measured_at": row["measured_at"],
             "value": row[db_field],
         })
 
@@ -3742,6 +3771,7 @@ def handle_query_metrics(params: dict) -> str:
         {
             "metric": metric,
             "window_days": window_days,
+            "as_of": now.strftime("%Y-%m-%d %H:%M:%S"),
             "data": data,
         },
         ensure_ascii=False,
@@ -4885,7 +4915,7 @@ def handle_style(params: dict) -> str:
     """Стили персоны: короткая инструкция о тоне ответов. action=list|add|use|del.
     Ровно один стиль активен на персону — его текст get_status_bar кладёт в поле
     "style" на каждый диалог (см. handle_get_status_bar): это единственный канал,
-    которым персональная манера доходит до модели у Hermes."""
+    которым персональная манера доходит до модели у локального бота."""
     conn = connect()
     migrate(conn)
     user_id = _get_user_id(params, conn)
@@ -5170,7 +5200,7 @@ _HELP_ADMIN = """🛠 **Админ**
 def handle_help(params: dict) -> str:
     """Справка «что умею и как со мной говорить». Готовый блок — модель
     приписывает его дословно, а не пересказывает своими словами: у слэш-команд
-    плагина нет (меню в Telegram — встроенные команды Hermes), и справка,
+    плагина нет (меню в Telegram — встроенные команды локального бота), и справка,
     пересказанная по памяти, разъезжается с реальным набором инструментов.
     Админский раздел показывается только в режиме admin — в user он не нужен и
     противоречит [MODE]."""
@@ -5191,10 +5221,10 @@ def _zero_write_error(cur, msg: str) -> str | None:
 def handle_register_user(params: dict) -> str:
     """Регистрация нового пользователя или обновление профиля. UPSERT по telegram_user_id.
 
-    Identity ТОЛЬКО из _caller_telegram_id() (ContextVar шлюза Hermes) — модель её не
+    Identity ТОЛЬКО из _caller_telegram_id() (ContextVar шлюза локального бота) — модель её не
     подделает. params["telegram_user_id"] используется, только когда caller_id нет вовсе
-    (self-check/CLI/cron вне Hermes) — единственный путь, где эта ветка вообще достижима,
-    потому что внутри Hermes caller_id есть всегда. Внутри Hermes params-значение игнорируется.
+    (self-check/CLI/cron вне локального бота) — единственный путь, где эта ветка вообще достижима,
+    потому что внутри локального бота caller_id есть всегда. Внутри локального бота params-значение игнорируется.
     """
     conn = connect()
     migrate(conn)
@@ -5203,7 +5233,7 @@ def handle_register_user(params: dict) -> str:
     if caller_id:
         telegram_user_id = caller_id  # реальная личность, params для identity не смотрим
     else:
-        # Вне Hermes ContextVar в принципе недоступен — тестовый/CLI путь.
+        # Вне локального бота ContextVar в принципе недоступен — тестовый/CLI путь.
         telegram_user_id = params.get("telegram_user_id")
         if telegram_user_id is None:
             conn.close()
@@ -5508,7 +5538,7 @@ def _admin_denial(caller_id: str, is_admin_caller: bool) -> str | None:
 
 @_handler_wrapper
 def handle_admin_cmd(params: dict) -> str:
-    """Admin command handler. Real telegram_user_id from Hermes gateway, never from params."""
+    """Admin command handler. Real telegram_user_id from the bot ContextVar, never from params."""
     import yaml
     from pathlib import Path
 
@@ -5948,7 +5978,7 @@ def _admin_alerts(n: int = 10) -> str:
 
 # ---------------------------------------------------------------- SLASH COMMANDS
 #
-# Отдельный API Hermes (ctx.register_command), не register_tool: хендлер берёт
+# Отдельный API локального бота (ctx.register_command), не register_tool: хендлер берёт
 # ОДНУ строку raw_args и обязан вернуть человеческий текст, а не JSON — modель
 # тут не участвует. Ниже — тонкие обёртки над уже существующими handle_*:
 # разбираем raw_args, зовём handle_*, разворачиваем JSON в текст.
@@ -5968,7 +5998,7 @@ def _unwrap(json_str: str, key: str | None = None):
 
 def cmd_health(raw_args: str) -> str:
     """/health — что умеет система. Не /health, а не /help: /help — встроенная
-    команда Hermes, её имя занято и регистрация под ним молча пропускается
+    команда локального бота, её имя занято и регистрация под ним молча пропускается
     (см. STEP registration guard в register())."""
     return _unwrap(handle_help({}), "help")
 
@@ -6123,7 +6153,7 @@ def cmd_week(raw_args: str) -> str:
 
 def cmd_importdata(raw_args: str) -> str:
     """/importdata <путь> — импорт выгрузки весов/тренировок с диска СЕРВЕРА,
-    не файла, присланного в чат Telegram (Hermes не подкладывает такие файлы
+    не файла, присланного в чат Telegram (локального бота не подкладывает такие файлы
     боту на диск сам)."""
     path = (raw_args or "").strip()
     if not path:
@@ -6150,7 +6180,7 @@ _SLASH_COMMANDS = [
 
 
 def register(ctx):
-    """Register all tools with Hermes."""
+    """Register project tools in the bot registry."""
     try:
         from . import schemas
     except ImportError:
@@ -6204,10 +6234,10 @@ def register(ctx):
 
     # Личность звонящего для слэш-команд — см. _remember_caller. Без этого хука
     # любая слэш-команда работает над user_id=1, кто бы её ни позвал.
-    ctx.register_hook("pre_gateway_dispatch", _remember_caller)
+    ctx.register_hook("pre_dispatch", _remember_caller)
 
     # register_command — отдельный, более новый API, чем register_tool. Сборка
-    # Hermes без него не должна ронять регистрацию обычных тулов выше, поэтому
+    # локального бота без него не должна ронять регистрацию обычных тулов выше, поэтому
     # гейт hasattr, а не жёсткий вызов.
     if hasattr(ctx, "register_command"):
         for name, handler, description in _SLASH_COMMANDS:
@@ -6857,7 +6887,7 @@ if __name__ == "__main__":
             raise AssertionError(f"get_status_bar raised after user exists: {e}")
 
         print("\n" + "="*60)
-        print("TEST 10: _caller_telegram_id() returns None outside Hermes")
+        print("TEST 10: _caller_telegram_id() returns None outside локального бота")
         print("="*60)
 
         caller_id = _caller_telegram_id()
@@ -6871,7 +6901,7 @@ if __name__ == "__main__":
         handler = ctx.tools["admin_cmd"]["handler"]
 
         # Even if params supplies a telegram_user_id, it should be IGNORED
-        # because we're outside Hermes (no caller_id from ContextVar)
+        # because we're outside локального бота (no caller_id from ContextVar)
         result_json = handler({"command": "status", "telegram_user_id": 999})
         result = json.loads(result_json)
         assert "error" in result and "identity" in result["error"].lower(), \
@@ -6895,7 +6925,7 @@ if __name__ == "__main__":
         print("="*60)
 
         import yaml
-        # Monkeypatch _caller_telegram_id to simulate being inside Hermes
+        # Monkeypatch _caller_telegram_id to simulate being inside локального бота
         import plugin.tools as tools_module
         original_caller = tools_module._caller_telegram_id
         _test_caller_id = "12345"
@@ -7609,7 +7639,7 @@ if __name__ == "__main__":
             _payload.update(_GEN_EXTRAS.get(_name, {}))
 
             if _name == "register_user":
-                # Identity приходит из ContextVar, не из схемы — вне Hermes нужен
+                # Identity приходит из ContextVar, не из схемы — вне локального бота нужен
                 # caller_id, иначе валится на "identity", а не на контракт полей.
                 def _reg_caller():
                     return "888001"
@@ -7951,7 +7981,7 @@ if __name__ == "__main__":
         print("TEST 29: help — готовый блок, admin-раздел только в admin-режиме")
         print("="*60)
 
-        # Вне Hermes caller_id нет (см. TEST 10) -> режим по умолчанию user.
+        # Вне локального бота caller_id нет (см. TEST 10) -> режим по умолчанию user.
         help_result = json.loads(handle_help({}))
         assert list(help_result.keys()) == ["help"], f"Expected only 'help' key, got {help_result}"
         help_text = help_result["help"]
@@ -7976,11 +8006,11 @@ if __name__ == "__main__":
         print("OK: справка admin-режима включает секцию admin_cmd")
 
         print("\n" + "="*60)
-        print("TEST 30: личность звонящего в слэш-команде (хук pre_gateway_dispatch)")
+        print("TEST 30: личность звонящего в слэш-команде (хук pre_dispatch)")
         print("="*60)
 
         # Хук зарегистрирован: без него слэш-команда работает над user_id=1.
-        assert "pre_gateway_dispatch" in ctx.hooks, \
+        assert "pre_dispatch" in ctx.hooks, \
             f"хук личности не зарегистрирован, есть: {list(ctx.hooks)}"
 
         class _FakeEvent:
@@ -7994,7 +8024,7 @@ if __name__ == "__main__":
             tools_module._remember_caller(event=_FakeEvent())
             assert tools_module._CALLER_FALLBACK.get() == "374939064", \
                 f"хук обязан запомнить автора, получено {tools_module._CALLER_FALLBACK.get()!r}"
-            # Вне Hermes session-контекста нет, значит читается именно фолбэк.
+            # Вне локального бота session-контекста нет, значит читается именно фолбэк.
             assert _orig_caller_fn() == "374939064", \
                 "в слэш-команде личность должна браться из запомненного автора"
 
@@ -8125,7 +8155,7 @@ if __name__ == "__main__":
 
         _TAKEN = {"help", "status", "new", "export", "profile", "whoami", "reset", "clear", "voice"}
         _collisions = _EXPECTED_CMDS & _TAKEN
-        assert not _collisions, f"имена слэш-команд пересекаются с занятыми Hermes: {_collisions}"
+        assert not _collisions, f"имена слэш-команд пересекаются с занятыми локального бота: {_collisions}"
         print(f"OK: все 6 слэш-команд зарегистрированы, без коллизий с {sorted(_TAKEN)}")
 
         assert "Что я умею" in cmd_health(""), "cmd_health должен вернуть текст help"
@@ -8208,7 +8238,7 @@ if __name__ == "__main__":
             config.load.cache_clear()
 
         print("\n" + "="*60)
-        print("TEST 34: быстрый ярлык добора БЖУ/воды (+30 белка) в pre_gateway_dispatch")
+        print("TEST 34: быстрый ярлык добора БЖУ/воды (+30 белка) в pre_dispatch")
         print("="*60)
 
         _qmr = tools_module._quick_macro_rewrite

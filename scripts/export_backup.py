@@ -9,9 +9,7 @@
 Бэкап пишется через health_core.export.backup_db() (sqlite3 .backup(), не
 copyfile — безопасно при открытом WAL-соединении демона) в HEALTH_BACKUP_DIR,
 по умолчанию рядом с health.db. Путь бэкапа печатается строкой `MEDIA:<path>`
-— Hermes подхватывает такие строки и отправляет файл вложением в Telegram
-(§13 «второй контур на случай потери VPS»); .db — из поддерживаемых
-расширений (см. Docs/hermes_ref/telegram.md).
+— scripts/notify.py отправляет такие строки вложениями в Telegram.
 
     python scripts/export_backup.py
 """
@@ -85,7 +83,7 @@ def journal_lines() -> list[str]:
 
 
 def main() -> int:
-    from admin.auth import load_env_file
+    from health_core.environment import load_env_file
     load_env_file()
     conn = connect()
     migrate(conn)
@@ -110,7 +108,7 @@ def main() -> int:
     # база, а только те пользователи, кого включили явно. По умолчанию — один
     # основной (id=1): чужие медицинские выгрузки не должны попадать на чужой
     # диск молча, по факту появления строки в users. Включение остальным —
-    # перечислением в ~/.hermes/.env: HEALTH_GDRIVE_USERS=1,3
+    # перечислением в .env: HEALTH_GDRIVE_USERS=1,3
     raw = os.environ.get("HEALTH_GDRIVE_USERS", "1").replace(",", " ").split()
     sync_ids = {int(x) for x in raw if x.lstrip("-").isdigit()}
     sync_users = [u for u in users if u["id"] in sync_ids]

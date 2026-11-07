@@ -30,7 +30,7 @@ except ImportError:
 
 import os
 
-from admin.auth import load_env_file
+from health_core.environment import load_env_file
 from health_core.config import load as load_config
 from health_core.db import connect
 
@@ -211,7 +211,7 @@ def main() -> int:
     load_env_file()
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
-        print("TELEGRAM_BOT_TOKEN не задан (~/.hermes/.env)", file=sys.stderr)
+        print("TELEGRAM_BOT_TOKEN не задан (.env)", file=sys.stderr)
         return 1
 
     if args.admins:

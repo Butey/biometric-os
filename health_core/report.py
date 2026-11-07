@@ -472,14 +472,16 @@ def whr(conn: sqlite3.Connection, user_id: int) -> float | None:
 
 def trends(conn: sqlite3.Connection, user_id: int, window_days: int = 30) -> dict:
     """Вес, LBM, талия, WHR, фактический TDEE за окно (§07 query_metrics/get_progress)."""
-    since = (_now(conn, user_id) - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    now = _now(conn, user_id)
+    since = (now - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    as_of = now.strftime("%Y-%m-%d %H:%M:%S")
     weight_rows = conn.execute(
-        "SELECT weight_kg, ffm_kg FROM body_metrics WHERE user_id=? AND measured_at>=? ORDER BY measured_at",
-        (user_id, since),
+        "SELECT weight_kg, ffm_kg FROM body_metrics WHERE user_id=? AND measured_at BETWEEN ? AND ? ORDER BY measured_at",
+        (user_id, since, as_of),
     ).fetchall()
     waist_rows = conn.execute(
-        "SELECT value_cm FROM anthropometry WHERE user_id=? AND site='талия' AND measured_on>=? ORDER BY measured_on",
-        (user_id, since[:10]),
+        "SELECT value_cm FROM anthropometry WHERE user_id=? AND site='талия' AND measured_on BETWEEN ? AND ? ORDER BY measured_on",
+        (user_id, since[:10], as_of[:10]),
     ).fetchall()
 
     def _delta(rows, key):
@@ -489,6 +491,7 @@ def trends(conn: sqlite3.Connection, user_id: int, window_days: int = 30) -> dic
     from health_core.body_composition import lean_loss_ratio
     lean = lean_loss_ratio(conn, user_id, since, min_points=load()["guards"]["lbm_ratio_min_points"])
     out = {
+        "as_of": as_of,
         "window_days": window_days,
         "weight_delta_kg": _delta(weight_rows, "weight_kg"),
         "lbm_delta_kg": _delta(weight_rows, "ffm_kg"),
@@ -500,6 +503,10 @@ def trends(conn: sqlite3.Connection, user_id: int, window_days: int = 30) -> dic
             "points": lean[3] if lean else None,
             "window_days": window_days,
             "estimate": True,
+            "weight_loss_kg": round(-lean[1], 3) if lean else None,
+            "ffm_loss_kg": round(-lean[2], 3) if lean else None,
+            "method": "morning_daily_medians; median_first_3_vs_last_3_days",
+            "is_muscle_measurement": False,
         },
     }
     try:
@@ -719,6 +726,9 @@ def training_efficiency(conn: sqlite3.Connection, user_id: int, window_days: int
     return {
         "window_days": window_days,
         "sports": sports,
+        "total_sessions": len(rows),
+        "usable_sessions": sum(len(sessions) for sessions in usable_by_sport.values()),
+        "estimate": True,
         "excluded_sessions": sum(excluded_reasons.values()),
         "excluded_reasons": excluded_reasons,
     }

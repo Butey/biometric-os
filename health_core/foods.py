@@ -7,6 +7,7 @@ health_core/card_drafts.py._http_get_json), тесты подменяют её �
 urllib изнутри.
 """
 import json
+import math
 import re
 import urllib.error
 import urllib.parse
@@ -224,6 +225,30 @@ def remember(conn, user_id: int, name: str, *, source: str, off_code=None,
     key = name_key(display_name)
     if not display_name or not key:
         raise ValueError("Название продукта пустое")
+    values = [kcal_100g, protein_100g, fat_100g, carbs_100g, fiber_100g]
+    for i, value in enumerate(values):
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("КБЖУ на 100 г должны быть числами")
+        if not math.isfinite(value) or not 0 <= value <= (1000 if i == 0 else 100):
+            raise ValueError("Недопустимый состав на 100 г: ккал 0..1000, нутриенты 0..100; NaN/Infinity запрещены")
+        values[i] = value
+    kcal_100g, protein_100g, fat_100g, carbs_100g, fiber_100g = values
+    if sum(v or 0 for v in values[1:4]) > 105:
+        raise ValueError("Сумма белков, жиров и углеводов превышает 100 г с допуском округления: проверь этикетку")
+    previous = conn.execute(
+        "SELECT * FROM my_products WHERE user_id=? AND name_key=?", (user_id, key)
+    ).fetchone()
+    if (previous and source == previous["source"] == "label" and previous["kcal_100g"]
+            and abs(kcal_100g - previous["kcal_100g"]) > max(100, previous["kcal_100g"] * .5)):
+        raise ValueError(
+            "Новая этикетка резко отличается от сохранённой; прежний состав не изменён. "
+            "Проверь распознавание и название: другой продукт сохрани под точным названием. "
+            "Если человек исправляет именно эту карточку, сначала удали её через forget, затем сохрани проверенные числа."
+        )
     # Строка с ключом прежней длины основы (5) - переводим на новый ключ, иначе UPSERT даст дубль.
     for r in conn.execute("SELECT id, name_key, display_name FROM my_products WHERE user_id=?", (user_id,)).fetchall():
         if r["name_key"] != key and name_key(r["display_name"]) == key:

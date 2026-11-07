@@ -52,7 +52,7 @@ def load() -> dict:
             new = yaml.safe_load(f)
         if not isinstance(new, dict):
             raise ValueError(f"корень файла - {type(new).__name__}, а не словарь")
-        # Админы задаются окружением (~/.hermes/.env), а не config.yaml: id не должен лежать в git.
+        # Админы задаются окружением (.env), а не config.yaml: id не должен лежать в git.
         admin_ids = os.environ.get("HEALTH_ADMIN_IDS", "").replace(",", " ").split()
         if admin_ids:
             new.setdefault("admin", {})["telegram_admin_ids"] = [int(i) for i in admin_ids]

@@ -752,7 +752,7 @@ if __name__ == "__main__":
     os.environ["HEALTH_DB"] = str(Path(tempfile.mkdtemp()) / "health.db")
     import health_core.db as db
     db.DB_PATH = Path(os.environ["HEALTH_DB"])
-    assert db.DB_PATH != Path.home() / ".hermes" / "health.db", db.DB_PATH
+    assert db.DB_PATH != db.DEFAULT_DB_PATH, db.DB_PATH
     _c = db.connect()
     db.migrate(_c)
     _c.execute("INSERT INTO users(telegram_user_id, created_at) VALUES (777, '2026-08-20 00:00:00')")

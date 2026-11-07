@@ -6,6 +6,7 @@
 import json
 import hashlib
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from health_core.config import load as _load_config, local_now
 _DEFAULT_WINDOW = 20
 _DEFAULT_CHARS = 8000
 _SUMMARY_TAG = "[Сводка предыдущего разговора]"
+_FOREIGN_IDENTITY = re.compile(r"\bя\s*[—,-]?\s*(?:claude|клод|chatgpt)|официальн\w*\s+cli|anthropic['’]s", re.IGNORECASE)
 
 # Поля, которые понимают все провайдеры + thought_signature/extra_content (Gemini 3.x,
 # без них она отвергает историю). Остальное (reasoning, refusal, annotations...) строгие
@@ -68,13 +70,17 @@ def load(conn, telegram_id: str) -> list[dict]:
         (str(telegram_id), window if window > 0 else 0),
     ).fetchall()
     msgs = [json.loads(r["content"]) for r in _trim(rows, window, chars)]
+    msgs = [m for m in msgs if not (str(m.get("content")).startswith(_SUMMARY_TAG)
+                                   and _FOREIGN_IDENTITY.search(str(m.get("content"))))]
     # Сводка из /compact живёт за пределами окна - подтягиваем последнюю, если её в окне нет
     if not any(str(m.get("content")).startswith(_SUMMARY_TAG) for m in msgs):
         row = conn.execute(
             "SELECT content FROM chat_history WHERE telegram_user_id=? AND role='user' AND content LIKE ? "
             "ORDER BY rowid DESC LIMIT 1", (str(telegram_id), f"%{_SUMMARY_TAG}%")).fetchone()
         if row:
-            msgs.insert(0, json.loads(row["content"]))
+            summary = json.loads(row["content"])
+            if not _FOREIGN_IDENTITY.search(str(summary.get("content"))):
+                msgs.insert(0, summary)
     return msgs
 
 
@@ -153,6 +159,8 @@ def archive(conn, telegram_id: str) -> Path:
 def replace(conn, telegram_id: str, up_to_rowid: int, summary: str) -> None:
     """Заменить все сообщения пользователя до up_to_rowid включительно одной
     сводкой. Она занимает освободившийся rowid, поэтому остаётся перед хвостом."""
+    if not summary.strip() or _FOREIGN_IDENTITY.search(summary):
+        raise ValueError("Сводка пуста или содержит постороннюю роль; исходные сообщения сохранены")
     archive(conn, telegram_id)
     with conn:
         conn.execute("DELETE FROM chat_history WHERE telegram_user_id=? AND rowid<=?", (str(telegram_id), up_to_rowid))
@@ -164,6 +172,7 @@ def replace(conn, telegram_id: str, up_to_rowid: int, summary: str) -> None:
 
 
 def clear(conn, telegram_id: str) -> None:
+    archive(conn, telegram_id)
     conn.execute("DELETE FROM chat_history WHERE telegram_user_id=?", (str(telegram_id),))
     conn.commit()
 

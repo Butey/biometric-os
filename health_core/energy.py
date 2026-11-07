@@ -278,7 +278,11 @@ def _morning_weights(conn: sqlite3.Connection, user_id: int, start: str, end: st
         "AND time(measured_at) BETWEEN '06:00:00' AND '11:00:00' ORDER BY measured_at",
         (user_id, start, end),
     ).fetchall()
-    return [(date.fromisoformat(r["d"]).toordinal(), r["weight_kg"]) for r in rows]
+    by_day = {}
+    for row in rows:
+        by_day.setdefault(row["d"], []).append(row["weight_kg"])
+    return [(date.fromisoformat(day).toordinal(), statistics.median(weights))
+            for day, weights in sorted(by_day.items())]
 
 
 _WASHOUT_DAYS = 5  # дней после рефида/болезни, вес которых не идёт в наклон
@@ -306,12 +310,11 @@ def _adaptive_tdee_core(
     logged_days считает ВСЕ залогированные дни (включая рефид): рефид тоже
     залогирован и подтверждает, что человек ведёт дневник.
 
-    Окно по умолчанию заканчивается сегодня (для forecast.py/report.py, которым
-    нужен именно текущий TDEE). daily_target() пересчитывает цель задним числом
-    и обязан передавать свою же дату через for_date, иначе повторный вызов на
-    одну и ту же историческую дату даёт разный результат в зависимости от того,
-    когда он был выполнен — окно "плывёт" вместе с user_now(conn, user_id)."""
-    end = datetime.fromisoformat(for_date[:10]).date() if for_date else user_now(conn, user_id).date()
+    Окно заканчивается не позже вчера: завтрак не является суточным рационом
+    и не должен менять оценку расхода. Исторический for_date сохраняет свою
+    дату, если она уже прошла."""
+    today = user_now(conn, user_id).date()
+    end = min(date.fromisoformat(for_date[:10]) if for_date else today, today - timedelta(days=1))
     start = end.fromordinal(end.toordinal() - window_days + 1)
     start_s, end_s = start.isoformat(), end.isoformat()
 
@@ -423,7 +426,8 @@ def adaptive_tdee(
     до этой серии (но не шире window_days). Серия короче — None, калибровка
     замораживается, а не подгоняется. См. _adaptive_tdee_core — тот же расчёт с
     более низким порогом идёт в daily_expenditure() (ADR 0004)."""
-    end = date.fromisoformat(for_date[:10]) if for_date else user_now(conn, user_id).date()
+    today = user_now(conn, user_id).date()
+    end = min(date.fromisoformat(for_date[:10]) if for_date else today, today - timedelta(days=1))
     streak, anchor = logged_streak(conn, user_id, end)
     if streak < MIN_LOG_STREAK_DAYS:
         return None
