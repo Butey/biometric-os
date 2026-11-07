@@ -15,6 +15,8 @@ import csv
 import shutil
 import sqlite3
 import subprocess
+import tempfile
+import zipfile
 from datetime import date
 from pathlib import Path
 
@@ -162,6 +164,41 @@ def export_all(conn: sqlite3.Connection, user_id: int, out_dir: str) -> dict:
         rows += 1
 
     return {"files": files, "rows": rows}
+
+
+def export_user_archive(conn: sqlite3.Connection, user_id: int, path: str) -> dict:
+    """CSV-архив собственных записей; глобальные таблицы и чужие строки не включаются."""
+    if conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
+        raise ValueError("Пользователь не зарегистрирован")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    files = rows = 0
+    with tempfile.TemporaryDirectory(prefix="health_csv_") as tmp, \
+            zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        def write_table(name, query):
+            nonlocal files, rows
+            cursor = conn.execute(query, (user_id,))
+            file = Path(tmp) / f"{name}.csv"
+            with file.open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow([column[0] for column in cursor.description])
+                while batch := cursor.fetchmany(_BATCH):
+                    writer.writerows(batch)
+                    rows += len(batch)
+            archive.write(file, arcname=file.name)
+            files += 1
+
+        write_table("users", "SELECT * FROM users WHERE id=?")
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+            table = row["name"]
+            if not table.isidentifier():
+                continue
+            columns = [c["name"] for c in conn.execute(f'PRAGMA table_info("{table}")')]
+            if "user_id" in columns:
+                write_table(table, f'SELECT * FROM "{table}" WHERE user_id=? ORDER BY rowid')
+        write_table("food_items", "SELECT fi.* FROM food_items fi JOIN food_log fl "
+                    "ON fi.food_log_id=fl.id WHERE fl.user_id=? ORDER BY fi.id")
+    return {"path": str(target), "files": files, "rows": rows}
 
 
 _BACKUP_GLOB = "health_????-??-??.db"
@@ -324,7 +361,7 @@ if __name__ == "__main__":
         empty_out = tmp_path / "export_empty"
         result_empty = export_all(conn, empty_uid, str(empty_out))
         assert result_empty["rows"] == 0, f"expected 0 rows for empty user, got {result_empty['rows']}"
-        bm_csv = (empty_out / "Metrics" / "body_metrics.csv").read_text(encoding="utf-8")
+        bm_csv = (empty_out / "Metrics" / "Body composition" / "body_metrics.csv").read_text(encoding="utf-8")
         assert bm_csv.strip() == ",".join(_BODY_METRICS_COLS), f"unexpected empty body_metrics.csv: {bm_csv!r}"
         sugar_csv = (empty_out / "Metrics" / "Sugar" / "sugar_log.csv").read_text(encoding="utf-8")
         assert sugar_csv.strip() == ",".join(_SUGAR_COLS), f"unexpected empty sugar_log.csv: {sugar_csv!r}"
@@ -348,7 +385,7 @@ if __name__ == "__main__":
         assert sorted(r1["files"]) == sorted(str(p) for p in dup_out.rglob("*") if p.is_file()), (
             "export produced files not accounted for in the returned manifest (possible duplicates)"
         )
-        bm_lines = (dup_out / "Metrics" / "body_metrics.csv").read_text(encoding="utf-8").splitlines()
+        bm_lines = (dup_out / "Metrics" / "Body composition" / "body_metrics.csv").read_text(encoding="utf-8").splitlines()
         assert len(bm_lines) == 1 + 5, f"expected header + 5 rows after two exports, got {len(bm_lines)}"
         print("OK: export_all() called twice into the same directory did not duplicate or corrupt files")
 

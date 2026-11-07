@@ -37,44 +37,9 @@ def _alert(code: str, severity: str, message: str, value, threshold) -> dict:
 # ---------------------------------------------------------------- LBM_RATIO / LBM_DRIFT
 
 def _lean_loss_ratio(conn: sqlite3.Connection, user_id: int, since: str | None):
-    """(ratio, d_weight, d_lean, n_точек) от медианы начала до медианы конца окна
-    (since=None -> вся история). None, если точек < 2 или вес не изменился (деление на 0).
+    from health_core.body_composition import lean_loss_ratio
 
-    МЕДИАНА ИСПОЛЬЗУЕТСЯ, ЧТОБЫ одна шумная точка на границе окна не решила сама по себе,
-    срабатывает ли гардрейл LBM_RATIO / LBM_DRIFT. Биоимпеданс носит шум гидрации в
-    килограмм в день; эндпоинт-дельта ловит одиночный всплеск как знаковый сдвиг."""
-    q = "SELECT measured_at, weight_kg, ffm_kg FROM body_metrics WHERE user_id=? AND ffm_kg IS NOT NULL"
-    params: list = [user_id]
-    if since is not None:
-        q += " AND measured_at >= ?"
-        params.append(since)
-    q += " ORDER BY measured_at ASC"
-    rows = conn.execute(q, params).fetchall()
-    if len(rows) < 2:
-        return None
-
-    # Медианное окно: 3 точки от каждого конца, деградация при < 6 точек.
-    # 6+ точек: медиана(первые 3) vs медиана(последние 3)
-    # 4-5 точек: медиана(первые 2) vs медиана(последние 2)
-    # 2-3 точки: endpoints (эндпоинт = медиана из 1)
-    n = len(rows)
-    if n >= 6:
-        window_size = 3
-    elif n >= 4:
-        window_size = 2
-    else:  # n == 2 или 3
-        window_size = 1
-
-    first_vals = [rows[i]["weight_kg"] for i in range(window_size)]
-    last_vals = [rows[n - window_size + i]["weight_kg"] for i in range(window_size)]
-    first_lean = [rows[i]["ffm_kg"] for i in range(window_size)]
-    last_lean = [rows[n - window_size + i]["ffm_kg"] for i in range(window_size)]
-
-    d_weight = statistics.median(last_vals) - statistics.median(first_vals)
-    if d_weight == 0:
-        return None
-    d_lean = statistics.median(last_lean) - statistics.median(first_lean)
-    return abs(d_lean) / abs(d_weight), d_weight, d_lean, len(rows)
+    return lean_loss_ratio(conn, user_id, since)
 
 
 def check_lbm_ratio(conn: sqlite3.Connection, user_id: int):
@@ -98,8 +63,8 @@ def check_lbm_ratio(conn: sqlite3.Connection, user_id: int):
     if ratio > threshold:
         return _alert(
             "LBM_RATIO", "critical",
-            f"Доля тощей массы в потере за {cfg['lbm_ratio_window_days']} дней "
-            f"{ratio * 100:.1f}% выше порога {threshold * 100:.0f}%.",
+            f"Оценочная доля FFM в потере веса за {cfg['lbm_ratio_window_days']} дней "
+            f"{ratio * 100:.1f}% выше порога {threshold * 100:.0f}%. FFM не равна мышечной массе.",
             round(ratio, 4), threshold,
         )
     return None
@@ -107,11 +72,6 @@ def check_lbm_ratio(conn: sqlite3.Connection, user_id: int):
 
 def check_lbm_drift(conn: sqlite3.Connection, user_id: int):
     cfg = _cfg()
-    total = conn.execute(
-        "SELECT COUNT(*) c FROM body_metrics WHERE user_id=? AND ffm_kg IS NOT NULL", (user_id,)
-    ).fetchone()["c"]
-    if total < 2:
-        return None
     res = _lean_loss_ratio(conn, user_id, since=None)
     if res is None:
         return None
@@ -136,7 +96,7 @@ def check_lbm_drift(conn: sqlite3.Connection, user_id: int):
     if ratio > threshold:
         return _alert(
             "LBM_DRIFT", "critical",
-            f"Доля тощей массы в потере от базовой точки {ratio * 100:.1f}% выше порога {threshold * 100:.0f}%.",
+            f"Оценочная доля FFM в потере веса от базовой точки {ratio * 100:.1f}% выше порога {threshold * 100:.0f}%. FFM не равна мышечной массе.",
             round(ratio, 4), threshold,
         )
     return None
@@ -202,34 +162,16 @@ def check_undereating(conn: sqlite3.Connection, user_id: int):
 # ---------------------------------------------------------------- PLATEAU
 
 def check_plateau(conn: sqlite3.Connection, user_id: int):
-    """Утренние замеры (06:00-11:00, как везде в проекте) в окне, дни рефида
-    исключены — там рост веса плановый (гликоген/вода), не сигнал плато.
-    С 6+ точками размах — |наклон линейного тренда по всем замерам| * окно в днях
-    (один шумный замер или откат тренд не ломают); меньше 6 точек — max-min."""
-    from health_core.energy import _is_refeed
+    """Короткий сигнал паузы из общей оценки; не диагноз и не причина."""
+    from health_core.plateau import assess
 
-    cfg = _cfg()
-    since = (_now(conn, user_id) - timedelta(days=cfg["plateau_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
-    rows = conn.execute(
-        "SELECT measured_at, weight_kg FROM body_metrics WHERE user_id=? AND measured_at>=? "
-        "AND time(measured_at) BETWEEN '06:00:00' AND '11:00:00' ORDER BY measured_at",
-        (user_id, since),
-    ).fetchall()
-    rows = [r for r in rows if not _is_refeed(conn, user_id, r["measured_at"][:10])]
-    if len(rows) < cfg["plateau_min_points"]:
-        return None
-    weights = [r["weight_kg"] for r in rows]
-    days = [datetime.strptime(r["measured_at"], "%Y-%m-%d %H:%M:%S").timestamp() / 86400 for r in rows]
-    if len(weights) >= 6 and days[-1] > days[0]:
-        spread = abs(statistics.linear_regression(days, weights).slope) * cfg["plateau_window_days"]
-    else:
-        spread = max(weights) - min(weights)
-    threshold = cfg["plateau_range_kg"]
-    if spread <= threshold:
+    result = assess(conn, user_id)
+    if result["short_weight_pause"]:
         return _alert(
             "PLATEAU", "warning",
-            f"Вес не двигался {cfg['plateau_window_days']} дней: размах {spread:.1f} кг не выше {threshold:.1f} кг.",
-            round(spread, 2), threshold,
+            f"Сигнал паузы веса в окне {result['window_days']} дней. "
+            "Сам по себе не подтверждает длительное плато и не устанавливает причину.",
+            result["weight_spread_10d_kg"], result["threshold_kg"],
         )
     return None
 
@@ -1007,22 +949,22 @@ def record(conn: sqlite3.Connection, user_id: int, alerts: list[dict]) -> None:
 GUARD_DEFINITIONS = {
     "LBM_RATIO": {
         "code": "LBM_RATIO",
-        "name": "Потеря мышечной массы (14 дней)",
-        "category": "Сохранение мышц",
+        "name": "Доля FFM в снижении веса (14 дней)",
+        "category": "Состав тела",
         "default_severity": "critical",
-        "description": "Контролирует долю сухой мышечной массы (FFM) в снижении общего веса за 14-дневное окно.",
-        "rationale": "При дефиците калорий приоритет — сжигать жир и сохранять метаболически активную ткань. Потеря более 15% веса за счёт мышц указывает на катаболизм, снижает базовый расход (BMR), провоцирует слабость и гормональный спад.",
-        "action": "Увеличить потребление белка (1.8–2.2 г/кг FFM), уменьшить дефицит калорий на 200–300 ккал/сут, обеспечить адекватный объём силовых тренировок.",
+        "description": "Оценивает долю изменения FFM в снижении веса по утренним дневным медианам за 14 дней.",
+        "rationale": "Порог политики для наблюдения за составом тела. Оценка FFM по весам не является измерением потери мышц и не устанавливает причину изменения.",
+        "action": "Проверить сопоставимость и даты замеров, полноту журнала питания; не менять цель по одной оценке FFM.",
         "keys": ["lbm_ratio_threshold", "lbm_ratio_window_days", "lbm_ratio_min_points", "ffm_noise_floor_kg"],
     },
     "LBM_DRIFT": {
         "code": "LBM_DRIFT",
-        "name": "Накопительный дрейф мышц (от старта)",
-        "category": "Сохранение мышц",
+        "name": "Накопительный дрейф FFM (от старта)",
+        "category": "Состав тела",
         "default_severity": "critical",
         "description": "Следит за суммарной долей потери тощей массы за всю историю наблюдений от базовой точки.",
-        "rationale": "Защищает от скрытого постепенного истощения мышечной ткани на длинной дистанции (месяцы диеты), даже если краткосрочные 14-дневные окна укладываются в лимит.",
-        "action": "Провести плановый диетический перерыв (diet break / рефид на 7–14 дней на уровне поддержки TDEE), снизить тренировочный стресс.",
+        "rationale": "Порог политики для наблюдения за составом тела. Оценка FFM по весам не является измерением потери мышц и не устанавливает причину изменения.",
+        "action": "Проверить сопоставимость и даты замеров, полноту журнала питания; не менять цель по одной оценке FFM.",
         "keys": ["lbm_drift_threshold", "ffm_noise_floor_kg"],
     },
     "FFMI_FLOOR": {
@@ -1298,24 +1240,24 @@ def get_guards_status(conn: sqlite3.Connection, user_id: int) -> list[dict]:
         if code == "LBM_RATIO":
             thresh = cfg["lbm_ratio_threshold"]
             item["threshold_val"] = f"≤ {thresh * 100:.0f}% FFM"
-            if res_14d:
+            if res_14d and res_14d[3] >= cfg["lbm_ratio_min_points"]:
                 ratio, dw, dl, n = res_14d
                 item["current_val"] = f"{ratio * 100:.1f}% FFM ({n} замеров)"
             else:
                 item["status"] = "nodata"
                 item["current_val"] = "Недостаточно точек"
-                item["message"] = f"Требуется минимум {cfg['lbm_ratio_min_points']} замера в окне {cfg['lbm_ratio_window_days']} дн."
+                item["message"] = f"Для доли нужны свежие утренние замеры минимум за {cfg['lbm_ratio_min_points']} разных дня и значимое снижение веса в окне {cfg['lbm_ratio_window_days']} дн."
 
         elif code == "LBM_DRIFT":
             thresh = cfg["lbm_drift_threshold"]
             item["threshold_val"] = f"≤ {thresh * 100:.0f}% FFM"
-            if res_drift:
+            if res_drift and res_drift[3] >= cfg["lbm_ratio_min_points"]:
                 ratio, dw, dl, n = res_drift
                 item["current_val"] = f"{ratio * 100:.1f}% FFM ({n} замеров)"
             else:
                 item["status"] = "nodata"
                 item["current_val"] = "Недостаточно точек"
-                item["message"] = "Требуется история замеров от базовой точки."
+                item["message"] = "Для доли нужна сопоставимая история со свежим замером и значимым снижением веса от базовой точки."
 
         elif code == "FFMI_FLOOR":
             thresh = cfg["ffmi_floor_f"] if sex == "f" else cfg["ffmi_floor_m"]
@@ -1542,8 +1484,8 @@ if __name__ == "__main__":
             print("---status_bar output---")
             print(bar)
             pattern = (
-                r"^Сегодня \d{2}\.\d{2}, \d{2}:\d{2}\. Вес 121\.8 \(утро\)\. Цель \d+ ккал\.\n"
-                r"Съедено 1180 / Б 96 / Ж 41 / У 58\. Вода 1\.9 / 3\.0 л\.\n"
+                r"^Сегодня \d{2}\.\d{2}, \d{2}:\d{2}\. Вес 121\.8 \(утро, 07:00\)\. Цель \d+ ккал\.\n"
+                r"По записям: съедено 1180 / Б 96 / Ж 41 / У 58\. Записано воды 1\.9 / 3\.0 л\.\n"
                 r".*Активных алертов.*\.\n"
                 r"Тренд 7 дней: −1\.2 кг\. Ближайшая веха 110 кг, осталось 11\.8\.$"
             )

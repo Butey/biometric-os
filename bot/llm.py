@@ -12,12 +12,13 @@
 """
 import asyncio
 import contextvars
+import inspect
 import json
 import logging
 import os
 import re
 import time
-from typing import Any, Callable, TypedDict
+from typing import Any, Awaitable, Callable, TypedDict
 
 import aiohttp
 
@@ -371,8 +372,8 @@ def _to_anthropic(provider: dict, messages: list[dict], tools: list[dict] | None
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
                 try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except json.JSONDecodeError:
+                    args = _tool_arguments(tc)
+                except ValueError:
                     args = {}
                 blocks.append({"type": "tool_use", "id": tc.get("id"), "name": fn.get("name"),
                                "input": args if isinstance(args, dict) else {}})
@@ -622,23 +623,37 @@ def _short(value: Any, limit: int = 300) -> str:
     return value_str if len(value_str) <= limit else value_str[:limit] + f"…(+{len(value_str) - limit})"
 
 
-async def _run_one(call: dict, dispatch: Callable[[str, dict], str]) -> str:
-    """Один вызов инструмента: разбор аргументов + исполнение в потоке."""
-    name = call["function"]["name"]
-    raw_args = call["function"].get("arguments") or "{}"
+def _tool_arguments(call: dict) -> dict:
+    """Один контракт аргументов для исполнения и ключа повторного вызова."""
+    raw_args = call["function"].get("arguments")
+    if raw_args is None or raw_args == "":
+        raw_args = "{}"
     try:
         args = json.loads(raw_args)
-    except json.JSONDecodeError as exc:
-        # Модель сама прислала битый JSON в аргументах — отдаём ей ошибку как результат инструмента
-        log.warning("битые arguments у tool_call %s: %r (%s)", name, raw_args, exc)
-        return json.dumps({"error": f"не удалось разобрать arguments: {exc}"}, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"не удалось разобрать arguments: {exc}") from exc
+    if not isinstance(args, dict):
+        raise ValueError("arguments должны быть JSON-объектом")
     # Модель (GPT) заполняет необязательные id нулями (water_id=0, user_id=0). Id в SQLite с 1,
     # а 0 хендлеры читают как «id указан» и ищут запись #0 вместо «последней».
-    if isinstance(args, dict):
-        args = {k: v for k, v in args.items()
-                if not (k.endswith("_id") and v == 0 and not isinstance(v, bool))}
+    return {k: v for k, v in args.items()
+            if not (k.endswith("_id") and v == 0 and not isinstance(v, bool))}
+
+
+async def _run_one(call: dict, dispatch: Callable[[str, dict], str | Awaitable[str]]) -> str:
+    """Один вызов инструмента: разбор аргументов + исполнение в потоке."""
+    name = call["function"]["name"]
+    raw_args = call["function"].get("arguments")
     try:
-        result = await asyncio.to_thread(dispatch, name, args)
+        args = _tool_arguments(call)
+    except ValueError as exc:
+        log.warning("битые arguments у tool_call %s: %s", name, exc)
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+    try:
+        if inspect.iscoroutinefunction(dispatch):
+            result = await dispatch(name, args)
+        else:
+            result = await asyncio.to_thread(dispatch, name, args)
     except Exception as e:
         # Ранние инструменты хода уже закоммитили в БД: не роняем ход, иначе история
         # теряет их tool_calls и повтор пользователя дублирует запись.
@@ -650,10 +665,10 @@ async def _run_one(call: dict, dispatch: Callable[[str, dict], str]) -> str:
 
 def _call_key(call: dict) -> tuple[str, str] | None:
     """(имя, канонические аргументы) — порядок ключей модель между повторами меняет.
-    Битый JSON -> None: такой вызов handler всё равно не запускает."""
+    Невалидные аргументы -> None: такой вызов handler не запускает."""
     try:
-        args = json.loads(call["function"].get("arguments") or "{}")
-    except json.JSONDecodeError:
+        args = _tool_arguments(call)
+    except ValueError:
         return None
     return call["function"]["name"], json.dumps(args, sort_keys=True, ensure_ascii=False)
 
@@ -669,17 +684,15 @@ def _error_text(result: str) -> str | None:
 
 
 async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict],
-                    providers: list[Provider], dispatch: Callable[[str, dict], str],
+                    providers: list[Provider], dispatch: Callable[[str, dict], str | Awaitable[str]],
                     max_iters: int = 6, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[str, list[dict]]:
     """Цикл: chat → если есть tool_calls, исполнить все и повторить, иначе вернуть текст.
 
-    dispatch синхронный и блокирующий (хендлеры дёргают sqlite и т.п.), поэтому вызываем
-    его через asyncio.to_thread — это не только уводит блокировку с event loop, но и
-    копирует contextvars (ContextVar с личностью звонящего registry.set_caller доезжает
-    до хендлера в отдельном потоке).
+    Синхронный dispatch вызывается через asyncio.to_thread с переносом ContextVar
+    личности звонящего. Асинхронный dispatch ожидается в текущем event loop,
+    чтобы транспорт мог подтвердить доставку файла до ответа модели.
     """
     messages = list(messages)
-    last_text = ""
     failed: dict[tuple[str, str], str] = {}  # вызовы с ошибкой в ЭТОМ ходе -> текст ошибки
 
     for _ in range(max_iters):
@@ -687,24 +700,14 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
         messages.append(clean_message(message))  # reasoning и пр. в историю не тащим
 
         tool_calls = message.get("tool_calls") or []
-        if message.get("content"):
-            last_text = message["content"]
-        elif not last_text:
-            reasoning = message.get("reasoning_content") or message.get("reasoning")
-            if reasoning:
-                last_text = reasoning
-
         if message.get("reasoning_content") or message.get("reasoning"):
             r = message.get("reasoning_content") or message.get("reasoning")
-            log.info("модель вернула reasoning (%d симв): %s", len(r), _short(r, 150))
+            log.info("модель вернула reasoning (%d симв)", len(r))
 
         if not tool_calls:
-            # Текст/reasoning ЭТОГО хода, не last_text — иначе легитимно пустой
-            # финальный ответ (content="", без reasoning) отдавал бы наружу
-            # обрывок reasoning из более раннего хода tool_calls. last_text
-            # остаётся только накопителем для аварийного возврата при max_iters.
-            own_reasoning = message.get("reasoning_content") or message.get("reasoning")
-            return message.get("content") or own_reasoning or "", messages
+            # reasoning — внутреннее поле провайдера, а не ответ человеку.
+            # Пустой content остаётся пустым даже при наличии reasoning.
+            return message.get("content") or "", messages
 
         results = []
         for call in tool_calls:
@@ -729,8 +732,12 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
                 "content": result,
             })
 
-    answer = last_text or ("Не удалось получить ответ: цикл вызова инструментов "
-                           "не сошёлся за отведённое число попыток.")
+    # Текст при tool_calls — предварительный: он написан ДО результатов
+    # последней проверки. Выдавать его как итог (например, «это плато»)
+    # при исчерпании лимита нельзя, даже если он непустой.
+    log.warning("цикл вызова инструментов исчерпал лимит: %d", max_iters)
+    answer = ("Не удалось завершить проверку данных и подготовить итоговый ответ. "
+              "Перед повтором записи проверьте журнал: часть действий могла выполниться.")
     messages.append({"role": "assistant", "content": answer})
     return answer, messages
 
@@ -953,7 +960,7 @@ if __name__ == "__main__":
                 text, msgs = await run_loop(session, [{"role": "user", "content": "зациклись"}], [{"type": "function"}],
                                              PROVIDERS, lambda n, a: "{}", max_iters=3)
                 assert isinstance(text, str) and text, text
-                assert "цикл" in text.lower(), text
+                assert "Не удалось завершить проверку" in text, text
             print("OK: 6) max_iters обрывает зацикливание и возвращает строку, а не виснет")
 
             # --- 7. reasoning с промежуточного хода tool_calls не протекает в

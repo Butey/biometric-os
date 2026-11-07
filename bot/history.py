@@ -4,6 +4,10 @@
 Соединение приходит снаружи (health_core.db.connect(), row_factory=Row).
 """
 import json
+import hashlib
+import os
+import tempfile
+from pathlib import Path
 
 from health_core.config import load as _load_config, local_now
 
@@ -112,16 +116,51 @@ def render(rows: list, limit: int = 30000) -> str:
     return "\n".join(out)[-limit:]
 
 
+def archive(conn, telegram_id: str) -> Path:
+    """Полный сохранённый диалог до сжатия, без обрезки tool-ответов."""
+    from health_core import db
+
+    uid = str(telegram_id)
+    if not uid.isascii() or not uid.isdigit():
+        raise ValueError("Для архива нужен числовой Telegram ID")
+    rows = conn.execute(
+        "SELECT rowid, ts, role, content FROM chat_history WHERE telegram_user_id=? ORDER BY rowid",
+        (uid,),
+    ).fetchall()
+    payload = {
+        "telegram_user_id": uid,
+        "messages": [{"rowid": r["rowid"], "timestamp": r["ts"],
+                      "message": json.loads(r["content"])} for r in rows],
+    }
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    directory = db.DB_PATH.parent / "history_archive" / uid
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = directory / (hashlib.sha256(data).hexdigest() + ".json")
+    if path.is_file() and path.read_bytes() == data:
+        return path
+    fd, temporary = tempfile.mkstemp(prefix=".history-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return path
+
+
 def replace(conn, telegram_id: str, up_to_rowid: int, summary: str) -> None:
     """Заменить все сообщения пользователя до up_to_rowid включительно одной
     сводкой. Она занимает освободившийся rowid, поэтому остаётся перед хвостом."""
-    conn.execute("DELETE FROM chat_history WHERE telegram_user_id=? AND rowid<=?", (str(telegram_id), up_to_rowid))
-    conn.execute(
-        "INSERT INTO chat_history(rowid, telegram_user_id, ts, role, content) VALUES (?, ?, ?, 'user', ?)",
-        (up_to_rowid, str(telegram_id), _now_iso(),
-         json.dumps({"role": "user", "content": _SUMMARY_TAG + "\n" + summary}, ensure_ascii=False)),
-    )
-    conn.commit()
+    archive(conn, telegram_id)
+    with conn:
+        conn.execute("DELETE FROM chat_history WHERE telegram_user_id=? AND rowid<=?", (str(telegram_id), up_to_rowid))
+        conn.execute(
+            "INSERT INTO chat_history(rowid, telegram_user_id, ts, role, content) VALUES (?, ?, ?, 'user', ?)",
+            (up_to_rowid, str(telegram_id), _now_iso(),
+             json.dumps({"role": "user", "content": _SUMMARY_TAG + "\n" + summary}, ensure_ascii=False)),
+        )
 
 
 def clear(conn, telegram_id: str) -> None:

@@ -107,35 +107,13 @@ def fat_mass_kg(conn: sqlite3.Connection, user_id: int) -> float | None:
 
 
 def lean_share(conn: sqlite3.Connection, user_id: int) -> float | None:
-    """Доказанная доля тощей массы в потере веса за policy.lean_share_window_days:
-    медианы веса и FFM по 5 первым и 5 последним замерам окна. Это
-    доказательство, а не прогноз — без достаточных, свежих данных о реальной
-    потере веса возвращает None (см. fat_share)."""
+    """Оценка доли FFM в потере за окно политики; FFM не равна мышечной массе."""
+    from health_core.body_composition import lean_loss_ratio
+
     policy = load()["policy"]
-    window_days = policy["lean_share_window_days"]
-    min_points = policy["lean_share_min_points"]
-    min_loss = policy["lean_share_min_loss_kg"]
-    no_measure_days = load()["guards"]["no_measure_days"]
-
-    since = (user_now(conn, user_id) - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
-    rows = conn.execute(
-        "SELECT measured_at, weight_kg, ffm_kg FROM body_metrics WHERE user_id=? "
-        "AND ffm_kg IS NOT NULL AND measured_at >= ? ORDER BY measured_at ASC",
-        (user_id, since),
-    ).fetchall()
-    if len(rows) < min_points:
-        return None
-    gap = (user_now(conn, user_id).date() - date.fromisoformat(rows[-1]["measured_at"][:10])).days
-    if gap > no_measure_days:
-        return None
-
-    k = min(5, len(rows))
-    first, last = rows[:k], rows[-k:]
-    d_weight = statistics.median(r["weight_kg"] for r in last) - statistics.median(r["weight_kg"] for r in first)
-    if -d_weight < min_loss:
-        return None  # потери меньше min_loss (в т.ч. набор) — доказательства нет
-    d_lean = statistics.median(r["ffm_kg"] for r in last) - statistics.median(r["ffm_kg"] for r in first)
-    return max(0.0, -d_lean) / -d_weight  # набор тощей массы на фоне потери — не потеря мышц
+    since = (user_now(conn, user_id) - timedelta(days=policy["lean_share_window_days"])).strftime("%Y-%m-%d %H:%M:%S")
+    result = lean_loss_ratio(conn, user_id, since, min_points=policy["lean_share_min_points"])
+    return result[0] if result is not None else None
 
 
 def fat_share(conn: sqlite3.Connection, user_id: int, fat_pct: float) -> float:
@@ -169,9 +147,11 @@ def fat_share(conn: sqlite3.Connection, user_id: int, fat_pct: float) -> float:
 
 
 def _smoothed_weight_kg(conn: sqlite3.Connection, user_id: int) -> float | None:
-    """Последний сглаженный вес — медиана за policy.weight_trend_window_days
-    дней от последнего замера. Опора потолка дефицита (см. kcal_floor): без
-    сглаживания один шумный день на весах двигал бы потолок сам по себе."""
+    """Последний сглаженный вес за policy.weight_trend_window_days дней от
+    последнего утреннего замера: медиана внутри дня (несколько вставаний за
+    одно утро не перекашивают окно), затем точка на линии тренда на последнюю
+    дату (как в forecast.smoothed_weight, чтобы оценка не отставала при
+    снижении массы). Опора потолка дефицита и дефицита до вехи."""
     window_days = load()["policy"].get("weight_trend_window_days", 7)
     last = conn.execute(
         "SELECT measured_at FROM body_metrics WHERE user_id=? AND weight_kg IS NOT NULL "
@@ -184,13 +164,25 @@ def _smoothed_weight_kg(conn: sqlite3.Connection, user_id: int) -> float | None:
     end = date.fromisoformat(last["measured_at"][:10])
     start = end.fromordinal(end.toordinal() - window_days + 1)
     rows = conn.execute(
-        "SELECT weight_kg FROM body_metrics WHERE user_id=? AND weight_kg IS NOT NULL "
+        "SELECT date(measured_at) d, weight_kg FROM body_metrics WHERE user_id=? AND weight_kg IS NOT NULL "
         "AND date(measured_at) BETWEEN ? AND ? "
-        "AND time(measured_at) BETWEEN '06:00:00' AND '11:00:00'",
+        "AND time(measured_at) BETWEEN '06:00:00' AND '11:00:00' "
+        "ORDER BY measured_at",
         (user_id, start.isoformat(), end.isoformat()),
     ).fetchall()
-    vals = [r["weight_kg"] for r in rows]
-    return statistics.median(vals) if vals else None
+    if not rows:
+        return None
+    by_day: dict[str, list[float]] = {}
+    for r in rows:
+        by_day.setdefault(r["d"], []).append(r["weight_kg"])
+    ordered = sorted(by_day)
+    ys = [statistics.median(by_day[d]) for d in ordered]
+    if len(ys) < 3:
+        return statistics.median(ys)
+    last_d = date.fromisoformat(ordered[-1])
+    xs = [(date.fromisoformat(d) - last_d).days for d in ordered]
+    _slope, icpt = statistics.linear_regression(xs, ys)
+    return min(max(icpt, min(ys)), max(ys))
 
 
 def _deficit_cap_kcal(conn: sqlite3.Connection, user_id: int) -> float | None:

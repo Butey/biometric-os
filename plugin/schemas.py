@@ -496,12 +496,12 @@ log_med_schema = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["add", "delete", "list"],
-            "description": "add (умолчание) — записать приём; delete — удалить (med_id, без него — последний); list — список"
+            "enum": ["add", "update", "delete", "list"],
+            "description": "add — новый приём; update — исправить дату существующего (med_id + at), без повторного списания запаса; delete — удалить; list — список"
         },
         "med_id": {
             "type": "integer",
-            "description": "Для action=delete: номер записи"
+            "description": "Для action=update/delete: номер записи из list; обязателен для update"
         },
         "drug": {
             "type": "string",
@@ -531,7 +531,7 @@ log_med_schema = {
         },
         "at": {
             "type": "string",
-            "description": "ISO timestamp, по умолчанию сейчас"
+            "description": "Дата/время ФАКТИЧЕСКОГО приёма в местном времени, не дата сообщения. Для «в прошлое воскресенье» вычисли дату по текущей дате пользователя и передай at обязательно. Если часы неизвестны — YYYY-MM-DD. Для update обязательно. Только если день не назван — по умолчанию сейчас."
         },
         "limit": {
             "type": "integer",

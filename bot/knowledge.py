@@ -4,7 +4,12 @@
 импорте: файлы добавляются через веб-админку на живой системе, перезапуск
 бота ради нового файла недопустим.
 """
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
+import math
+import re
+import unicodedata
 
 from plugin import tools as _tools
 
@@ -16,6 +21,12 @@ _EXTS = (".md", ".txt")
 _ADMIN_ONLY = "admin_commands"
 _FULL_LIMIT = 20 * 1024   # файл целиком, байт
 _SEARCH_LIMIT = 8 * 1024  # выдача по query, байт максимум
+_QUERY_LIMIT = 1024
+
+
+def _normalize(text: str) -> str:
+    """Одинаковый поиск для NFC/NFD, регистра и е/ё; без удалённых embeddings."""
+    return unicodedata.normalize("NFC", text).casefold().replace("ё", "е")
 
 
 def _is_admin() -> bool:
@@ -31,7 +42,14 @@ def _personal_dir() -> Path | None:
 
 def _dirs() -> list[Path]:
     personal = _personal_dir()
-    return [d for d in (personal, KNOWLEDGE_DIR) if d is not None and d.is_dir()]
+    dirs = []
+    if (personal is not None and personal.is_dir() and not personal.is_symlink()
+            and not personal.parent.is_symlink()
+            and personal.resolve().parent == KNOWLEDGE_DIR.resolve() / "personal"):
+        dirs.append(personal)
+    if KNOWLEDGE_DIR.is_dir():
+        dirs.append(KNOWLEDGE_DIR)
+    return dirs
 
 
 def _topics() -> list[Path]:
@@ -42,7 +60,10 @@ def _topics() -> list[Path]:
     for d in _dirs():
         for ext in _EXTS:
             for p in d.glob(f"*{ext}"):
-                by_stem.setdefault(p.stem, p)
+                # В индекс и поиск попадают только файлы внутри разрешённого
+                # каталога: симлинк не должен расширять область чтения.
+                if p.is_file() and not p.is_symlink() and p.resolve().parent == d.resolve():
+                    by_stem.setdefault(_normalize(p.stem), p)
     admin = _is_admin()
     return [p for stem, p in sorted(by_stem.items()) if admin or stem != _ADMIN_ONLY]
 
@@ -85,17 +106,17 @@ def index() -> str:
 
 
 def schema() -> dict:
-    topic = {"type": "string", "description": "Тема из базы знаний Knowledge/"}
+    topic = {"type": "string", "description": "Тема из базы знаний Knowledge/; '*' — поиск query по всем доступным темам"}
     stems = [p.stem for p in _topics()]
     if stems:                       # пустой enum провайдеры отвергают
-        topic["enum"] = stems
+        topic["enum"] = [*stems, "*"]
     return {
         "type": "object",
         "properties": {
             "topic": topic,
             "query": {
                 "type": "string",
-                "description": "Подстрока поиска — обязательна для файлов больше 20 KB",
+                "description": "Слова или фраза для локального поиска; обязательны для topic='*' и файлов больше 20 KB. Результаты с источниками ограничены 8 KB",
             },
         },
         "required": ["topic"],
@@ -103,54 +124,164 @@ def schema() -> dict:
 
 
 def _resolve(topic: str) -> Path | None:
-    """Путь собирается от KNOWLEDGE_DIR + расширение; topic приходит от модели —
-    граница доверия, поэтому итог обязан лежать ВНУТРИ каталога (resolve +
-    сравнение), иначе "../../.env" утечёт файлом."""
+    """Тема от модели выбирает только файл из разрешённого каталога _topics().
+
+    Разделители пути и traversal не являются темами; NFC/NFD и е/ё
+    сопоставляются одинаково на разных файловых системах.
+    """
     if not isinstance(topic, str) or not topic or any(c in topic for c in "/\\\0") or ".." in topic:
         return None
     # Файл обязан лежать ПРЯМО в своём каталоге, а не где-то внутри: иначе
     # topic "personal/<чужой id>/protocol" прочитал бы чужие личные документы.
-    for d in _dirs():
-        base = d.resolve()
-        for ext in _EXTS:
-            candidate = (d / f"{topic}{ext}").resolve()
-            if candidate.parent == base and candidate.is_file():
-                return candidate
+    # macOS хранит часть имён в NFD, модель может вернуть тот же текст в NFC.
+    for candidate in _topics():
+        if _normalize(candidate.stem) == _normalize(topic):
+            return candidate
     return None
 
 
+def _clip_bytes(text: str, limit: int) -> str:
+    return text.encode("utf-8")[:max(0, limit)].decode("utf-8", errors="ignore")
+
+
+@dataclass(frozen=True)
+class _SearchChunk:
+    path: Path
+    heading: str
+    text: str
+    normalized: str
+    token_count: int
+    matches: dict[str, int]
+
+
+def _search_chunks(paths: list[Path], phrase: str, terms: set[str]) -> list[_SearchChunk]:
+    chunks = []
+    for path in paths:
+        heading = ""
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for paragraph in re.split(r"\n\s*\n", text):
+            if not paragraph.strip():
+                continue
+            headings = re.findall(r"^#{1,6}\s+(.+)$", paragraph, re.MULTILINE)
+            if headings:
+                heading = headings[-1]
+            paragraph = unicodedata.normalize("NFC", paragraph)
+            # Перекрытие сохраняет контекст совпадения у границы фрагмента.
+            for offset in range(0, len(paragraph), 2100):
+                part = paragraph[offset:offset + 2400]
+                normalized = _normalize(part)
+                counts = Counter(re.findall(r"\w+", normalized))
+                matches = {term: counts[term] for term in terms}
+                if any(matches.values()) or phrase in normalized:
+                    chunks.append(_SearchChunk(path, heading, part, normalized,
+                                               counts.total(), matches))
+    return chunks
+
+
+def _rank_chunks(chunks: list[_SearchChunk], phrase: str, terms: set[str]) -> list[_SearchChunk]:
+    """BM25 по кандидатам; сначала точная фраза и покрытие слов запроса."""
+    size = len(chunks)
+    average = sum(c.token_count for c in chunks) / size or 1
+    frequency = {t: sum(bool(c.matches[t]) for c in chunks) for t in terms}
+
+    def score(chunk: _SearchChunk):
+        matched = sum(bool(n) for n in chunk.matches.values())
+        rank = 0.0
+        for term, count in chunk.matches.items():
+            if count:
+                idf = math.log(1 + (size - frequency[term] + .5) / (frequency[term] + .5))
+                rank += idf * count * 2.2 / (count + 1.2 * (.25 + .75 * chunk.token_count / average))
+        return (phrase in chunk.normalized, matched / len(terms), rank)
+
+    return sorted(chunks, key=score, reverse=True)
+
+
+def _excerpt(text: str, phrase: str, terms: set[str], limit: int) -> tuple[str, bool]:
+    if len(text.encode("utf-8")) <= limit:
+        return text, False
+    # Позиции считаем в исходном тексте: casefold может менять длину Unicode.
+    normalized_position = _normalize(text).find(phrase)
+    if normalized_position >= 0:
+        cursor = 0
+        position = 0
+        for position, char in enumerate(text):
+            cursor += len(_normalize(char))
+            if cursor > normalized_position:
+                break
+    else:
+        position = next((m.start() for m in re.finditer(r"\w+", text)
+                         if _normalize(m.group()) in terms), 0)
+    start = max(0, position - 100)
+    prefix = "… " if start else ""
+    return prefix + _clip_bytes(text[start:], limit - len(prefix.encode("utf-8"))), True
+
+
+def _render_search(chunks: list[_SearchChunk], phrase: str, terms: set[str]) -> str:
+    out = []
+    total = 0
+    shown = 0
+    note_template = "\n\n… ещё {count} совпадений не показано; длинные фрагменты сокращены, уточните query."
+    budget = _SEARCH_LIMIT - len(note_template.format(count=len(chunks)).encode("utf-8"))
+    shortened = False
+    for chunk in chunks:
+        source = chunk.path.relative_to(KNOWLEDGE_DIR).as_posix()
+        header = f"[Источник: {source}; тема: {chunk.path.stem}]"
+        if chunk.heading:
+            header += "\nРаздел: " + _clip_bytes(chunk.heading, 300)
+        separator = "\n\n" if out else ""
+        available = budget - total - len((separator + header + "\n").encode("utf-8"))
+        if available < 120:
+            break
+        excerpt, clipped = _excerpt(chunk.text, phrase, terms, min(3600, available))
+        shortened |= clipped
+        block = separator + header + "\n" + excerpt
+        out.append(block)
+        total += len(block.encode("utf-8"))
+        shown += 1
+    result = "".join(out)
+    if shown < len(chunks) or shortened:
+        result += note_template.format(count=len(chunks) - shown)
+    return result
+
+
+def _search(paths: list[Path], query: str) -> str:
+    """Локальный лексический поиск; без стемминга и семантической модели.
+
+    Документы перечитываются при вызове. Сбор фрагментов, ранжирование и
+    ограничение выдачи разделены, чтобы изменения поиска не затронули ACL.
+    """
+    phrase = _normalize(query.strip())
+    terms = set(re.findall(r"\w+", phrase))
+    if not terms:
+        return "Для поиска нужны слова или фраза в query."
+    chunks = _search_chunks(paths, phrase, terms)
+    if not chunks:
+        return f"По запросу «{query}» ничего не найдено. Уточните слова или тему."
+    return _render_search(_rank_chunks(chunks, phrase, terms), phrase, terms)
+
+
 def read(topic: str, query: str | None = None) -> str:
+    if query is not None and not isinstance(query, str):
+        return "query должен быть строкой: слова или фраза для поиска."
+    if query and len(query.encode("utf-8")) > _QUERY_LIMIT:
+        return "Запрос query слишком длинный (максимум 1024 байта); сократите его до ключевых слов."
     if topic == _ADMIN_ONLY and not _is_admin():
         return f"Тема «{topic}» недоступна."
+    if topic in ("*", "") and query:
+        return _search(_topics(), query)
+    if topic == "*":
+        return "Для поиска по всем темам нужен query: слова или фраза."
     path = _resolve(topic)
     if path is None:
         return f"Тема «{topic}» не найдена. Список тем — в knowledge index."
 
+    if query:
+        return _search([path], query)
     text = path.read_text(encoding="utf-8", errors="replace")
     if len(text.encode("utf-8")) <= _FULL_LIMIT:
         return text
-    if not query:
-        return (f"Файл «{topic}» больше 20 KB — нужен query: подстрока, по которой "
-                f"выбрать абзацы.")
-
-    # ponytail: подстрочный поиск, не эмбеддинги — менять, когда книг станет больше десятка
-    q = query.lower()
-    hits = [p for p in text.split("\n\n") if q in p.lower()]
-    if not hits:
-        return f"По запросу «{query}» в «{topic}» ничего не найдено."
-
-    out, total = [], 0
-    for p in hits:
-        b = len(p.encode("utf-8"))
-        if out and total + b > _SEARCH_LIMIT:
-            break
-        out.append(p)
-        total += b
-    remaining = len(hits) - len(out)
-    result = "\n\n".join(out)
-    if remaining > 0:
-        result += f"\n\n… ещё {remaining} совпадений не показано, уточните query."
-    return result
+    return (f"Файл «{topic}» больше 20 KB — нужен query: слова или фраза, по которым "
+            f"выбрать фрагменты.")
 
 
 if __name__ == "__main__":

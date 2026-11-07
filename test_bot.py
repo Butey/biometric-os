@@ -64,7 +64,7 @@ def test_tool_specs():
     _tools._set_mode("111222", "user")
     specs = main.tool_specs()
     names = [s["function"]["name"] for s in specs]
-    assert len(names) == 39, f"38 инструментов плагина (без admin_cmd) + knowledge, получено {len(names)}"
+    assert len(names) == 40, f"38 инструментов плагина + knowledge + export_data, получено {len(names)}"
     assert "knowledge" in names, "инструмент знаний не подключён"
     assert "log_food" in names and "get_status_bar" in names
     assert "admin_cmd" not in names, "admin_cmd не должен быть виден не-админу"
@@ -75,7 +75,7 @@ def test_tool_specs():
 
     _tools._set_mode("111222", "admin")
     admin_names = [s["function"]["name"] for s in main.tool_specs()]
-    assert len(admin_names) == 40, f"39 инструментов плагина + knowledge для админа, получено {len(admin_names)}"
+    assert len(admin_names) == 41, f"39 инструментов плагина + knowledge + export_data для админа, получено {len(admin_names)}"
     assert "admin_cmd" in admin_names, "admin_cmd должен быть виден админу"
     _tools._set_mode("111222", "user")
 
@@ -163,7 +163,7 @@ def test_water_reminder_only_when_a_portion_behind():
         def _at(clock):
             return patch.object(_wr, "user_now", lambda *a, **k: _dt.fromisoformat(f"{today} {clock}"))
 
-        with _at("15:00:00"), patch.object(_wr, "user_today", lambda *a, **k: today):
+        with _at("15:00:00"):
             msg = _wr.reminder(conn, 986)
             assert msg and "Добери" in msg, msg
             conn.execute("INSERT INTO water_log(user_id, at, volume_ml) VALUES (986, ?, 5000)", (f"{today} 14:00:00",))
@@ -171,9 +171,9 @@ def test_water_reminder_only_when_a_portion_behind():
             assert _wr.reminder(conn, 986) is None, "норма выполнена - тишина"
         conn.execute("DELETE FROM water_log WHERE user_id=986")
         conn.commit()
-        with _at("20:30:00"), patch.object(_wr, "user_today", lambda *a, **k: today):
+        with _at("20:30:00"):
             assert _wr.reminder(conn, 986) is None, "после 20:00 тишина"
-        with _at("08:30:00"), patch.object(_wr, "user_today", lambda *a, **k: today):
+        with _at("08:30:00"):
             assert _wr.reminder(conn, 986) is None, "в 08:30 отставание меньше порции"
     finally:
         conn.execute("DELETE FROM water_log WHERE user_id=986")
@@ -334,7 +334,7 @@ def test_telegram_menu():
     assert handled == admin, f"команды без пункта меню у админа: {handled - admin}"
     assert {"model", "approve", "deny", "revoke", "access", "users", "mode"} <= admin
     assert not {"model", "approve", "deny", "revoke", "access", "users", "mode"} & user, "админские команды в меню пользователя"
-    assert {"new", "help", "status", "week", "wipe"} <= user
+    assert {"new", "help", "status", "week", "wipe", "export"} <= user
 
 
 def test_personal_knowledge_isolated():
@@ -415,6 +415,49 @@ def test_tool_loop_limit_is_recorded():
     assert answer, "пустой ответ вместо объяснения"
     assert full[-1]["role"] == "assistant", f"ход кончается на {full[-1]['role']}"
     assert full[-1]["content"] == answer, "показанный текст разошёлся с сохранённым"
+
+
+def test_tool_loop_limit_does_not_publish_provisional_claims():
+    """Гипотеза до проверки инструментом не становится итогом при лимите."""
+    from unittest.mock import patch
+
+    provisional = "Плато подтверждено, причина — неправильные пищевые привычки."
+    call = {"id": "plateau-check", "type": "function", "function": {
+        "name": "forecast", "arguments": '{"action":"plateau"}',
+    }}
+    dispatched = []
+
+    def dispatch(name, args):
+        dispatched.append((name, args))
+        return json.dumps({"plateau": {"detected": False}})
+
+    for field in ("content", "reasoning_content", "reasoning"):
+        response = {"role": "assistant", "content": None, "tool_calls": [call],
+                    field: provisional}
+        with patch.object(llm, "_post", scripted(response)):
+            answer, full = asyncio.run(llm.run_loop(
+                None, [{"role": "user", "content": "Почему вес стоит?"}],
+                [], PROVIDERS, dispatch, max_iters=1))
+        assert provisional not in answer, (field, answer)
+        assert "Не удалось завершить проверку" in answer, answer
+        assert full[-1]["content"] == answer
+        assert any(m["role"] == "tool" for m in full), "результат проверки потерян"
+    assert len(dispatched) == 3, dispatched
+
+
+def test_reasoning_only_final_response_is_not_published():
+    """Внутренний reasoning провайдера не заменяет отсутствующий ответ."""
+    from unittest.mock import patch
+
+    for field in ("reasoning_content", "reasoning"):
+        with patch.object(llm, "_post", scripted({
+            "role": "assistant", "content": None, field: "Внутренняя гипотеза о плато",
+        })):
+            answer, full = asyncio.run(llm.run_loop(
+                None, [{"role": "user", "content": "Почему вес стоит?"}],
+                [], PROVIDERS, lambda name, args: "{}"))
+        assert answer == "", (field, answer)
+        assert field not in full[-1], full[-1]
 
 
 def test_user_lock_serializes_same_user_only():
@@ -1449,15 +1492,20 @@ def test_forecast_calibrate():
             "VALUES(992,'115 кг','weight_kg',115.0, ?)", ((today + timedelta(days=40)).isoformat(),))
         conn.commit()
 
-        # Режим 1: принудительная калорийность 1750 (ниже пола 1799 -> safe=False с предупреждением)
-        raw = main.dispatch("forecast", {"action": "calibrate", "target_kcal": 1750, "user_id": 992})
+        # Безопасность проверяем относительно действующей политики, не старого
+        # фиксированного пола: policy/config могут менять его для этого профиля.
+        from health_core.energy import daily_expenditure, kcal_floor
+        floor, _ = kcal_floor(conn, 992, daily_expenditure(conn, 992, today.isoformat())["kcal"])
+        below_floor = max(1, int(floor) - 100)
+        above_floor = int(floor) + 200
+        raw = main.dispatch("forecast", {"action": "calibrate", "target_kcal": below_floor, "user_id": 992})
         out = json.loads(main.strip_tool_rules(raw))
         assert out.get("mode") == "force_kcal", out
         assert out.get("safe") is False, out
         assert "ниже безопасного пола" in out.get("safety_warnings", [""])[0], out
 
-        # Режим 2: безопасная калорийность 1900 (выше пола 1799) + согласование и применение (apply=True)
-        raw_app = main.dispatch("forecast", {"action": "calibrate", "target_kcal": 1900, "apply": True, "user_id": 992})
+        # Режим 2: безопасная калорийность + согласование и применение.
+        raw_app = main.dispatch("forecast", {"action": "calibrate", "target_kcal": above_floor, "apply": True, "user_id": 992})
         out_app = json.loads(main.strip_tool_rules(raw_app))
         assert out_app.get("safe") is True, out_app
         assert out_app.get("applied") is True, out_app
@@ -1507,7 +1555,8 @@ def test_forecast_plateau():
         out = json.loads(main.strip_tool_rules(raw))
         assert "pharmacological_plateau" in out, out
         ph = out["pharmacological_plateau"]
-        assert ph.get("phase") in ("активное снижение", "приближение к плато", "в фазе плато"), ph
+        assert ph.get("phase") == "популяционный ориентир", ph
+        assert ph.get("expected_date") is None and ph.get("is_individual_prediction") is False, ph
         assert ph.get("median_plateau_weeks") is not None
         assert ph.get("weeks_on_program") is not None
 
@@ -1575,9 +1624,19 @@ def test_interactive_commands_target_plateau_forecast():
         plat_msg, plat_kb = main._format_plateau_interactive("988", "")
         assert "плато" in plat_msg.lower()
         assert "SURMOUNT" in plat_msg
+        assert "Ожидаемая дата плато на текущей дозе" not in plat_msg
+        assert "осталось ~" not in plat_msg and "None" not in plat_msg
+        assert "сценарий питания" in plat_msg.lower() or "Сценарий по целевому калоражу" in plat_msg or "полнота журнала не подтверждена" in plat_msg
         assert plat_kb is not None
-        assert any(b.callback_data == "plateau_refeed" for row in plat_kb.inline_keyboard for b in row)
+        assert not any(b.callback_data == "plateau_refeed" for row in plat_kb.inline_keyboard for b in row), "нет длительной паузы и замеров талии — не предлагать рефид"
         assert any(b.callback_data == "plateau_council" for row in plat_kb.inline_keyboard for b in row)
+        from unittest.mock import patch
+        from health_core import forecast
+        sustained = forecast.plateau_forecast(conn, 988)
+        sustained["current_stagnation"]["sustained_weight_waist_pause"] = True
+        with patch.object(forecast, "plateau_forecast", return_value=sustained):
+            _, sustained_kb = main._format_plateau_interactive("988", "")
+        assert any(b.callback_data == "plateau_refeed" for row in sustained_kb.inline_keyboard for b in row)
 
         # 5. /forecast interactive
         fc_msg, fc_kb = main._format_forecast_interactive("988", "")
@@ -1804,6 +1863,97 @@ def test_unnamed_time_ignores_model_at():
     _water_rows(7802)
     assert ats[0][:10] == config.local_today() and ats[0] != "2026-10-08 22:11:00", ats
     assert ats[1] == "2026-10-08 09:30:00", ats
+
+
+def test_med_past_weekday_keeps_event_date_and_requires_at():
+    """Сообщённый в среду воскресный укол сохраняет дату события и одну дозу запаса."""
+    from datetime import datetime
+    from unittest.mock import patch
+    from health_core import config
+    uid = 7810
+    _water_user(uid)
+    conn = connect()
+    conn.execute(
+        "INSERT INTO med_schedule(user_id,substance,dose,unit,route,every_days,next_at,stock_doses) "
+        "VALUES (?, 'Тирзепатид',12.5,'mg','injection',7,'2026-11-08 22:00:00',3)", (uid,))
+    conn.commit()
+    conn.close()
+    try:
+        with patch.object(config, "user_now", return_value=datetime(2026, 11, 4, 21, 51)):
+            config.set_user_text("В прошлое воскресенье сделал укол, забыл записать")
+            args = {"drug": "Тирзепатид", "dose": "12.5", "unit": "mg", "route": "injection"}
+            missing = json.loads(registry.dispatch("log_med", args))
+            assert "error" in missing, missing
+            wrong_date = json.loads(registry.dispatch("log_med", {**args, "at": "2026-11-04 21:51:00"}))
+            assert "error" in wrong_date and wrong_date.get("expected_date") == "2026-11-01", wrong_date
+            conn = connect()
+            assert conn.execute("SELECT COUNT(*) n FROM med_log WHERE user_id=?", (uid,)).fetchone()["n"] == 0
+            assert conn.execute("SELECT stock_doses FROM med_schedule WHERE user_id=?", (uid,)).fetchone()[0] == 3
+            conn.close()
+            result = json.loads(registry.dispatch("log_med", {**args, "at": "2026-11-01 22:00:00"}))
+            assert result.get("at") == "2026-11-01 22:00:00", result
+        conn = connect()
+        row = conn.execute("SELECT at FROM med_log WHERE user_id=?", (uid,)).fetchone()
+        sched = conn.execute("SELECT next_at, stock_doses FROM med_schedule WHERE user_id=?", (uid,)).fetchone()
+        conn.close()
+        assert row["at"] == "2026-11-01 22:00:00"
+        assert sched["next_at"] == "2026-11-08 22:00:00" and sched["stock_doses"] == 2, dict(sched)
+    finally:
+        config.set_user_text(None)
+        conn = connect()
+        conn.execute("DELETE FROM med_log WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM med_schedule WHERE user_id=?", (uid,))
+        conn.commit()
+        conn.close()
+        _water_rows(uid)
+
+
+def test_med_date_update_preserves_stock_schedule_and_user_boundary():
+    """Исправление даты меняет существующую запись, без новой дозы и чужих записей."""
+    from health_core import config
+    uid = 7811
+    _water_user(uid)
+    conn = connect()
+    med_id = conn.execute(
+        "INSERT INTO med_log(user_id,substance,dose,unit,route,at) "
+        "VALUES (?,'Тирзепатид','12.5','mg','injection','2026-11-04 21:51:27')", (uid,)).lastrowid
+    conn.execute(
+        "INSERT INTO med_schedule(user_id,substance,every_days,next_at,stock_doses) "
+        "VALUES (?,'Тирзепатид',7,'2026-11-08 22:00:00',2)", (uid,))
+    conn.commit()
+    before = dict(conn.execute("SELECT * FROM med_schedule WHERE user_id=?", (uid,)).fetchone())
+    conn.close()
+    try:
+        config.set_user_text("Да, исправь")
+        missing = json.loads(registry.dispatch("log_med", {"action": "update", "med_id": med_id}))
+        assert "error" in missing, missing
+        missing_id = json.loads(registry.dispatch("log_med", {"action": "update", "at": "2026-11-01"}))
+        assert "error" in missing_id, missing_id
+        result = json.loads(registry.dispatch("log_med", {
+            "action": "update", "med_id": med_id, "at": "2026-11-01 21:51:27"}))
+        assert result.get("updated") and result["previous_at"] == "2026-11-04 21:51:27", result
+        assert result["at"] == "2026-11-01 21:51:27" and not result["stock_changed"], result
+        conn = connect()
+        rows = conn.execute("SELECT id,at FROM med_log WHERE user_id=?", (uid,)).fetchall()
+        after = dict(conn.execute("SELECT * FROM med_schedule WHERE user_id=?", (uid,)).fetchone())
+        conn.close()
+        assert len(rows) == 1 and rows[0]["id"] == med_id and rows[0]["at"] == result["at"]
+        assert after == before, (before, after)
+        registry.set_caller("111")
+        foreign = json.loads(registry.dispatch("log_med", {
+            "action": "update", "med_id": med_id, "at": "2026-11-02 21:51:27"}))
+        assert "error" in foreign, foreign
+        conn = connect()
+        assert conn.execute("SELECT at FROM med_log WHERE id=?", (med_id,)).fetchone()[0] == result["at"]
+        conn.close()
+    finally:
+        config.set_user_text(None)
+        conn = connect()
+        conn.execute("DELETE FROM med_log WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM med_schedule WHERE user_id=?", (uid,))
+        conn.commit()
+        conn.close()
+        _water_rows(uid)
 
 
 def test_failure_before_commit_stays_error():
@@ -2041,6 +2191,693 @@ def test_weight_history_chart():
         conn.commit()
         conn.close()
         _water_rows(7810)
+
+
+def test_knowledge_normalized_topics_and_query():
+    import unicodedata
+    with tempfile.TemporaryDirectory() as tmp:
+        kdir = Path(tmp)
+        stem = unicodedata.normalize("NFD", "здоровый сон")
+        (kdir / f"{stem}.md").write_text(
+            "# Сон\n\nРегулярный сон снижает стресс.\n\nСтресс требует внимания.\n\nЕщё рекомендации про сон.\n\nЧужой нерелевантный абзац.",
+            encoding="utf-8")
+        old = knowledge.KNOWLEDGE_DIR
+        knowledge.KNOWLEDGE_DIR = kdir
+        try:
+            assert "Регулярный" in knowledge.read("здоровый сон"), "NFC запрос не находит NFD имя"
+            found = knowledge.read("здоровый сон", "ЕЩЕ")
+            assert "Ещё рекомендации" in found, "ё/е и регистр должны нормализоваться"
+            assert "Чужой нерелевантный абзац" not in found, "query игнорируется для малого файла"
+            found = knowledge.read("здоровый сон", "стресс сон")
+            assert "Регулярный сон снижает стресс" in found, "слова запроса не обязаны идти подряд"
+            assert found.index("Регулярный сон снижает стресс") < found.index("Стресс требует внимания"), "полное покрытие слов должно быть выше частичного"
+            assert "Источник:" in found and "Раздел: Сон" in found, "утерян контекст фрагмента"
+        finally:
+            knowledge.KNOWLEDGE_DIR = old
+
+
+def test_knowledge_cross_topic_search_acl_and_live_updates():
+    with tempfile.TemporaryDirectory() as tmp:
+        kdir = Path(tmp)
+        mine = kdir / "personal" / "900002"
+        other = kdir / "personal" / "900003"
+        mine.mkdir(parents=True)
+        other.mkdir(parents=True)
+        (kdir / "общая.md").write_text("Поиск: питание, общий источник.", encoding="utf-8")
+        (mine / "заметки.md").write_text("Поиск: питание, мой источник.", encoding="utf-8")
+        (other / "заметки.md").write_text("Поиск: питание, ЧУЖОЙ_СЕКРЕТ.", encoding="utf-8")
+        (kdir / "admin_commands.md").write_text("Поиск: питание, ADMIN_СЕКРЕТ.", encoding="utf-8")
+        old = knowledge.KNOWLEDGE_DIR
+        knowledge.KNOWLEDGE_DIR = kdir
+        registry.set_caller("900002")
+        try:
+            found = knowledge.read("*", "питание")
+            assert "общий источник" in found and "мой источник" in found, "нет поиска по всем доступным темам"
+            assert "ЧУЖОЙ_СЕКРЕТ" not in found and "ADMIN_СЕКРЕТ" not in found, "поиск расширил права чтения"
+            assert "общий источник" in knowledge.read("", "питание"), "empty topic+query несовместим с общим поиском"
+            (kdir / "новая.md").write_text("Питание: свежий документ.", encoding="utf-8")
+            assert "свежий документ" in knowledge.read("*", "питание"), "новый документ требует рестарт"
+            (kdir / "новая.md").write_text("Питание: обновлённый документ.", encoding="utf-8")
+            refreshed = knowledge.read("*", "питание")
+            assert "обновлённый документ" in refreshed and "свежий документ" not in refreshed
+            assert "query" in knowledge.read("*"), "глобальное чтение без query не должно выгружать весь корпус"
+        finally:
+            knowledge.KNOWLEDGE_DIR = old
+            registry.set_caller("111")
+
+
+def test_knowledge_search_hard_byte_limit_and_late_match():
+    with tempfile.TemporaryDirectory() as tmp:
+        kdir = Path(tmp)
+        text = ("Шум " * 1000) + "уникальныймаркер " + ("Шум " * 10000)
+        (kdir / "большой.md").write_text(text, encoding="utf-8")
+        old = knowledge.KNOWLEDGE_DIR
+        knowledge.KNOWLEDGE_DIR = kdir
+        try:
+            found = knowledge.read("большой", "уникальныймаркер")
+            assert "уникальныймаркер" in found, "обрезка скрыла само совпадение"
+            assert len(found.encode("utf-8")) <= knowledge._SEARCH_LIMIT, "один большой абзац обошёл бюджет"
+            assert "сокращены" in found, "усечение должно быть явно обозначено"
+            assert "ничего не найдено" in knowledge.read("большой", "отсутствует")
+        finally:
+            knowledge.KNOWLEDGE_DIR = old
+
+
+def test_knowledge_search_rejects_oversized_or_malformed_query():
+    with tempfile.TemporaryDirectory() as tmp:
+        kdir = Path(tmp)
+        (kdir / "тема.md").write_text("Небольшой документ о питании.", encoding="utf-8")
+        old = knowledge.KNOWLEDGE_DIR
+        knowledge.KNOWLEDGE_DIR = kdir
+        try:
+            found = knowledge.read("*", "несуществующий" * 10000)
+            assert len(found.encode("utf-8")) <= knowledge._SEARCH_LIMIT
+            assert "слишком длинный" in found and "сократите" in found
+            assert "строкой" in knowledge.read("*", ["питание"])
+        finally:
+            knowledge.KNOWLEDGE_DIR = old
+
+
+def test_plateau_shared_evidence_and_uncertainty():
+    """A repeated weigh-in is not repeated days; missing waist is not a diagnosis."""
+    import sqlite3
+    from datetime import datetime, timedelta
+    from unittest.mock import patch
+    from health_core import plateau, guards, council_data
+    from health_core.db import migrate
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    migrate(conn)
+    now = datetime(2026, 11, 7, 12, 0, 0)
+    conn.execute("INSERT INTO users(id,telegram_user_id,timezone,created_at) VALUES (1,1,'Asia/Yekaterinburg','2026-01-01 00:00:00')")
+
+    def weight(days_ago, value=100.0, n=0, hour=8):
+        d = now - timedelta(days=days_ago)
+        conn.execute("INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg) VALUES(1,?,?,?)",
+                     (f"{days_ago}-{n}", d.strftime(f"%Y-%m-%d {hour:02d}:00:00"), value))
+
+    with patch.object(plateau, "user_now", return_value=now):
+        for n in range(8):
+            weight(0, n=n)
+        result = plateau.assess(conn, 1)
+        assert result["status"] == "insufficient_data", result
+        assert guards.check_plateau(conn, 1) is None
+        conn.execute("DELETE FROM body_metrics")
+        for day in (0, 27):
+            weight(day)
+            conn.execute("INSERT INTO anthropometry(user_id,measured_on,site,value_cm) VALUES(1,?,'талия',100)",
+                         ((now - timedelta(days=day)).date().isoformat(),))
+        result = plateau.assess(conn, 1)
+        assert result["status"] == "insufficient_data", "два конца окна не доказывают плато: " + str(result)
+        assert council_data.plateau_3w(conn, 1) is False
+        conn.execute("DELETE FROM body_metrics")
+        conn.execute("DELETE FROM anthropometry")
+        for day in range(28):
+            weight(day)
+        result = plateau.assess(conn, 1)
+        assert result["short_weight_pause"] is True
+        assert result["cause"] == "unknown"
+        assert result["sustained_weight_waist_pause"] is False
+        assert council_data.plateau_3w(conn, 1) is False
+        assert guards.check_plateau(conn, 1)["code"] == "PLATEAU"
+        # Waist measurements need distinct dates and an actual long interval.
+        for days_ago in (0, 21):
+            conn.execute("INSERT INTO anthropometry(user_id,measured_on,site,value_cm) VALUES(1,?,'талия',100)",
+                         ((now - timedelta(days=days_ago)).date().isoformat(),))
+        assert plateau.assess(conn, 1)["status"] == "sustained_flat_weight"
+        assert council_data.plateau_3w(conn, 1) is True
+        conn.execute("UPDATE anthropometry SET value_cm=99 WHERE measured_on=?", (now.date().isoformat(),))
+        result = plateau.assess(conn, 1)
+        assert result["status"] == "waist_decreasing", result
+        assert result["cause"] == "unknown"
+        assert council_data.plateau_3w(conn, 1) is False
+        # An evening/future spike cannot turn a morning pause into no plateau.
+        weight(0, 110, n=1, hour=22)
+        weight(-1, 120)
+        assert plateau.assess(conn, 1)["status"] == "waist_decreasing"
+        # Intentional maintenance days are not evidence of a pause in deficit.
+        for day in range(28):
+            conn.execute("INSERT INTO refeed_days(user_id,date) VALUES(1,?)",
+                         ((now - timedelta(days=day)).date().isoformat(),))
+        result = plateau.assess(conn, 1)
+        assert result["status"] == "insufficient_data", result
+        assert guards.check_plateau(conn, 1) is None
+        # Равные медианы двух недель не отменяют возобновившегося снижения.
+        conn.execute("DELETE FROM refeed_days")
+        conn.execute("DELETE FROM body_metrics")
+        conn.execute("UPDATE anthropometry SET value_cm=100")
+        for day in range(28):
+            weight(day, 99.3 + day * 0.2 if day <= 10 else 100.0)
+        result = plateau.assess(conn, 1)
+        assert result["status"] == "decreasing", result
+        assert result["sustained_weight_waist_pause"] is False, result
+        conn.execute("DELETE FROM body_metrics")
+        for day in range(28):
+            weight(day, 100.7 - day * 0.2 if day <= 10 else 100.0)
+        result = plateau.assess(conn, 1)
+        assert result["status"] == "increasing", result
+        assert result["sustained_weight_waist_pause"] is False, result
+        assert council_data.plateau_3w(conn, 1) is False
+    conn.close()
+
+
+def test_plateau_timeline_does_not_diagnose_individual():
+    """Crossing a trial median cannot diagnose plateau in a falling time series."""
+    import sqlite3
+    from datetime import datetime, timedelta
+    from unittest.mock import patch
+    from health_core import plateau, forecast
+    from health_core.db import migrate
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    migrate(conn)
+    now = datetime(2026, 11, 7, 12, 0, 0)
+    conn.execute("INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,base_weight_kg,base_weight_date,created_at) "
+                 "VALUES(1,1,180,'1990-01-01','m','Asia/Yekaterinburg',140,'2025-01-01','2025-01-01 00:00:00')")
+    for day in range(28):
+        d = now - timedelta(days=day)
+        conn.execute("INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg,ffm_kg,fat_pct) VALUES(1,?,?,?,75,30)",
+                     (str(day), d.strftime("%Y-%m-%d 08:00:00"), 110 + day * 0.1))
+    with patch.object(plateau, "user_now", return_value=now), patch.object(forecast, "user_now", return_value=now):
+        result = forecast.plateau_forecast(conn, 1, intake_kcal=2200)
+        assert result["current_stagnation"]["status"] == "decreasing", result
+        assert result["pharmacological_plateau"]["phase"] == "популяционный ориентир"
+        assert result["pharmacological_plateau"]["expected_date"] is None
+        assert result["pharmacological_plateau"]["is_individual_prediction"] is False
+        assert result["metabolic_equilibrium"]["intake_source"] == "scenario"
+    conn.close()
+
+
+def test_morning_report_does_not_fill_missing_days():
+    """Вчерашний вес — исторический контекст, а не сегодняшний факт."""
+    import sqlite3
+    from datetime import datetime
+    from unittest.mock import patch
+    from health_core import report
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    migrate(conn)
+    conn.execute("INSERT INTO users(id,telegram_user_id,timezone,created_at) "
+                 "VALUES(1,'1','Asia/Yekaterinburg','2026-01-01 00:00:00')")
+    conn.execute("INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg) "
+                 "VALUES(1,'old','2026-11-06 07:00:00',100)")
+    conn.execute("INSERT INTO sleep_log(user_id,night_date,duration_min) VALUES(1,'2026-11-06',430)")
+    conn.execute("INSERT INTO daily_watch(user_id,date,steps,hr_min,created_at) "
+                 "VALUES(1,'2026-11-05',9000,60,'2026-11-05 20:00:00')")
+    conn.execute("INSERT INTO bp_log(user_id,at,systolic,diastolic) VALUES(1,'2026-11-06 07:00:00',120,80)")
+    conn.execute("INSERT INTO glucose_log(user_id,at,mmol_l,context) VALUES(1,'2026-11-06 07:00:00',5,'fasting')")
+    now = datetime(2026, 11, 7, 8)
+    try:
+        with patch.object(report, "_now", return_value=now), \
+                patch.object(report, "check_all", return_value=[]), \
+                patch("health_core.config.user_today", return_value="2026-11-07"), \
+                patch("health_core.energy.daily_target", return_value={}):
+            summary = report.day_summary(conn, 1, "2026-11-07")
+            assert summary["weight_kg"] is None and summary["weight_measured_at"] is None
+            assert summary["food_recorded"] is False and summary["water_recorded"] is False
+            historical = report.day_summary(conn, 1, "2026-11-06")
+            assert historical["weight_kg"] == 100
+            assert report.day_summary(conn, 1, "2026-11-05")["weight_kg"] is None
+            bar = report.status_bar(conn, 1)
+            assert "Вес сегодня не записан" in bar.splitlines()[0], bar
+            assert "100.0" not in bar.splitlines()[0], bar
+            assert "Последний замер 06.11.2026 07:00: 100.0 кг" in bar, bar
+            assert "Питание сегодня не записано" in bar and "Вода сегодня не записана" in bar
+            checklist = report.morning_checklist(conn, 1)
+            assert "✓" not in checklist, checklist
+            assert "☐ Сон за ночь" in checklist and "☐ Шаги за вчера" in checklist
+    finally:
+        conn.close()
+
+
+def test_morning_report_uses_only_available_current_measurements():
+    """Записи после времени отчёта не закрывают чек-лист; даты — пользовательские."""
+    import sqlite3
+    from datetime import datetime
+    from unittest.mock import patch
+    from health_core import report
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    migrate(conn)
+    conn.execute("INSERT INTO users(id,telegram_user_id,timezone,created_at) "
+                 "VALUES(1,'1','Asia/Yekaterinburg','2026-01-01 00:00:00')")
+    conn.execute("INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg) "
+                 "VALUES(1,'future','2026-11-07 09:00:00',150)")
+    conn.execute("INSERT INTO bp_log(user_id,at,systolic,diastolic) VALUES(1,'2026-11-07 09:00:00',140,90)")
+    conn.execute("INSERT INTO glucose_log(user_id,at,mmol_l,context) VALUES(1,'2026-11-07 09:00:00',6,'fasting')")
+    now = datetime(2026, 11, 7, 8)
+    try:
+        with patch.object(report, "user_now", return_value=now), \
+                patch("health_core.config.user_now", return_value=now), \
+                patch.object(report, "check_all", return_value=[]), \
+                patch("health_core.energy.daily_target", return_value={}):
+            bar = report.status_bar(conn, 1)
+            assert "Вес сегодня не записан" in bar and "150.0" not in bar, bar
+            checklist = report.morning_checklist(conn, 1)
+            assert "✓" not in checklist, checklist
+            conn.execute("INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg) "
+                         "VALUES(1,'current','2026-11-07 07:15:00',99)")
+            conn.execute("INSERT INTO sleep_log(user_id,night_date,duration_min) VALUES(1,'2026-11-07',450)")
+            conn.execute("INSERT INTO daily_watch(user_id,date,steps,created_at) "
+                         "VALUES(1,'2026-11-06',7000,'2026-11-06 20:00:00')")
+            bar = report.status_bar(conn, 1)
+            assert "Вес 99.0 (утро, 07:15)" in bar and "150.0" not in bar, bar
+            checklist = report.morning_checklist(conn, 1)
+            assert "✓ Вес 99.0" in checklist and "✓ Сон 7 ч 30 мин" in checklist, checklist
+            assert "✓ Шаги вчера 7000" in checklist, checklist
+            assert "☐ Давление" in checklist and "☐ Глюкоза натощак" in checklist
+    finally:
+        conn.close()
+
+
+def test_knowledge_symlinks_cannot_expand_access():
+    with tempfile.TemporaryDirectory() as tmp:
+        kdir = Path(tmp)
+        (kdir / 'admin_commands.md').write_text('ADMIN_PRIVATE_MARKER справочник', encoding='utf-8')
+        (kdir / 'публичная.md').symlink_to(kdir / 'admin_commands.md')
+        personal = kdir / 'personal'
+        personal.mkdir()
+        other = personal / '900003'
+        other.mkdir()
+        (other / 'заметки.md').write_text('OTHER_PRIVATE_MARKER справочник', encoding='utf-8')
+        (personal / '900002').symlink_to(other, target_is_directory=True)
+        old = knowledge.KNOWLEDGE_DIR
+        knowledge.KNOWLEDGE_DIR = kdir
+        registry.set_caller('900002')
+        try:
+            assert 'ADMIN_PRIVATE_MARKER' not in knowledge.read('публичная')
+            assert 'ADMIN_PRIVATE_MARKER' not in knowledge.read('*', 'справочник')
+            assert 'OTHER_PRIVATE_MARKER' not in knowledge.read('заметки')
+            assert 'OTHER_PRIVATE_MARKER' not in knowledge.read('*', 'справочник')
+            assert 'ADMIN_PRIVATE_MARKER' not in knowledge.index()
+            assert 'OTHER_PRIVATE_MARKER' not in knowledge.index()
+        finally:
+            knowledge.KNOWLEDGE_DIR = old
+            registry.set_caller('111')
+
+
+def test_report_food_water_share_measurement_cutoff():
+    import sqlite3
+    from datetime import datetime
+    from unittest.mock import patch
+    from health_core import report
+    conn = sqlite3.connect(':memory:')
+    conn.row_factory = sqlite3.Row
+    migrate(conn)
+    conn.execute("INSERT INTO users(id,telegram_user_id,timezone,created_at) VALUES(1,1,'Asia/Yekaterinburg','2026-01-01')")
+    food_id = conn.execute("INSERT INTO food_log(user_id,eaten_at,meal_slot) VALUES(1,'2026-11-07 09:00:00','breakfast')").lastrowid
+    conn.execute("INSERT INTO food_items(food_log_id,name,kcal) VALUES(?,'future meal',500)", (food_id,))
+    conn.execute("INSERT INTO water_log(user_id,at,volume_ml) VALUES(1,'2026-11-07 09:00:00',700)")
+    try:
+        with patch.object(report, '_now', return_value=datetime(2026,11,7,8)), \
+                patch.object(report, 'check_all', return_value=[]), \
+                patch('health_core.energy.daily_target', return_value={}):
+            d = report.day_summary(conn, 1, '2026-11-07')
+            assert d['kcal_eaten'] == 0 and not d['food_recorded'], d
+            assert d['water_ml'] == 0 and not d['water_recorded'], d
+            bar = report.status_bar(conn, 1)
+            assert 'Питание сегодня не записано' in bar and 'Вода сегодня не записана' in bar, bar
+            assert 'Завтрак не записан' in bar, bar
+            # За завершённый день все фактические записи доступны.
+            conn.execute("UPDATE food_log SET eaten_at='2026-11-06 09:00:00'")
+            conn.execute("UPDATE water_log SET at='2026-11-06 09:00:00'")
+            d = report.day_summary(conn, 1, '2026-11-06')
+            assert d['kcal_eaten'] == 500 and d['food_recorded'], d
+            assert d['water_ml'] == 700 and d['water_recorded'], d
+    finally:
+        conn.close()
+
+
+def test_tool_argument_validation_and_normalized_retry_key():
+    def call(raw):
+        return {'id':'review_call', 'type':'function', 'function':{'name':'help','arguments':raw}}
+    for raw in ('[]', 'null', '42', '"text"', {'bad':'type'}, ['bad'], 7):
+        dispatched = []
+        result = asyncio.run(llm._run_one(call(raw), lambda n,a: dispatched.append(a) or '{}'))
+        assert 'error' in json.loads(result), result
+        assert not dispatched, raw
+        assert llm._call_key(call(raw)) is None
+    assert llm._call_key(call('{"user_id":0,"ml":100}')) == llm._call_key(call('{"ml":100}'))
+    assert llm._call_key(call('{"user_id":false}')) != llm._call_key(call('{}'))
+
+
+def test_knowledge_excerpt_preserves_substring_and_unicode_offsets():
+    # casefold('ß') расширяет один символ до двух; срез должен оставаться
+    # привязанным к исходному тексту, включая совпадение внутри слова.
+    text = "ß" * 1800 + " сверхкалорийность " + "хвост " * 100
+    excerpt, clipped = knowledge._excerpt(text, "калорий", {"калорий"}, 300)
+    assert clipped and "калорий" in excerpt, excerpt
+    assert len(excerpt.encode("utf-8")) <= 300
+
+
+def test_tool_retry_uses_effective_arguments():
+    """Нулевой необязательный ID не позволяет повторить тот же упавший запрос."""
+    from unittest.mock import patch
+
+    def call(call_id, args):
+        return {"id": call_id, "type": "function", "function": {
+            "name": "help", "arguments": json.dumps(args),
+        }}
+
+    dispatched = []
+    def dispatch(name, args):
+        dispatched.append(args)
+        return json.dumps({"error": "temporarily unavailable"})
+
+    responses = scripted(
+        {"role": "assistant", "content": "", "tool_calls": [call("a", {"user_id": 0})]},
+        {"role": "assistant", "content": "", "tool_calls": [call("b", {})]},
+        {"role": "assistant", "content": "Не удалось прочитать данные."},
+    )
+    with patch.object(llm, "_post", responses):
+        answer, messages = asyncio.run(llm.run_loop(
+            None, [{"role": "user", "content": "покажи данные"}], [], PROVIDERS, dispatch))
+    assert len(dispatched) == 1 and dispatched[0] == {}, dispatched
+    assert "Не удалось" in answer
+    assert len([m for m in messages if m["role"] == "tool"]) == 2
+
+
+def test_plateau_calendar_windows_and_ambiguous_direction():
+    import sqlite3
+    from datetime import datetime, timedelta
+    from unittest.mock import patch
+    from health_core import plateau
+    conn = sqlite3.connect(':memory:')
+    conn.row_factory = sqlite3.Row
+    migrate(conn)
+    conn.execute("INSERT INTO users(id,telegram_user_id,timezone,created_at) VALUES(1,1,'UTC','2026-01-01')")
+    now = datetime(2026,11,7,12)
+    def weights(values):
+        conn.execute('DELETE FROM body_metrics')
+        for day, value in enumerate(values):
+            conn.execute('INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg) VALUES(1,?,?,?)',
+                         (str(day), (now-timedelta(days=day)).strftime('%Y-%m-%d 08:00:00'), value))
+    try:
+        with patch.object(plateau, 'user_now', return_value=now):
+            weights([100]*29)
+            d = plateau.assess(conn,1)
+            assert d['weight_days'] == d['window_days'], d
+            assert d['recent_weight_days'] == 7, d
+            # Пять точек: размах велик, но конечный вес равен начальному.
+            conn.execute('DELETE FROM body_metrics')
+            for day, value in ((0,100),(2,101),(4,99),(6,102),(9,100)):
+                conn.execute('INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg) VALUES(1,?,?,?)',
+                             (str(day),(now-timedelta(days=day)).strftime('%Y-%m-%d 08:00:00'),value))
+            d = plateau.assess(conn,1)
+            assert d['status'] not in ('increasing','decreasing'), d
+            assert not d['sustained_weight_waist_pause'], d
+    finally:
+        conn.close()
+
+
+def test_lean_loss_uses_same_daily_evidence():
+    import sqlite3
+    from datetime import datetime, timedelta
+    from unittest.mock import patch
+    from health_core import body_composition as body, energy, guards, report
+    conn = sqlite3.connect(':memory:')
+    conn.row_factory = sqlite3.Row
+    migrate(conn)
+    conn.execute("INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,created_at) VALUES(1,1,180,'1990-01-01','m','UTC','2026-01-01')")
+    now = datetime(2026,11,7,12)
+    def add(day, w, f, key, hour=8):
+        conn.execute('INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg,ffm_kg) VALUES(1,?,?,?,?)',
+                     (key,(now-timedelta(days=day)).strftime(f'%Y-%m-%d {hour:02}:00:00'),w,f))
+    try:
+        with patch.object(body,'user_now',return_value=now), patch.object(energy,'user_now',return_value=now), \
+                patch.object(guards,'_now',return_value=now), patch.object(report,'_now',return_value=now):
+            for day in range(8):
+                add(day,100+day,70+day*.2,str(day))
+            expected = body.lean_loss_ratio(conn,1,None)[0]
+            assert abs(expected-.2)<1e-8
+            assert abs(energy.lean_share(conn,1)-expected)<1e-8
+            assert abs(guards._lean_loss_ratio(conn,1,None)[0]-expected)<1e-8
+            assert abs(report.trends(conn,1,28)['lean_loss']['ratio']-expected)<1e-8
+            assert guards.check_lbm_ratio(conn,1)['code']=='LBM_RATIO'
+            # Повторы одного дня, вечерние и будущие точки не меняют оценку.
+            for n in range(20):
+                add(0,100,70,f'repeat{n}')
+            add(1,80,50,'evening',18)
+            add(-1,80,50,'future')
+            assert abs(energy.lean_share(conn,1)-expected)<1e-8
+            conn.execute('UPDATE body_metrics SET ffm_kg=90-weight_kg*.1')
+            assert energy.lean_share(conn,1)==0
+            assert guards.check_lbm_ratio(conn,1) is None
+            conn.execute('UPDATE body_metrics SET weight_kg=200-weight_kg')
+            assert energy.lean_share(conn,1) is None
+            with patch.object(guards,'check_all',return_value=[]):
+                status = {r['code']:r for r in guards.get_guards_status(conn,1)}
+                assert status['LBM_RATIO']['status']=='nodata'
+            conn.execute('DELETE FROM body_metrics')
+            for n in range(10):
+                add(0,100+n,70+n*.2,str(n))
+            assert body.lean_loss_ratio(conn,1,None) is None
+            conn.execute("UPDATE body_metrics SET measured_at='2026-09-01 08:00:00'")
+            assert body.lean_loss_ratio(conn,1,None) is None
+    finally:
+        conn.close()
+
+
+def test_export_archive_contains_only_own_records():
+    import sqlite3
+    import zipfile
+    from health_core.export import export_user_archive
+    conn = sqlite3.connect(':memory:')
+    conn.row_factory = sqlite3.Row
+    migrate(conn)
+    for uid, marker in ((1,'OWN_RECORD'),(2,'OTHER_PRIVATE_RECORD')):
+        conn.execute('INSERT INTO users(id,telegram_user_id,created_at,health_notes) VALUES(?,?,?,?)',
+                     (uid,str(uid),'2026-01-01',marker))
+        fid=conn.execute('INSERT INTO food_log(user_id,eaten_at) VALUES(?,?)',(uid,'2026-11-07 07:00:00')).lastrowid
+        conn.execute('INSERT INTO food_items(food_log_id,name,kcal) VALUES(?,?,100)',(fid,marker))
+        conn.execute('INSERT INTO water_log(user_id,at,volume_ml) VALUES(?,?,100)',(uid,'2026-11-07 07:00:00'))
+    try:
+        before=conn.total_changes
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'export.zip'
+            result=export_user_archive(conn,1,str(path))
+            with zipfile.ZipFile(path) as z:
+                assert z.testzip() is None
+                assert {'users.csv','food_log.csv','food_items.csv','water_log.csv'}<=set(z.namelist())
+                data='\n'.join(z.read(n).decode('utf-8-sig') for n in z.namelist())
+                assert 'OWN_RECORD' in data and 'OTHER_PRIVATE_RECORD' not in data
+                assert 'OWN_RECORD' in z.read('food_items.csv').decode('utf-8-sig')
+                assert result['files']==len(z.namelist()) and result['rows']>=4
+            assert conn.total_changes==before, 'экспорт не должен пересчитывать и записывать цели'
+    finally:
+        conn.close()
+
+
+def test_export_delivery_success_failure_and_private_scope():
+    import zipfile
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    prepared=[]
+    paths=[]
+    class Message:
+        chat=SimpleNamespace(type='private',id=75001)
+        fail=False
+        def __init__(self): self.sent=[]; self.answers=[]
+        async def answer_document(self, document, **kwargs):
+            path=Path(document.path)
+            assert path.is_file()
+            paths.append(path)
+            if self.fail: raise RuntimeError('test Telegram failure')
+            with zipfile.ZipFile(path) as z: assert z.read('sample.csv')==b'value\n1\n'
+            self.sent.append(document.filename)
+        async def answer(self, text, **kwargs): self.answers.append(text)
+    def prepare(uid,path):
+        prepared.append(uid)
+        with zipfile.ZipFile(path,'w') as z: z.writestr('sample.csv','value\n1\n')
+        return {'path':path,'files':1,'rows':1}
+    async def scenario():
+        msg=Message()
+        result=json.loads(await main._send_export(msg,'75001'))
+        assert result['sent'] is True and msg.sent==['health-data.zip']
+        assert not paths[-1].exists(), 'временный архив должен удаляться'
+        # Инструмент не принимает другого адресата/user_id из аргументов модели.
+        result=json.loads(await llm._run_one({'id':'export1','function':{'name':'export_data','arguments':'{\"user_id\":999}'}}, main._message_dispatch(msg,'75001')))
+        assert result['sent'] is True and prepared[-1]=='75001'
+        msg.fail=True
+        result=json.loads(await main._send_export(msg,'75001'))
+        assert 'error' in result and not result.get('sent')
+        assert not paths[-1].exists()
+        count=len(prepared)
+        msg.chat=SimpleNamespace(type='group',id=-123)
+        assert 'error' in json.loads(await main._send_export(msg,'75001'))
+        assert len(prepared)==count
+        msg.chat=SimpleNamespace(type='private',id=75001)
+        await main._handle_turn(msg,None,{},'75001','/export')
+        assert msg.answers and 'не отправлен' in msg.answers[-1]
+    with patch.object(main,'_prepare_export',prepare):
+        asyncio.run(scenario())
+
+
+def test_database_location_is_project_relative():
+    import subprocess
+    env = dict(os.environ)
+    env.pop('HEALTH_DB', None)
+    env['PYTHONPATH'] = str(ROOT)
+    code = 'from health_core.db import DB_PATH; print(DB_PATH)'
+    with tempfile.TemporaryDirectory() as tmp:
+        def resolved():
+            return subprocess.check_output([sys.executable,'-c',code],cwd=tmp,env=env,text=True).strip()
+        assert Path(resolved()) == ROOT / 'health.db'
+        env['HEALTH_DB'] = 'test-data/health.db'
+        assert Path(resolved()) == ROOT / 'test-data' / 'health.db'
+        env['HEALTH_DB'] = str(Path(tmp)/'override.db')
+        assert Path(resolved()) == Path(tmp)/'override.db'
+
+
+def test_legacy_database_cannot_be_silently_abandoned():
+    from unittest.mock import patch
+    from health_core import db
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp)/'project'/'health.db'
+        legacy = Path(tmp)/'legacy.db'
+        legacy.touch()
+        with patch.object(db,'DB_PATH',target), patch.object(db,'DEFAULT_DB_PATH',target), \
+                patch.object(db,'LEGACY_DB_PATH',legacy):
+            try:
+                db.connect()
+            except RuntimeError as e:
+                assert 'install.sh' in str(e)
+            else:
+                raise AssertionError('старая база не должна заменяться пустой')
+            assert not target.exists()
+
+
+def test_installer_preserves_database_and_copies_wal():
+    import sqlite3
+    from unittest.mock import patch
+    installer = (ROOT/'install.sh').read_text()
+    code = installer.split("<<'PYDB'\n",1)[1].split('\nPYDB',1)[0]
+    with tempfile.TemporaryDirectory() as tmp:
+        home=Path(tmp)/'home'
+        legacy=home/'.hermes'/'health.db'
+        legacy.parent.mkdir(parents=True)
+        project=Path(tmp)/'project'
+        project.mkdir()
+        src=sqlite3.connect(legacy)
+        try:
+            src.execute('PRAGMA journal_mode=WAL')
+            src.execute('CREATE TABLE example(value INTEGER)')
+            src.execute('INSERT INTO example VALUES(42)')
+            src.commit()
+            assert Path(str(legacy)+'-wal').exists()
+            def restore():
+                with patch.object(Path,'home',return_value=home), \
+                        patch.object(sys,'argv',['install.sh',str(project)]), \
+                        patch.dict(os.environ,{},clear=True):
+                    exec(compile(code,'install.sh:database','exec'),{})
+            restore()
+            dst=sqlite3.connect(project/'health.db')
+            try:
+                assert dst.execute('SELECT value FROM example').fetchone()[0]==42
+                dst.execute('INSERT INTO example VALUES(99)')
+                dst.commit()
+                restore()
+                assert dst.execute('SELECT COUNT(*) FROM example').fetchone()[0]==2
+                assert src.execute('SELECT COUNT(*) FROM example').fetchone()[0]==1
+            finally:
+                dst.close()
+        finally:
+            src.close()
+
+
+def test_history_json_archive_preserves_originals_before_compaction():
+    from unittest.mock import patch
+    from health_core import db
+    with tempfile.TemporaryDirectory() as tmp, patch.object(db,'DB_PATH',Path(tmp)/'health.db'):
+        conn=db.connect()
+        migrate(conn)
+        for i in range(15):
+            history.append(conn,'123',{'role':'user','content':f'Вопрос {i}'})
+            history.append(conn,'123',{'role':'assistant','content':f'Ответ {i}'})
+        history.append(conn,'123',{'role':'tool','tool_call_id':'source','content':'полный результат '*500})
+        history.append(conn,'456',{'role':'user','content':'ЧУЖОЙ_ДИАЛОГ'})
+        original=conn.execute("SELECT count(*) FROM chat_history WHERE telegram_user_id='123'").fetchone()[0]
+        conn.close()
+        async def summarize(*args,**kwargs):
+            files=list((Path(tmp)/'history_archive'/'123').glob('*.json'))
+            assert len(files)==1, 'JSON должен существовать ДО вызова модели'
+            data=json.loads(files[0].read_text())
+            assert len(data['messages'])==original
+            assert data['messages'][-1]['message']['content']=='полный результат '*500
+            assert 'ЧУЖОЙ_ДИАЛОГ' not in files[0].read_text()
+            assert all('timestamp' in m and 'rowid' in m for m in data['messages'])
+            return {'content':'Сводка'}
+        with patch.object(llm,'chat',summarize):
+            asyncio.run(main._compact_history(None,'123',PROVIDERS))
+        files=list((Path(tmp)/'history_archive'/'123').glob('*.json'))
+        assert len(files)==1, 'повторная защита перед удалением не должна дублировать снимок'
+        conn=db.connect()
+        try:
+            assert conn.execute("SELECT count(*) FROM chat_history WHERE telegram_user_id='123'").fetchone()[0]<original
+            assert len(history.load(conn,'456'))==1
+            previous=files[0].read_bytes()
+            history.append(conn,'123',{'role':'user','content':'Новый вопрос'})
+            second=history.archive(conn,'123')
+            assert second!=files[0] and files[0].read_bytes()==previous
+        finally:
+            conn.close()
+
+
+def test_history_archive_failure_and_summary_insert_failure_preserve_messages():
+    import sqlite3
+    from unittest.mock import patch, AsyncMock
+    from health_core import db
+    with tempfile.TemporaryDirectory() as tmp, patch.object(db,'DB_PATH',Path(tmp)/'health.db'):
+        conn=db.connect()
+        migrate(conn)
+        for i in range(30):
+            history.append(conn,'123',{'role':'user','content':str(i)})
+        before=conn.execute('SELECT rowid,content FROM chat_history ORDER BY rowid').fetchall()
+        model=AsyncMock(return_value={'content':'summary'})
+        with patch.object(history.os,'replace',side_effect=OSError('disk failure')), patch.object(llm,'chat',model):
+            try:
+                asyncio.run(main._compact_history(None,'123',PROVIDERS))
+            except OSError:
+                pass
+            else:
+                raise AssertionError('сжатие должно прерваться при ошибке архива')
+        model.assert_not_awaited()
+        assert [tuple(r) for r in conn.execute('SELECT rowid,content FROM chat_history ORDER BY rowid')]==[tuple(r) for r in before]
+        assert not list((Path(tmp)/'history_archive').rglob('*.tmp'))
+        conn.execute("CREATE TRIGGER fail_summary BEFORE INSERT ON chat_history BEGIN SELECT RAISE(ABORT,'insert failure'); END")
+        conn.commit()
+        try:
+            history.replace(conn,'123',before[9]['rowid'],'summary')
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError('ожидался сбой вставки сводки')
+        assert [tuple(r) for r in conn.execute('SELECT rowid,content FROM chat_history ORDER BY rowid')]==[tuple(r) for r in before]
+        conn.close()
 
 
 if __name__ == "__main__":

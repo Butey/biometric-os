@@ -5,7 +5,6 @@
 собирает их результаты в один словарь, который потом читают модели.
 """
 import sqlite3
-import statistics
 from datetime import timedelta
 
 from health_core.config import local_now, latest_ffm, user_now
@@ -165,7 +164,10 @@ def _recent_alerts_28d(conn: sqlite3.Connection, user_id: int) -> list[dict]:
 def build(conn: sqlite3.Connection, user_id: int) -> dict:
     """Единый детерминированный пакет для консилиума. Пустая/неполная БД не
     роняет сборку — недостающие числа просто становятся None/[]."""
+    from health_core.plateau import assess
+
     return {
+        "plateau_assessment": assess(conn, user_id),
         "weight_trend": {
             "4w": trends(conn, user_id, window_days=4 * 7),
             "8w": trends(conn, user_id, window_days=8 * 7),
@@ -187,33 +189,10 @@ def build(conn: sqlite3.Connection, user_id: int) -> dict:
 
 
 def plateau_3w(conn: sqlite3.Connection, user_id: int) -> bool:
-    """CONTEXT.md «Консилиум» / docs/adr/0003-консилиум.md: медиана веса за
-    последние 7 дней отличается от медианы 21-28 дней назад меньше чем на
-    0.5 кг, И талия за 21 день не уменьшилась (нужно >=2 замера в окне,
-    последний не меньше первого)."""
-    now = user_now(conn, user_id)
-    recent = [r["weight_kg"] for r in conn.execute(
-        "SELECT weight_kg FROM body_metrics WHERE user_id=? AND weight_kg IS NOT NULL AND measured_at>=?",
-        (user_id, (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")),
-    ).fetchall()]
-    older = [r["weight_kg"] for r in conn.execute(
-        "SELECT weight_kg FROM body_metrics WHERE user_id=? AND weight_kg IS NOT NULL "
-        "AND measured_at>=? AND measured_at<?",
-        (user_id, (now - timedelta(days=28)).strftime("%Y-%m-%d %H:%M:%S"),
-         (now - timedelta(days=21)).strftime("%Y-%m-%d %H:%M:%S")),
-    ).fetchall()]
-    if not recent or not older:
-        return False
-    if abs(statistics.median(recent) - statistics.median(older)) >= 0.5:
-        return False
-    waist = conn.execute(
-        "SELECT value_cm FROM anthropometry WHERE user_id=? AND site='талия' AND measured_on>=? "
-        "ORDER BY measured_on",
-        (user_id, (now - timedelta(days=21)).date().isoformat()),
-    ).fetchall()
-    if len(waist) < 2:
-        return False
-    return waist[-1]["value_cm"] >= waist[0]["value_cm"]
+    """Общий операционный сигнал длительной паузы веса и талии."""
+    from health_core.plateau import assess
+
+    return assess(conn, user_id)["sustained_weight_waist_pause"]
 
 
 if __name__ == "__main__":
@@ -240,8 +219,9 @@ if __name__ == "__main__":
             "weight_trend", "body_composition", "waist_12w", "nutrition_vs_target_28d",
             "kcal_floor", "meds", "side_effects_12w", "sleep_activity_28d",
             "refeed_sick_days_28d", "recent_alerts_28d", "daily_watch_28d",
-            "steps_drop_28d", "recovery_low",
+            "steps_drop_28d", "recovery_low", "plateau_assessment",
         }
+        assert empty["plateau_assessment"]["status"] == "insufficient_data"
         assert empty["daily_watch_28d"] is None, "нет данных с часов -> блок None, а не выдуманные числа"
         assert empty["steps_drop_28d"] is None, "нет данных шагов -> None"
         assert empty["recovery_low"] is None, "нет данных часов -> RECOVERY_LOW молчит"
@@ -271,14 +251,15 @@ if __name__ == "__main__":
         # --- плато: вес почти не двигался 3+ недели, талия не уменьшилась ---
         conn.execute("DELETE FROM body_metrics WHERE user_id=?", (uid,))
         conn.execute("DELETE FROM anthropometry WHERE user_id=?", (uid,))
-        for days_ago, w in ((27, 90.0), (24, 90.1), (21, 90.0), (14, 89.9), (7, 89.8), (1, 90.1)):
+        for days_ago in range(28):
+            w = 90.0 + (days_ago % 3 - 1) * 0.1
             ts = (local_now() - timedelta(days=days_ago)).strftime("%Y-%m-%d 07:00:00")
             conn.execute(
                 "INSERT INTO body_metrics(user_id, burst_key, measured_at, weight_kg, fat_pct, ffm_kg) "
                 "VALUES (?, ?, ?, ?, 28.0, 65.0)",
                 (uid, f"pl-{days_ago}", ts, w),
             )
-        for days_ago, waist in ((20, 95.0), (2, 95.2)):
+        for days_ago, waist in ((21, 95.0), (0, 95.2)):
             d = (local_now() - timedelta(days=days_ago)).date().isoformat()
             conn.execute(
                 "INSERT INTO anthropometry(user_id, measured_on, site, value_cm) VALUES (?, ?, 'талия', ?)",

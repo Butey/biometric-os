@@ -233,5 +233,5 @@ Always verify changes with:
 ### Правила, которые легко сломать
 - Чек-лист и гарды: галочка `✓` - записано, `☐` - нет.
 - `find_mine(loose=True)` по умолчанию; `forget` обязан звать с `loose=False`, иначе удалит не тот продукт.
-- Тесты, которые пишут в БД, должны ставить `HEALTH_DB` ДО импорта модулей, тянущих `health_core.db` (иначе пишут в живую `/root/.hermes/health.db`). У `meal_options.py` это учтено отложенным импортом `report`.
+- Тесты, которые пишут в БД, должны ставить `HEALTH_DB` ДО импорта модулей, тянущих `health_core.db` (иначе пишут в живую `<проект>/health.db`). У `meal_options.py` это учтено отложенным импортом `report`.
 - Файлы с CRLF (`guards.py`, `report.py`, `export.py`, `schemas.py`, `registry.py`, `system_promt.md`): править с сохранением окончаний строк, иначе дифф на тысячи строк.

@@ -4,7 +4,12 @@ import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(os.environ.get("HEALTH_DB", str(Path.home() / ".hermes" / "health.db")))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DB_PATH = PROJECT_ROOT / "health.db"
+LEGACY_DB_PATH = Path.home() / ".hermes" / "health.db"
+DB_PATH = Path(os.environ.get("HEALTH_DB") or DEFAULT_DB_PATH).expanduser()
+if not DB_PATH.is_absolute():
+    DB_PATH = PROJECT_ROOT / DB_PATH
 
 SCHEMA_VERSION = 30
 
@@ -524,6 +529,8 @@ class _Conn(sqlite3.Connection):
 
 
 def connect() -> sqlite3.Connection:
+    if DB_PATH == DEFAULT_DB_PATH and not DB_PATH.exists() and LEGACY_DB_PATH.is_file():
+        raise RuntimeError("Найдена старая БД ~/.hermes/health.db. Остановите сервисы и выполните install.sh для переноса в папку проекта.")
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, factory=_Conn)
     conn.row_factory = sqlite3.Row

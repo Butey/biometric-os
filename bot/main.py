@@ -2,7 +2,7 @@
 
 Запускается ИЗ КАТАЛОГА ПРОЕКТА. Копий кода, персоны и config.yaml в
 ~/.hermes/ больше нет: правка файла здесь — правка боевого кода. От ~/.hermes/
-остались только .env (общий канал секретов с админкой) и health.db.
+остался только .env (общий канал секретов с админкой). База health.db — в корне проекта.
 
     python -m bot.main
 """
@@ -34,7 +34,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat,
-                           CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message)
+                           CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message)
 from aiogram.utils.chat_action import ChatActionSender
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -77,6 +77,7 @@ BUILTIN_COMMANDS = {
     "target": "Интерактивный подбор калорийности и вехи",
     "plateau": "Прогноз и разбор плато массы тела",
     "forecast": "Прогноз динамики веса",
+    "export": "Скачать мои данные архивом CSV",
 }
 
 # Видны в меню только в чатах администраторов (BotCommandScopeChat); у остальных
@@ -131,6 +132,13 @@ def tool_specs() -> list[dict]:
             "name": "knowledge",
             "description": "Прочитать справочный материал: протокол, препараты, вехи, книги по питанию",
             "parameters": knowledge.schema(),
+        },
+    }, {
+        "type": "function",
+        "function": {
+            "name": "export_data",
+            "description": "Экспортировать собственные данные человека и отправить ZIP с CSV в этот приватный чат. Успех означает подтверждённую отправку файла.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
     }]
 
@@ -230,6 +238,8 @@ def dispatch(name: str, args: dict) -> str:
     поэтому маршрутизируется здесь, а не внутри registry. Дергается только
     из цикла LLM (llm.run_loop) — слэш-команды и скрипты идут через
     registry.dispatch напрямую и правил инструментов не видят."""
+    if name == "export_data":
+        return json.dumps({"error": "Для отправки архива нужен приватный чат Telegram. Используй /export."}, ensure_ascii=False)
     if name == "knowledge":
         result = knowledge.read(args.get("topic", ""), args.get("query"))
     elif name == "log_food" and (args.get("action") or "add") == "add" and _PLAN_ONLY.get():
@@ -239,6 +249,45 @@ def dispatch(name: str, args: dict) -> str:
     else:
         result = registry.dispatch(name, args)
     return with_tool_rules(name, result)
+
+
+def _prepare_export(uid: str, path: str) -> dict:
+    from health_core.export import export_user_archive
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN")
+        user_id = _resolve_uid_to_user_id(conn, uid)
+        if user_id is None:
+            raise ValueError("Пользователь не зарегистрирован")
+        return export_user_archive(conn, user_id, path)
+    finally:
+        conn.close()
+
+
+async def _send_export(message: Message, uid: str) -> str:
+    if message.chat.type != "private" or str(message.chat.id) != uid:
+        return json.dumps({"error": "Экспорт доступен только в личном чате с ботом."}, ensure_ascii=False)
+    try:
+        with tempfile.TemporaryDirectory(prefix="health_export_") as tmp:
+            result = await asyncio.to_thread(_prepare_export, uid, str(Path(tmp) / "health-data.zip"))
+            await message.answer_document(
+                FSInputFile(result["path"], filename="health-data.zip"),
+                caption=f"Ваши данные: {result['files']} CSV-файлов, {result['rows']} записей.",
+            )
+        return json.dumps({"sent": True, "files": result["files"], "rows": result["rows"]}, ensure_ascii=False)
+    except Exception:
+        log.exception("не удалось экспортировать и отправить данные")
+        return json.dumps({"error": "Архив не отправлен. Не удалось подготовить или доставить файл; попробуйте /export ещё раз."}, ensure_ascii=False)
+
+
+def _message_dispatch(message: Message, uid: str):
+    async def execute(name: str, args: dict) -> str:
+        if name == "export_data":
+            return await _send_export(message, uid)
+        return await asyncio.to_thread(dispatch, name, args)
+
+    return execute
 
 
 def allowed_users() -> set[str]:
@@ -782,14 +831,12 @@ def _format_plateau_interactive(uid: str, args: str = "") -> tuple[str, InlineKe
 
         st_verdict = stagnation.get("verdict", "нормальная динамика")
         st_details = stagnation.get("details", "")
-        spread = stagnation.get("weight_spread_10d_kg")
+        trend_change = stagnation.get("weight_trend_change_kg")
         waist = stagnation.get("waist_change_21d_cm")
 
         ph_phase = pharma.get("phase", "")
         weeks_on = pharma.get("weeks_on_program", 0)
         med_weeks = pharma.get("median_plateau_weeks", 0)
-        weeks_rem = pharma.get("weeks_remaining", 0)
-        exp_date = pharma.get("expected_date", "")
         ph_desc = pharma.get("description", "")
 
         intake = eq.get("intake_kcal", 0)
@@ -798,47 +845,57 @@ def _format_plateau_interactive(uid: str, args: str = "") -> tuple[str, InlineKe
         slow_w = eq.get("slowdown_weight_kg")
 
         lines = [
-            "⏳ **Прогноз и клинический анализ плато массы тела**\n",
-            "📊 **Текущий статус (динамика за 2–3 недели):**",
+            "⏳ **Динамика веса и оценка паузы в снижении**\n",
+            "📊 **Оценка по доступным замерам:**",
             f"• Статус: **{st_verdict}**",
             f"• {st_details}",
         ]
-        if spread is not None:
-            lines.append(f"• Колебания веса за 10 дней: **{spread} кг**")
+        if stagnation.get("as_of"):
+            lines.append(f"• Проверено на: **{stagnation['as_of']}**")
+        if stagnation.get("weight_days") is not None:
+            lines.append(f"• Дней с сопоставимым весом в окне {stagnation.get('window_days')} дней: **{stagnation['weight_days']}**")
+        if trend_change is not None:
+            lines.append(f"• Изменение тренда веса в этом окне: **{trend_change:+.2f} кг**")
         if waist is not None:
-            lines.append(f"• Изменение талии за 3 недели: **{waist:+.1f} см**")
+            lines.append(f"• Изменение талии между замерами ({stagnation.get('waist_span_days', 0)} дней): **{waist:+.1f} см**")
         lines.append("")
 
         lines.extend([
-            "💊 **Фармакологическое плато (SURMOUNT timeline):**",
+            "💊 **Популяционный ориентир SURMOUNT:**",
             f"• Фаза: **{ph_phase}**",
-            f"• Неделя программы: **{weeks_on:.0f} из {med_weeks:.0f} нед** (осталось ~{weeks_rem:.0f} нед)",
-            f"• Ожидаемая дата плато на текущей дозе: **{exp_date}**",
+            f"• Прошло недель программы: **{weeks_on:.0f}**; медиана до плато в исследовании: **{med_weeks:.0f} нед**",
             f"• {ph_desc}\n",
         ])
 
+        intake_label = {
+            "logged_intake": "Среднее по записанному питанию (полнота журнала не подтверждена)",
+            "scenario": "Заданный сценарий питания",
+            "target_scenario": "Сценарий по целевому калоражу, не фактическое питание",
+            "estimated_scenario": "Оценочный сценарий питания, не фактическое питание",
+        }.get(eq.get("intake_source"), "Сценарий питания (источник не подтверждён)")
         lines.extend([
-            "⚖️ **Метаболическое равновесие (модель Hall):**",
-            f"• Приход: **{intake} ккал/сут**",
-            f"• Равновесная масса W_eq: **{w_eq} кг** *(вес, на котором расход сравняется с приходом)*",
+            "⚖️ **Условный сценарий равновесия модели:**",
+            f"• {intake_label}: **{intake} ккал/сут**",
+            f"• Расчётное равновесие: **{w_eq} кг** — не индивидуальный физиологический предел.",
         ])
         if slow_date and slow_w:
-            lines.append(f"• Замедление потери (<100 г/нед): ориентировочно **{slow_date}** (при весе **{slow_w} кг**)")
+            lines.append(f"• В этом сценарии замедление потери (<100 г/нед): **{slow_date}** (при весе **{slow_w} кг**)")
         lines.append("")
 
         if recs:
-            lines.append("💡 **Клинические рекомендации:**")
+            lines.append("💡 **Что проверить дальше:**")
             for r in recs:
                 lines.append(f"• {r}")
 
         buttons = [
-            [InlineKeyboardButton(text="🍽 Назначить рефид (4 дня)", callback_data="plateau_refeed")],
             [InlineKeyboardButton(text="🩺 Созвать консилиум (/council)", callback_data="plateau_council")],
             [
                 InlineKeyboardButton(text="🎯 Подобрать калораж", callback_data="nav_target"),
                 InlineKeyboardButton(text="📈 Траектория веса", callback_data="nav_forecast"),
             ],
         ]
+        if stagnation.get("sustained_weight_waist_pause"):
+            buttons.insert(0, [InlineKeyboardButton(text="🍽 Запланировать перерыв (4 дня)", callback_data="plateau_refeed")])
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
     finally:
         conn.close()
@@ -1221,7 +1278,9 @@ def _user_time_context(conn, uid: str) -> str:
         f"ВАЖНО: Текущий год — {u_now.year}! Ни в коем случае не используй 2025 или 2024 при логировании еды или запросах за сегодня."
         f"\nВремя в at/eaten_at/measured_at передавай местным временем человека без суффикса пояса (без Z и +03:00): "
         f"пояс человека{tz_info.strip() or ' из профиля'} код применяет сам, угаданный суффикс сдвигает запись на часы."
-        f"\nЕсли человек не назвал время события, НЕ передавай at/eaten_at/measured_at вовсе: код подставит текущее. "
+        f"\nЕсли человек не назвал ни дату, ни день, ни время события, НЕ передавай at/eaten_at/measured_at вовсе: код подставит текущее. "
+        f"Назван прошлый день («вчера», «в прошлое воскресенье», «забыл записать») — передай дату фактического события, "
+        f"вычисленную относительно местной даты выше, а не дату сообщения; если часы неизвестны, передай только YYYY-MM-DD. "
         f"Не бери время из имён файлов, прошлых реплик и своих прошлых вызовов - только из строки выше или из слов человека."
     )
     if health_notes:
@@ -1281,9 +1340,13 @@ def _close_turn(uid: str, new_messages: list[dict]) -> None:
 
 _COMPACT_PROMPT = (
     "Сожми историю диалога health-бота в краткую сводку на русском (до 1200 символов). "
-    "Оставь только то, что нужно для продолжения разговора: договорённости, предпочтения, "
-    "незакрытые вопросы, контекст текущей темы. Цифры замеров и записи не пересказывай - "
-    "они в базе. Только текст сводки, без вступлений."
+    "Оставь только прямо высказанные человеком предпочтения, согласованные планы, "
+    "договорённости и незакрытые вопросы; указывай, что сообщил человек, а что было согласовано. "
+    "Цифры замеров и записи не пересказывай — они в базе. Не сохраняй выводы модели "
+    "о состоянии здоровья и причинах: наличие или отсутствие плато, метаболическую адаптацию, "
+    "объяснения пищевыми привычками или недооценкой порций. Это требует новой проверки "
+    "актуальных данных инструментами, а не переноса старого вывода в сводку. "
+    "Только текст сводки, без вступлений."
 )
 
 
@@ -1292,7 +1355,10 @@ async def _compact_history(session: aiohttp.ClientSession, uid: str, providers: 
     def _load():
         conn = connect()
         try:
-            return history.split(conn, uid)
+            parts = history.split(conn, uid)
+            if parts[0]:
+                history.archive(conn, uid)
+            return parts
         finally:
             conn.close()
 
@@ -1313,7 +1379,7 @@ async def _compact_history(session: aiohttp.ClientSession, uid: str, providers: 
             conn.close()
 
     await asyncio.to_thread(_save)
-    return f"История сжата: {len(old)} старых сообщений -> сводка. Записи в базе на месте."
+    return f"История сжата: {len(old)} старых сообщений -> сводка. Оригиналы сохранены в history_archive в JSON; данные здоровья остались в базе."
 
 
 def _user_lock(uid: str) -> asyncio.Lock:
@@ -1507,7 +1573,7 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
     try:
         answer, full = await llm.run_loop(
             session, prefix, tool_specs(), bot_cfg["providers"],
-            dispatch, max_iters=bot_cfg.get("max_tool_iters", 6),
+            _message_dispatch(message, uid), max_iters=bot_cfg.get("max_tool_iters", 6),
             timeout_s=bot_cfg.get("request_timeout_s", llm.DEFAULT_TIMEOUT_S),
         )
     except RuntimeError as e:
@@ -1569,6 +1635,11 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
 
     if text.startswith("/"):
         cmd_name = text[1:].partition(" ")[0].split("@")[0].lower()
+        if cmd_name == "export":
+            result = json.loads(await _send_export(message, uid))
+            if result.get("error"):
+                await message.answer(result["error"])
+            return
         if cmd_name in ("model", "models"):
             if uid not in admin_user_ids():
                 await message.answer("⚠ Команда /model доступна только администраторам.")
@@ -1664,7 +1735,7 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
     try:
         answer, full = await llm.run_loop(
             session, prefix, tool_specs(), bot_cfg["providers"],
-            dispatch, max_iters=bot_cfg.get("max_tool_iters", 6),
+            _message_dispatch(message, uid), max_iters=bot_cfg.get("max_tool_iters", 6),
             timeout_s=bot_cfg.get("request_timeout_s", llm.DEFAULT_TIMEOUT_S),
         )
     except RuntimeError as e:

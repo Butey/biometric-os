@@ -6,8 +6,8 @@ set -euo pipefail
 #
 # Раскладка после перехода с Hermes на собственный цикл агента (bot/,
 # Docs/bot_design.md): venv живёт В КАТАЛОГЕ ПРОЕКТА, а не в ~/.hermes/.
-# От ~/.hermes/ остаются только .env (секреты, общий канал с admin/) и
-# health.db. Копий кода, персоны и config.yaml туда больше не кладём.
+# В ~/.hermes/ остаётся только .env (секреты, общий канал с admin/).
+# База health.db находится в корне проекта. Копий кода, персоны и config.yaml туда больше не кладём.
 
 PROJECT_DIR="${1:-.}"
 PYTHON="${PYTHON:-python3}"
@@ -89,22 +89,42 @@ printf "${GREEN}OK${NC}: Installed\n\n"
 # ================================================================
 mkdir -p "$HOME/.hermes"
 
-# 1. Database: restore if present in package, or initialize empty
-if [ ! -f "$HOME/.hermes/health.db" ]; then
-    if [ -f "$PROJECT_DIR/data/health.db" ]; then
-        printf "Found database in %s/data/health.db -> copying to ~/.hermes/health.db...\n" "$PROJECT_DIR"
-        cp "$PROJECT_DIR/data/health.db" "$HOME/.hermes/health.db"
-        printf "${GREEN}OK${NC}: Restored database from package\n"
-    elif [ -f "$PROJECT_DIR/../data/health.db" ]; then
-        printf "Found database in data/health.db -> copying to ~/.hermes/health.db...\n"
-        cp "$PROJECT_DIR/../data/health.db" "$HOME/.hermes/health.db"
-        printf "${GREEN}OK${NC}: Restored database from package\n"
-    else
-        printf "${YELLOW}NOTE${NC}: No existing health.db found, will create empty schema\n"
-    fi
-else
-    printf "${GREEN}OK${NC}: Existing ~/.hermes/health.db found\n"
-fi
+# 1. Существующая база проекта приоритетнее восстановления из старого пути/пакета.
+# На обновлении сервисы должны быть остановлены до переноса (см. DEPLOY.md).
+"$TARGET_PY" - "$PROJECT_DIR" <<'PYDB'
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+target = Path(os.environ.get("HEALTH_DB") or root / "health.db").expanduser()
+if not target.is_absolute():
+    target = root / target
+if target.exists():
+    print(f"Existing database retained: {target}")
+else:
+    sources = [Path.home() / ".hermes" / "health.db", root / "data" / "health.db", root.parent / "data" / "health.db"]
+    source = next((p for p in sources if p.is_file()), None)
+    if source:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # SQLite backup включает WAL; исходная база сохраняется для отката.
+        src = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            dst = sqlite3.connect(target)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        finally:
+            src.close()
+        print(f"Database copied: {source} -> {target}; original retained")
+    else:
+        print(f"No existing database; schema will be created at {target}")
+PYDB
 
 # 2. Secrets (.env): restore template if needed
 if [ ! -f "$HOME/.hermes/.env" ]; then
@@ -211,6 +231,6 @@ printf "   Job times: config.yaml -> schedule.jobs; preview: .venv/bin/python sc
 printf "Note: most of these fail silently (non-zero exit -> error sent to admins, not users)\n"
 printf "until a user is registered in the database. This is expected before step 3.\n\n"
 printf "Details and rationale: DEPLOY.md, Docs/bot_design.md, Docs/llm_config.md\n\n"
-printf "Database location: ~/.hermes/health.db\n"
+printf "Database location: %s/health.db (or HEALTH_DB override)\n" "$PROJECT_DIR"
 printf "Secrets location:  ~/.hermes/.env\n"
 printf "Venv location:     %s\n\n" "$VENV_DIR"

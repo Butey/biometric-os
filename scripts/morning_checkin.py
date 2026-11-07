@@ -18,7 +18,7 @@ from health_core.chrono import caffeine_cutoff
 from health_core.meds import stock_runs_out
 from health_core import sick
 from health_core import refeed
-from health_core.config import user_today
+from health_core.config import user_now
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # соседние скрипты
 from injection_reminder import injection_block  # noqa: E402
@@ -61,9 +61,10 @@ def main() -> int:
     blocks = []
     for u in users:
         try:
-            block_lines = [status_bar(conn, u["id"])]
-            today = user_today(conn, u["id"])
-            block_lines.append(morning_checklist(conn, u["id"]))
+            now = user_now(conn, u["id"])
+            block_lines = [status_bar(conn, u["id"], as_of=now)]
+            today = now.date().isoformat()
+            block_lines.append(morning_checklist(conn, u["id"], as_of=now))
             # Кофеиновое окно
             cutoff = caffeine_cutoff(conn, u["id"])
             if cutoff is not None:

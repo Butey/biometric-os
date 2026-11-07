@@ -48,7 +48,7 @@ policy:
   fat_supply_kcal_per_kg: 69.3
   # доля предела на худом/жирном конце шкалы (см. выше)
   fat_share_lean: 0.7
-  fat_share_fat: 0.3
+  fat_share_fat: 0.4
   fat_share_fat_proven: 0.4
   # шкала процента жира, [нижняя, верхняя] граница; неизвестный пол -> _m
   fat_share_bounds_m: [12, 30]
@@ -332,16 +332,18 @@ bot:
   # Ключи здесь НЕ хранятся, только имя переменной окружения из ~/.hermes/.env.
   # На free tier цепочка обязательна: выбив лимит, бот иначе просто замолкает.
   providers:
-    - base_url: https://api.tkbk.online/openai/v1
-      api_key_env: TKBK_API_KEY
-      model: gpt-6-sol
-      timeout_s: 60
-    # Claude через тот же прокси: формат Anthropic Messages (bot/llm.py::_to_anthropic)
     - base_url: https://api.tkbk.online/claude
       api: anthropic
       api_key_env: TKBK_API_KEY
       model: claude-sonnet-5
       timeout_s: 60
+    - base_url: https://api.tkbk.online/openai/v1
+      api_key_env: TKBK_API_KEY
+      model: gpt-6-sol
+      timeout_s: 60
+    - base_url: https://generativelanguage.googleapis.com/v1beta/openai
+      api_key_env: GOOGLE_API_KEY
+      model: gemini-3.8-flash
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
       model: gemini-3.5-flash-lite
@@ -351,11 +353,6 @@ bot:
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
       model: gemini-3.7-flash
-    - base_url: https://generativelanguage.googleapis.com/v1beta/openai
-      api_key_env: GOOGLE_API_KEY
-      model: gemini-3.8-flash
-    # Резерв вне квоты Google. :free — лимиты OpenRouter на бесплатные модели,
-    # и бесплатные эндпоинты могут сохранять запросы.
     - base_url: https://openrouter.ai/api/v1
       api_key_env: OPENROUTER_API_KEY
       model: google/gemma-4-31b-it:free

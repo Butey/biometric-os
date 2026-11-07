@@ -207,13 +207,13 @@ def _plateau_note(conn: sqlite3.Connection, user_id: int, weight_kg: float,
     weeks = (user_now(conn, user_id).date() - started).days / 7.0
     if weeks < 0:
         return None
-    bmi = weight_kg / (height_cm / 100) ** 2
+    baseline = conn.execute("SELECT base_weight_kg FROM users WHERE id=?", (user_id,)).fetchone()
+    bmi = ((baseline["base_weight_kg"] or weight_kg) / (height_cm / 100) ** 2)
     median_weeks = next((w for lo, w in PLATEAU_WEEKS if bmi >= lo), PLATEAU_WEEKS[-1][1])
-    note = (f"На программе {weeks:.0f}-я неделя. В SURMOUNT медиана времени до "
-            f"плато при таком ИМТ — {median_weeks:.0f} недель "
-            f"(Horn et al., Clin Obes, 2025). Модель плато не предсказывает.")
-    if weeks >= median_weeks * 0.8:
-        note += " Срок близко: прогноз ниже, скорее всего, оптимистичен."
+    note = (f"В SURMOUNT медиана времени до плато в группе со стартовым классом ИМТ "
+            f"составляла {median_weeks:.1f} недель (Horn et al., Clin Obes, 2025). "
+            "Это популяционный ориентир по тирзепатиду, не личный срок плато или завершения действия дозы. "
+            "Текущую динамику проверяют отдельной оценкой по наблюдениям; модель плато не предсказывает.")
     return note
 
 
@@ -307,6 +307,7 @@ def project(conn: sqlite3.Connection, user_id: int, horizon_days: int = 84,
         return {"error": f"Еды записано меньше {MIN_LOG_STREAK_DAYS} дней подряд — среднего прихода нет. "
                          "Либо логируй полнее, либо задай intake_kcal вручную сценарием"}
 
+    from health_core.energy import daily_expenditure
     cfg = _forecast_cfg()
     activity = _policy().get("activity_factor", 1.20)
     adaptive_pct = float(cfg.get("adaptive_thermogenesis_pct", 0.0))
@@ -315,9 +316,16 @@ def project(conn: sqlite3.Connection, user_id: int, horizon_days: int = 84,
     age_years = _age_years(user["birth_date"], today.isoformat())
     sex = user["sex"] or "m"
 
+    # Привязываем стартовый TDEE симуляции к фактическому расходу дня (daily_expenditure),
+    # чтобы прогноз не расходился с daily_target() и calibrate() на сотни ккал.
+    bmr0 = bmr_mifflin(weight_kg, user["height_cm"], age_years, sex)
+    exp_kcal = daily_expenditure(conn, user_id, today.isoformat())["kcal"]
+    denom0 = bmr0 * (1.0 - adaptive_pct)
+    eff_activity = (exp_kcal / denom0) if denom0 > 0 else activity
+
     def run(intake):
         return _simulate(weight_kg, fat_kg, user["height_cm"], age_years, sex,
-                         intake, horizon_days, activity, adaptive_pct)
+                         intake, horizon_days, eff_activity, adaptive_pct)
 
     mid, truncated = run(intake_kcal)
     # Больше еды -> меньше дефицит -> выше вес: верхняя граница полосы.
@@ -420,7 +428,7 @@ def calibrate(
     3. Только target_kg (подбор без дедлайна):
        - генерация 3 вариантов темпа (комфортный, оптимальный, интенсивный) с БЖУ и сроками.
     """
-    from health_core.energy import daily_expenditure, kcal_floor, _active_milestone
+    from health_core.energy import daily_expenditure, daily_target, kcal_floor, _active_milestone
     from health_core.config import targets_for
 
     today = user_now(conn, user_id).date()
@@ -501,11 +509,17 @@ def calibrate(
                     weight_at_cur_deadline = proj["end"]
 
         kg_diff = start_weight - target_kg
-        # Срок из динамической модели (как forecast_reach); 7700 - только запасной путь.
-        aligned_deadline = fr.get("expected")
-        if aligned_deadline is None and deficit > 0 and kg_diff > 0:
+        # Срок вехи вычисляется по той же формуле 7700 ккал/кг, которую шаг 2
+        # daily_target() (_deadline_deficit) обращает в суточную цель: только
+        # тогда сохранение aligned_deadline действительно даёт target_kcal.
+        aligned_deadline = None
+        if deficit > 0 and kg_diff > 0:
             aligned_days = max(1, round(kg_diff * 7700.0 / deficit))
+            if is_safe and (full_tdee - (kg_diff * 7700.0 / aligned_days)) < floor:
+                aligned_days += 1
             aligned_deadline = (today + timedelta(days=aligned_days)).isoformat()
+        if aligned_deadline is None:
+            aligned_deadline = fr.get("expected")
 
         applied = False
         applied_message = None
@@ -520,6 +534,8 @@ def calibrate(
                     (target_kg, aligned_deadline, active_ms["id"])
                 )
                 conn.commit()
+                if conn.execute("SELECT 1 FROM daily_targets WHERE user_id=? AND date=?", (user_id, today.isoformat())).fetchone():
+                    daily_target(conn, user_id, today.isoformat())
                 applied = True
                 applied_message = (
                     f"Веха «{active_ms['name']}» обновлена: цель {target_kg} кг, срок {aligned_deadline}. "
@@ -534,6 +550,8 @@ def calibrate(
                     (user_id, ms_name, target_kg, aligned_deadline)
                 )
                 conn.commit()
+                if conn.execute("SELECT 1 FROM daily_targets WHERE user_id=? AND date=?", (user_id, today.isoformat())).fetchone():
+                    daily_target(conn, user_id, today.isoformat())
                 applied = True
                 applied_message = (
                     f"Создана веха «{ms_name}» со сроком {aligned_deadline}. "
@@ -656,6 +674,8 @@ def calibrate(
                     (user_id, f"{target_kg:.0f} кг", target_kg, chosen_deadline)
                 )
             conn.commit()
+            if conn.execute("SELECT 1 FROM daily_targets WHERE user_id=? AND date=?", (user_id, today.isoformat())).fetchone():
+                daily_target(conn, user_id, today.isoformat())
             applied = True
             applied_message = f"Веха установлена на {chosen_deadline}."
 
@@ -709,16 +729,13 @@ def plateau_forecast(
     user_id: int,
     intake_kcal: float | None = None,
 ) -> dict:
-    """Комплексный прогноз и клинический анализ плато массы тела.
+    """Наблюдаемая пауза веса, популяционный ориентир и условный сценарий.
 
-    Включает:
-    1. Фармакологический прогноз (SURMOUNT timeline): неделя терапии, медиана времени
-       до плато (Horn et al., Clin Obes, 2025), ожидаемая дата замедления.
-    2. Метаболическое плато (Hall equilibrium): асимптотический вес W_eq при текущем
-       калораже (где TDEE сравняется с приходом) и дата замедления потери до < 100 г/нед.
-    3. Текущий статус застоя: истинное плато, псевдоплато (вода при уменьшении талии)
-       или нормальное снижение.
-    4. Клинические рекомендации по преодолению плато (рефид, консилиум, замеры талии).
+    Общая оценка health_core.plateau отделяет достаточность измерений от
+    короткой и длительной паузы. Она не устанавливает медицинскую причину.
+    SURMOUNT описывает группу участников, а не дату плато или эффект дозы
+    конкретного человека. Равновесие модели условно при заданном приходе;
+    источник прихода указан явно, включая сценарии по цели и оценке.
     """
     from health_core.energy import daily_expenditure, kcal_floor
 
@@ -732,7 +749,9 @@ def plateau_forecast(
     sw = smoothed_weight(conn, user_id)
     if sw is None:
         return {"error": "Нет свежих замеров массы тела за последние 7 дней"}
-    curr_weight, _ = sw
+    curr_weight, last_weight_date = sw
+    if (today - date.fromisoformat(last_weight_date)).days > MAX_WEIGHT_AGE_DAYS:
+        return {"error": "Нет свежих замеров массы тела за последние 7 дней"}
 
     height_cm = u["height_cm"]
     sex = u["sex"] or "m"
@@ -751,46 +770,40 @@ def plateau_forecast(
     expected_plateau_date = (started_date + timedelta(weeks=median_plateau_weeks)).isoformat()
     weeks_until_plateau = round(median_plateau_weeks - weeks_on_program, 1)
 
-    if weeks_on_program >= median_plateau_weeks:
-        pharma_phase = "в фазе плато"
-        pharma_desc = (
-            f"На программе {weeks_on_program:.0f}-я неделя (медиана SURMOUNT {median_plateau_weeks:.0f} нед). "
-            f"Активная фаза снижения на текущей дозе физиологически завершена."
-        )
-    elif weeks_on_program >= median_plateau_weeks * 0.8:
-        pharma_phase = "приближение к плато"
-        pharma_desc = (
-            f"На программе {weeks_on_program:.0f}-я неделя из {median_plateau_weeks:.0f} нед. "
-            f"До медианы плато осталось ~{weeks_until_plateau:.0f} нед (ориентировочно {expected_plateau_date}). "
-            f"Темп снижения естественным образом замедляется."
-        )
-    else:
-        pharma_phase = "активное снижение"
-        pharma_desc = (
-            f"На программе {weeks_on_program:.0f}-я неделя из {median_plateau_weeks:.0f} нед. "
-            f"Ожидаемое время активного снижения до плато: ~{weeks_until_plateau:.0f} нед ({expected_plateau_date})."
-        )
+    # Population medians are descriptive trial results, not an individual clock.
+    pharma_phase = "популяционный ориентир"
+    pharma_desc = (
+        f"Медиана времени до плато в SURMOUNT для стартового класса ИМТ: {median_plateau_weeks:.1f} нед. "
+        "Это популяционная статистика по тирзепатиду, не подтверждение плато у человека. "
+        "Начало программы не обязательно совпадает с началом терапии; индивидуальную дату плато и завершение действия дозы по нему определить нельзя."
+    )
 
     # 2. Метаболическое равновесие (Hall dynamic equilibrium)
     exp_dict = daily_expenditure(conn, user_id, today.isoformat())
     full_tdee = exp_dict["kcal"]
     floor, _ = kcal_floor(conn, user_id, full_tdee)
 
+    intake_source = "scenario" if intake_kcal is not None else "unknown"
     if intake_kcal is None:
         obs = _observed_intake(conn, user_id)
         if obs is not None:
             intake_kcal = obs
+            intake_source = "logged_intake"
         else:
             t_row = conn.execute(
                 "SELECT kcal_target FROM daily_targets WHERE user_id=? AND date=?",
                 (user_id, today.isoformat()),
             ).fetchone()
-            intake_kcal = t_row["kcal_target"] if t_row and t_row["kcal_target"] else max(floor, full_tdee - 500.0)
+            if t_row and t_row["kcal_target"]:
+                intake_kcal, intake_source = t_row["kcal_target"], "target_scenario"
+            else:
+                intake_kcal, intake_source = max(floor, full_tdee - 500.0), "estimated_scenario"
 
     intake_kcal = float(intake_kcal)
     act_factor = _policy().get("activity_factor", 1.20)
     adapt_pct = _forecast_cfg().get("adaptive_thermogenesis_pct", 0.0)
-    k = act_factor * (1.0 - adapt_pct)
+    bmr0 = bmr_mifflin(curr_weight, height_cm, age, sex)
+    k = (full_tdee / bmr0) if bmr0 > 0 else act_factor * (1.0 - adapt_pct)
     c_const = 6.25 * height_cm - 5.0 * age + (5.0 if sex == "m" else -161.0)
     denom = 10.0 * k
     w_eq = round((intake_kcal - k * c_const) / denom, 1)
@@ -810,67 +823,19 @@ def plateau_forecast(
                 slowdown_weight = traj[i]["mid"]
                 break
 
-    # 3. Текущий статус застоя веса (последние 14–21 день)
-    since_21d = (today - timedelta(days=21)).isoformat()
-    rows_w = conn.execute(
-        "SELECT date(measured_at) d, weight_kg w FROM body_metrics "
-        "WHERE user_id=? AND measured_at >= ? AND weight_kg IS NOT NULL ORDER BY measured_at",
-        (user_id, since_21d),
-    ).fetchall()
+    # 3. Shared observed assessment, independent of trial population timelines.
+    from health_core.plateau import assess
 
-    stagnation_verdict = "нормальная динамика"
-    stagnation_details = "Застоя массы тела нет."
-    weight_spread_10d = None
-    waist_change_21d = None
-
-    if len(rows_w) >= 4:
-        since_10d = (today - timedelta(days=10)).isoformat()
-        rows_10d = [r["w"] for r in rows_w if r["d"] >= since_10d]
-        if len(rows_10d) >= 4:
-            weight_spread_10d = round(max(rows_10d) - min(rows_10d), 2)
-
-        rows_waist = conn.execute(
-            "SELECT measured_on d, value_cm w FROM anthropometry "
-            "WHERE user_id=? AND site IN ('талия', 'waist') AND measured_on >= ? AND value_cm IS NOT NULL ORDER BY measured_on",
-            (user_id, since_21d[:10]),
-        ).fetchall()
-        if len(rows_waist) >= 2:
-            waist_change_21d = round(rows_waist[-1]["w"] - rows_waist[0]["w"], 1)
-
-        if weight_spread_10d is not None and weight_spread_10d <= 0.5:
-            if waist_change_21d is not None and waist_change_21d <= -1.0:
-                stagnation_verdict = "псевдоплато (задержка воды)"
-                stagnation_details = (
-                    f"Вес колеблется в пределах {weight_spread_10d} кг за 10 дней, но талия уменьшилась "
-                    f"на {abs(waist_change_21d)} см. Жир сгорает, застой на весах вызван задержкой воды/гликогена."
-                )
-            elif (len(rows_w) >= 6 and (today - date.fromisoformat(rows_w[0]["d"])).days >= 18
-                  and max(r["w"] for r in rows_w) - min(r["w"] for r in rows_w) <= 0.5):
-                spread_all = round(max(r["w"] for r in rows_w) - min(r["w"] for r in rows_w), 2)
-                stagnation_verdict = "истинное плато"
-                stagnation_details = (
-                    f"Вес зафиксирован более 18 дней (размах всего {spread_all} кг), объемы не падают. "
-                    f"Это метаболическая адаптация: рекомендуется плановый рефид или консилиум."
-                )
-            else:
-                stagnation_verdict = "пауза в весе (< 2 недель)"
-                stagnation_details = (
-                    f"Вес в узком коридоре {weight_spread_10d} кг за 10 дней. Застой менее 2 недель "
-                    f"физиологически нормален и обычно связан с солью, водой или мышечным восстановлением."
-                )
-        else:
-            delta_w = round(rows_w[-1]["w"] - rows_w[0]["w"], 1)
-            stagnation_details = f"Динамика за 3 недели: {delta_w:+.1f} кг. Застоя веса не зафиксировано."
-
-    # 4. Рекомендации
-    recommendations = []
-    if stagnation_verdict == "истинное плато":
-        recommendations.append("Плановый рефид (MATADOR 2 недели на уровне TDEE) для нормализации лептина и щитовидной оси.")
-        recommendations.append("Консилиум по титрации дозы GLP-1 с врачом (команда /council).")
-    elif stagnation_verdict == "псевдоплато (задержка воды)":
-        recommendations.append("Продолжать режим: талия уходит, состав тела улучшается, вес сбросит воду скачком.")
+    stagnation = assess(conn, user_id)
+    if stagnation["sustained_weight_waist_pause"]:
+        recommendations = [
+            "Проверить полноту журнала питания, условия замеров, активность и изменения терапии; причина паузы не установлена.",
+            "При необходимости обсудить ситуацию с врачом или запросить консилиум (/council); не менять дозу по одному сигналу веса.",
+        ]
+    elif stagnation["status"] == "insufficient_data":
+        recommendations = ["Продолжить сопоставимые утренние замеры веса и талии; данных для уверенного вывода о длительном плато пока недостаточно."]
     else:
-        recommendations.append("Текущий дефицит работает штатно. Поддерживать каденцию взвешиваний и шагов.")
+        recommendations = ["Оценивать тренд по сопоставимым замерам. По весу и талии нельзя установить причину изменений или доказать пищевые привычки."]
 
     return {
         "start_weight_kg": round(base_weight, 1),
@@ -881,23 +846,23 @@ def plateau_forecast(
             "weeks_on_program": weeks_on_program,
             "median_plateau_weeks": median_plateau_weeks,
             "weeks_remaining": weeks_until_plateau,
-            "expected_date": expected_plateau_date,
+            "expected_date": None,
+            "population_reference_date": expected_plateau_date,
+            "is_individual_prediction": False,
+            "source": "https://pmc.ncbi.nlm.nih.gov/articles/PMC12096058/",
             "phase": pharma_phase,
             "description": pharma_desc,
         },
         "metabolic_equilibrium": {
             "intake_kcal": round(intake_kcal),
             "equilibrium_weight_kg": w_eq,
+            "intake_source": intake_source,
+            "estimate": True,
             "slowdown_date": slowdown_date,
             "slowdown_weight_kg": slowdown_weight,
-            "note": f"При калораже {intake_kcal:.0f} ккал/сут метаболический предел снижения составляет {w_eq:.1f} кг.",
+            "note": f"Условное равновесие упрощённой модели при {intake_kcal:.0f} ккал/сут: {w_eq:.1f} кг. Не индивидуальный физиологический предел; сценарий не устанавливает фактическое питание.",
         },
-        "current_stagnation": {
-            "verdict": stagnation_verdict,
-            "details": stagnation_details,
-            "weight_spread_10d_kg": weight_spread_10d,
-            "waist_change_21d_cm": waist_change_21d,
-        },
+        "current_stagnation": stagnation,
         "recommendations": recommendations,
     }
 

@@ -4,15 +4,16 @@ import sqlite3
 import statistics
 from datetime import datetime, timedelta, date
 
+from health_core.config import load, local_now, targets_for, user_now
+from health_core.guards import check_all
+from health_core.chrono import eating_window, late_load, meal_windows
+
 def _parse_date_safe(s: str) -> "date | None":
-    """Безопасный парсинг ISO-даты; логирует и возвращает None при ошибке."""
+    """Безопасный парсинг ISO-даты; возвращает None при ошибке."""
     try:
         return date.fromisoformat(str(s)[:10])
     except (ValueError, TypeError):
         return None
-from health_core.config import load, local_now, targets_for, user_now
-from health_core.guards import check_all
-from health_core.chrono import eating_window, late_load, meal_windows
 
 MINUS = "−"  # настоящий минус, не дефис — так в §07
 
@@ -62,7 +63,7 @@ def _water_target_ml(conn: sqlite3.Connection, user_id: int) -> float | None:
     return targets_for(conn, user_id).get("water_ml")
 
 
-def _day_macros(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
+def _day_macros(conn: sqlite3.Connection, user_id: int, date: str, as_of: datetime) -> dict:
     # Вторая агрегация тех же колонок: первая — nutrition.day_macros. Отличия
     # только в COALESCE и счётчике n. Новую колонку приходится добавлять в оба
     # места, и забытое второе валится KeyError уже в рантайме, а не на импорте.
@@ -72,50 +73,61 @@ def _day_macros(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
         "COALESCE(SUM(fi.fat_g),0) fat_g, COALESCE(SUM(fi.carbs_g),0) carb_g, "
         "COALESCE(SUM(fi.fiber_g),0) fiber_g, COUNT(*) n, COUNT(fi.fiber_g) fiber_n "
         "FROM food_log fl JOIN food_items fi ON fi.food_log_id=fl.id "
-        "WHERE fl.user_id=? AND date(fl.eaten_at)=?",
-        (user_id, date),
+        "WHERE fl.user_id=? AND date(fl.eaten_at)=? AND fl.eaten_at<=?",
+        (user_id, date, as_of.strftime("%Y-%m-%d %H:%M:%S")),
     ).fetchone()
     return dict(row)
 
 
-def _day_water_ml(conn: sqlite3.Connection, user_id: int, date: str) -> float:
+def _day_water(conn: sqlite3.Connection, user_id: int, date: str, as_of: datetime) -> dict:
     row = conn.execute(
-        "SELECT COALESCE(SUM(volume_ml),0) ml FROM water_log WHERE user_id=? AND date(at)=?",
-        (user_id, date),
+        "SELECT COALESCE(SUM(volume_ml),0) ml, COUNT(*) n FROM water_log "
+        "WHERE user_id=? AND date(at)=? AND at<=?",
+        (user_id, date, as_of.strftime("%Y-%m-%d %H:%M:%S")),
     ).fetchone()
-    return row["ml"]
+    return dict(row)
 
 
-def _latest_metric(conn: sqlite3.Connection, user_id: int):
-    return conn.execute(
-        "SELECT measured_at, weight_kg, ffm_kg FROM body_metrics WHERE user_id=? "
-        "ORDER BY measured_at DESC LIMIT 1",
-        (user_id,),
-    ).fetchone()
+def _latest_metric(conn: sqlite3.Connection, user_id: int, on_date: str | None = None,
+                   *, as_of: datetime | None = None):
+    """Записанный вес не позже текущего времени; on_date запрещает перенос между днями."""
+    query = (
+        "SELECT measured_at, weight_kg, ffm_kg, fat_pct FROM body_metrics "
+        "WHERE user_id=? AND weight_kg IS NOT NULL AND measured_at<=? "
+    )
+    now = as_of if as_of is not None else _now(conn, user_id)
+    params = [user_id, now.strftime("%Y-%m-%d %H:%M:%S")]
+    if on_date is not None:
+        query += "AND date(measured_at)=? "
+        params.append(on_date)
+    return conn.execute(query + "ORDER BY measured_at DESC LIMIT 1", params).fetchone()
 
 
-def _weight_trend(conn: sqlite3.Connection, user_id: int, window_days: int, latest_weight: float):
+def _weight_trend(conn: sqlite3.Connection, user_id: int, window_days: int, latest_weight: float,
+                  *, as_of: datetime | None = None):
     """Дельта веса за окно: медиана конца минус медиана начала.
 
     МЕДИАНА ИСПОЛЬЗУЕТСЯ, ЧТОБЫ одна шумная точка на границе окна не решила сама по себе,
     какой тренд показывать. Биоимпеданс носит шум гидрации в килограмм в день;
     эндпоинт-дельта ловит одиночный всплеск как знаковый сдвиг."""
-    since = (_now(conn, user_id) - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    now = as_of if as_of is not None else _now(conn, user_id)
+    since = (now - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
     # Оригинал: ищет ТОЧКУ <= граница окна (якорь), затем использует latest.
     # Для медианы: берём все точки, начиная хотя бы от границы окна.
     # Дополнительный запрос: найти последнюю точку ВНЕ окна (если есть), чтобы включить якорь.
     # Якорь старше window_days до границы окна - не «начало окна», а чужая эпоха.
-    anchor_min = (_now(conn, user_id) - timedelta(days=2 * window_days)).strftime("%Y-%m-%d %H:%M:%S")
+    anchor_min = (now - timedelta(days=2 * window_days)).strftime("%Y-%m-%d %H:%M:%S")
     anchor = conn.execute(
         "SELECT weight_kg FROM body_metrics WHERE user_id=? AND measured_at<=? AND measured_at>=? "
+        "AND weight_kg IS NOT NULL "
         "ORDER BY measured_at DESC LIMIT 1",
         (user_id, since, anchor_min),
     ).fetchone()
 
     rows_in_window = conn.execute(
         "SELECT weight_kg FROM body_metrics WHERE user_id=? AND measured_at>? "
-        "ORDER BY measured_at ASC",
-        (user_id, since),
+        "AND measured_at<=? AND weight_kg IS NOT NULL ORDER BY measured_at ASC",
+        (user_id, since, now.strftime("%Y-%m-%d %H:%M:%S")),
     ).fetchall()
 
     # Если есть якорь вне окна, включаем его в начало для сравнения
@@ -182,8 +194,8 @@ def _meal_clause(conn: sqlite3.Connection, user_id: int, date: str, now: datetim
         if not (w["start"] <= t <= w["end"]):
             continue
         row = conn.execute(
-            "SELECT COUNT(*) n FROM food_log WHERE user_id=? AND date(eaten_at)=? AND meal_slot=?",
-            (user_id, date, name),
+            "SELECT COUNT(*) n FROM food_log WHERE user_id=? AND date(eaten_at)=? AND meal_slot=? AND eaten_at<=?",
+            (user_id, date, name, now.strftime("%Y-%m-%d %H:%M:%S")),
         ).fetchone()
         if row["n"] > 0:
             return None
@@ -191,13 +203,19 @@ def _meal_clause(conn: sqlite3.Connection, user_id: int, date: str, now: datetim
     return None
 
 
-def day_summary(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
-    """Все числа дня одним словарём — источник и для status_bar, и для evening_report."""
-    macros = _day_macros(conn, user_id, date)
+def day_summary(conn: sqlite3.Connection, user_id: int, date: str,
+                *, as_of: datetime | None = None) -> dict:
+    """Числа указанного дня: вес другой даты не подставляется.
+
+    Источник для status_bar и evening_report. Отсутствие записей питания/воды
+    отмечено отдельно от числовых сумм: ноль в журнале не доказывает отсутствие потребления.
+    """
+    now = as_of if as_of is not None else _now(conn, user_id)
+    macros = _day_macros(conn, user_id, date, now)
+    water = _day_water(conn, user_id, date, now)
     # Строка цели на сегодня могла быть записана до правок формулы или до новых данных: пересчитываем при чтении.
-    from health_core.config import user_today
     from health_core.energy import daily_target
-    if date == user_today(conn, user_id):
+    if date == now.date().isoformat():
         try:
             daily_target(conn, user_id, date)
         except ValueError:  # ещё нет ни одного замера тела — считать цель не от чего
@@ -207,10 +225,14 @@ def day_summary(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
         "water_ml_target FROM daily_targets WHERE user_id=? AND date=?",
         (user_id, date),
     ).fetchone()
-    metric = _latest_metric(conn, user_id)
+    metric = _latest_metric(conn, user_id, on_date=date, as_of=now)
     return {
         "date": date,
+        "as_of": now.strftime("%Y-%m-%d %H:%M:%S"),
         "weight_kg": metric["weight_kg"] if metric else None,
+        "weight_measured_at": metric["measured_at"] if metric else None,
+        "food_recorded": bool(macros["n"]),
+        "water_recorded": bool(water["n"]),
         "kcal_target": target["kcal_target"] if target else None,
         "protein_g_target": target["protein_g_target"] if target else None,
         "fat_g_target": target["fat_g_target"] if target else None,
@@ -222,30 +244,45 @@ def day_summary(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
         "carb_g": macros["carb_g"],
         "fiber_g": macros["fiber_g"],
         "fiber_known": bool(macros["fiber_n"]),
-        "water_ml": _day_water_ml(conn, user_id, date),
+        "water_ml": water["ml"],
         "water_target_ml": _water_target_ml(conn, user_id),
         "alerts": [dict(r) for r in _active_alerts_today(conn, user_id, date)],
     }
 
 
-def status_bar(conn: sqlite3.Connection, user_id: int) -> str:
+def _intake_line(summary: dict) -> str:
+    """Форматирует записанное потребление, сохраняя различие нуля и пропуска."""
+    food = (
+        f"По записям: съедено {summary['kcal_eaten']:.0f} / Б {summary['protein_g']:.0f} / "
+        f"Ж {summary['fat_g']:.0f} / У {summary['carb_g']:.0f}."
+        if summary["food_recorded"] else "Питание сегодня не записано."
+    )
+    if summary["water_recorded"]:
+        target = summary["water_target_ml"]
+        target_text = f"{target / 1000:.1f}" if target is not None else "?"
+        water = f"Записано воды {summary['water_ml'] / 1000:.1f} / {target_text} л."
+    else:
+        water = "Вода сегодня не записана."
+    return f"{food} {water}"
+
+
+def status_bar(conn: sqlite3.Connection, user_id: int,
+               *, as_of: datetime | None = None) -> str:
     """Готовая строка §07. Модель дописывает её как есть, не перефразируя."""
-    now = _now(conn, user_id)
+    now = as_of if as_of is not None else _now(conn, user_id)
     date = now.date().isoformat()
     policy = load()["policy"]
 
-    metric = _latest_metric(conn, user_id)
-    weight_str = f"{metric['weight_kg']:.1f}" if metric else "?"
-    weight_tag = _time_tag(_parse(metric["measured_at"]).hour) if metric else "?"
-
-    d = day_summary(conn, user_id, date)
+    metric = _latest_metric(conn, user_id, as_of=now)
+    d = day_summary(conn, user_id, date, as_of=now)
+    if d["weight_measured_at"]:
+        measured = _parse(d["weight_measured_at"])
+        weight_clause = f"Вес {d['weight_kg']:.1f} ({_time_tag(measured.hour)}, {measured:%H:%M})."
+    else:
+        weight_clause = "Вес сегодня не записан."
     kcal_target = f"{d['kcal_target']:.0f}" if d["kcal_target"] is not None else "?"
-    water_now = d["water_ml"] / 1000
-    water_target = (d["water_target_ml"] or 0) / 1000
-
-    line1 = f"Сегодня {now.strftime('%d.%m')}, {now.strftime('%H:%M')}. Вес {weight_str} ({weight_tag}). Цель {kcal_target} ккал."
-    line2 = (f"Съедено {d['kcal_eaten']:.0f} / Б {d['protein_g']:.0f} / Ж {d['fat_g']:.0f} / "
-             f"У {d['carb_g']:.0f}. Вода {water_now:.1f} / {water_target:.1f} л.")
+    line1 = f"Сегодня {now.strftime('%d.%m')}, {now.strftime('%H:%M')}. {weight_clause} Цель {kcal_target} ккал."
+    line2 = _intake_line(d)
 
     meal_clause = _meal_clause(conn, user_id, date, now)
     alerts_today = check_all(conn, user_id)
@@ -253,7 +290,7 @@ def status_bar(conn: sqlite3.Connection, user_id: int) -> str:
     line3 = f"{meal_clause} {alert_clause}" if meal_clause else alert_clause
 
     window = policy["weight_trend_window_days"]
-    trend = _weight_trend(conn, user_id, window, metric["weight_kg"]) if metric else None
+    trend = _weight_trend(conn, user_id, window, metric["weight_kg"], as_of=now) if metric else None
     if trend is None:
         trend_part = "недостаточно данных"
     else:
@@ -265,24 +302,31 @@ def status_bar(conn: sqlite3.Connection, user_id: int) -> str:
         milestone_part = f" Ближайшая веха {milestone['threshold']:.0f} кг, осталось {remaining:.1f}."
     else:
         milestone_part = ""
-    line4 = f"Тренд {window} дней: {trend_part}.{milestone_part}"
+    history_part = ""
+    if metric is not None and d["weight_measured_at"] is None:
+        measured = _parse(metric["measured_at"])
+        history_part = f"Последний замер {measured:%d.%m.%Y %H:%M}: {metric['weight_kg']:.1f} кг. "
+        if milestone_part:
+            milestone_part = " По последнему замеру:" + milestone_part
+    line4 = f"{history_part}Тренд {window} дней: {trend_part}.{milestone_part}"
 
     return "\n".join([line1, line2, line3, line4])
 
 
-def morning_checklist(conn: sqlite3.Connection, user_id: int) -> str:
+def morning_checklist(conn: sqlite3.Connection, user_id: int,
+                      *, as_of: datetime | None = None) -> str:
     """Чек-лист утренних замеров: что уже записано сегодня (✓) и чего не хватает
     (☐), плюс шаги и пульс за вчера из часов. Без модели."""
     from health_core.guards import is_fasting_glucose
     from health_core.watch import resting_hr_trend, step_goal
 
-    today = _now(conn, user_id).date()
+    now = as_of if as_of is not None else _now(conn, user_id)
+    today = now.date()
     t, y = today.isoformat(), (today - timedelta(days=1)).isoformat()
     lines = [f"Утренние замеры {today.strftime('%d.%m')}:"]
 
-    w = conn.execute(
-        "SELECT weight_kg, fat_pct FROM body_metrics WHERE user_id=? AND date(measured_at)=? "
-        "ORDER BY measured_at DESC LIMIT 1", (user_id, t)).fetchone()
+    cutoff = now.strftime("%Y-%m-%d %H:%M:%S")
+    w = _latest_metric(conn, user_id, on_date=t, as_of=now)
     if w:
         fat = f", жир {w['fat_pct']:.1f}%" if w["fat_pct"] is not None else ", состав тела не записан"
         lines.append(f"✓ Вес {w['weight_kg']:.1f} кг{fat}")
@@ -290,12 +334,13 @@ def morning_checklist(conn: sqlite3.Connection, user_id: int) -> str:
         lines.append("☐ Вес и состав тела (весы натощак)")
 
     g = [r for r in conn.execute(
-        "SELECT at, mmol_l, context FROM glucose_log WHERE user_id=? AND date(at)=? ORDER BY at", (user_id, t))
+        "SELECT at, mmol_l, context FROM glucose_log WHERE user_id=? AND date(at)=? AND at<=? ORDER BY at",
+        (user_id, t, cutoff))
         if is_fasting_glucose(conn, user_id, r["at"], r["context"])]
     lines.append(f"✓ Глюкоза натощак {g[0]['mmol_l']:.1f} ммоль/л" if g else "☐ Глюкоза натощак")
 
-    b = conn.execute("SELECT systolic, diastolic, pulse FROM bp_log WHERE user_id=? AND date(at)=? ORDER BY at LIMIT 1",
-                     (user_id, t)).fetchone()
+    b = conn.execute("SELECT systolic, diastolic, pulse FROM bp_log WHERE user_id=? AND date(at)=? AND at<=? ORDER BY at LIMIT 1",
+                     (user_id, t, cutoff)).fetchone()
     if b:
         lines.append(f"✓ Давление {b['systolic']}/{b['diastolic']}" + (f", пульс {b['pulse']}" if b["pulse"] else ""))
     else:
@@ -441,6 +486,8 @@ def trends(conn: sqlite3.Connection, user_id: int, window_days: int = 30) -> dic
         vals = [r[key] for r in rows if r[key] is not None]
         return round(vals[-1] - vals[0], 2) if len(vals) >= 2 else None
 
+    from health_core.body_composition import lean_loss_ratio
+    lean = lean_loss_ratio(conn, user_id, since, min_points=load()["guards"]["lbm_ratio_min_points"])
     out = {
         "window_days": window_days,
         "weight_delta_kg": _delta(weight_rows, "weight_kg"),
@@ -448,6 +495,12 @@ def trends(conn: sqlite3.Connection, user_id: int, window_days: int = 30) -> dic
         "waist_delta_cm": _delta(waist_rows, "value_cm"),
         "whr": whr(conn, user_id),
         "actual_tdee_kcal": None,
+        "lean_loss": {
+            "ratio": lean[0] if lean else None,
+            "points": lean[3] if lean else None,
+            "window_days": window_days,
+            "estimate": True,
+        },
     }
     try:
         # ponytail: реальный расчёт живёт в energy.py; пока модуль не готов, поле пустое.
@@ -820,6 +873,10 @@ if __name__ == "__main__":
         db.DB_PATH = Path(os.environ["HEALTH_DB"])
         conn = db.connect()
         db.migrate(conn)
+        # Фикстуры и читающая их логика должны использовать один часовой пояс.
+        # Иначе «сейчас» сервера может оказаться будущим для профиля без timezone.
+        from health_core.config import set_tz
+        set_tz(load().get("schedule", {}).get("default_timezone"))
 
         try:
             def make_user(tg_id):
@@ -1004,5 +1061,6 @@ if __name__ == "__main__":
 
         finally:
             conn.close()
+            set_tz(None)
 
     print("Все проверки report.py прошли.")

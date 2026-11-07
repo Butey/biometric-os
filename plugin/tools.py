@@ -290,7 +290,12 @@ def _today_iso(conn: sqlite3.Connection | None = None, user_id: int | None = Non
     return config.local_now().date().isoformat()
 
 
-_TIME_HINT_RE = re.compile(r"\d{1,2}[:.]\d{2}|\b(?:в|к|с|около|после)\s+\d{1,2}\b|\d{1,2}\s+(?:январ|феврал|март|апрел|ма[яй]|июн|июл|август|сентябр|октябр|ноябр|декабр)|назад|вчера|позавчера|утр|вечер|ноч|днём|днем|полдень|полночь", re.IGNORECASE)
+_WEEKDAY_HINT_RE = re.compile(r"\b(?:понедельник\w*|вторник\w*|сред[ауые]|четверг\w*|пятниц\w*|суббот\w*|воскресень\w*)\b", re.IGNORECASE)
+_PAST_WEEKDAY_RE = re.compile(
+    r"\b(?:в|во)\s+(?:прошл\w*|прошедш\w*|минувш\w*)\s+(" + _WEEKDAY_HINT_RE.pattern + r")",
+    re.IGNORECASE,
+)
+_TIME_HINT_RE = re.compile(r"\d{1,2}[:.]\d{2}|\b(?:в|к|с|около|после)\s+\d{1,2}\b|\d{1,2}\s+(?:январ|феврал|март|апрел|ма[яй]|июн|июл|август|сентябр|октябр|ноябр|декабр)|назад|вчера|позавчера|утр|вечер|ноч|днём|днем|полдень|полночь|" + _WEEKDAY_HINT_RE.pattern, re.IGNORECASE)
 
 
 def _drop_unnamed_ts(raw: str | None) -> str | None:
@@ -1087,12 +1092,12 @@ def handle_log_water(params: dict) -> str:
 
     # Get day summary for water info — за дату записи (at), не за сегодня
     record_date = at[:10] if at else _today_iso()
-    d = day_summary(conn, user_id, record_date)
+    now = datetime.fromisoformat(_now_iso(conn, user_id))
+    d = day_summary(conn, user_id, record_date, as_of=now)
     water_ml = d.get("water_ml", 0)
     water_target_ml = d.get("water_target_ml", 0)
 
     # Темп воды (health_core.report.water_pace), только для записей сегодняшнего дня.
-    now = datetime.fromisoformat(_now_iso(conn, user_id))
     water_pace = (_water_pace(water_ml, water_target_ml, now)
                   if record_date == now.date().isoformat() else None)
 
@@ -2064,6 +2069,47 @@ def handle_log_med(params: dict) -> str:
     user_id = _get_user_id(params, conn)
 
     action = (params.get("action") or "add").lower()
+    if action not in {"add", "update", "delete", "list"}:
+        conn.close()
+        return json.dumps({"error": "action: add, update, delete или list"}, ensure_ascii=False)
+
+    # Исправление даты — та же физическая доза, а не удаление и новый приём:
+    # остаток и сетка расписания не должны изменяться второй раз.
+    if action == "update":
+        try:
+            med_id = int(params["med_id"])
+        except (KeyError, TypeError, ValueError):
+            conn.close()
+            return json.dumps({"error": "Для исправления даты нужен med_id из action=list"}, ensure_ascii=False)
+        row = conn.execute(
+            "SELECT id, substance, dose, at FROM med_log WHERE id=? AND user_id=?",
+            (med_id, user_id),
+        ).fetchone()
+        if row is None:
+            conn.close()
+            return json.dumps({"error": f"Записи #{med_id} нет"}, ensure_ascii=False)
+        if not params.get("at"):
+            conn.close()
+            return json.dumps({"error": "Для исправления даты нужен at — дата фактического приёма"}, ensure_ascii=False)
+        try:
+            # Явное исправление существующей записи не зависит от наличия
+            # временных слов в текущей реплике («да, исправь»).
+            at = _norm_event_ts(params["at"], conn, user_id)
+            duplicate = conn.execute(
+                "SELECT id FROM med_log WHERE user_id=? AND substance=? AND at=? AND id<>?",
+                (user_id, row["substance"], at, med_id),
+            ).fetchone()
+            if duplicate:
+                return json.dumps({"error": f"На это время уже есть запись #{duplicate['id']}"}, ensure_ascii=False)
+            conn.execute("UPDATE med_log SET at=? WHERE id=? AND user_id=?", (at, med_id, user_id))
+            conn.commit()
+            return json.dumps({
+                "med_id": med_id, "updated": True, "drug": row["substance"], "dose": row["dose"],
+                "previous_at": row["at"], "at": at,
+                "stock_changed": False, "schedule_changed": False,
+            }, ensure_ascii=False)
+        finally:
+            conn.close()
 
     # ── Просмотр записей препаратов ──
     if action == "list":
@@ -2126,7 +2172,31 @@ def handle_log_med(params: dict) -> str:
     unit = params.get("unit")
     site = params.get("site")
     notes = params.get("notes")
+    # Назван день приёма, а модель не передала его дату: не записываем
+    # автоматически сегодняшним числом. Возвращаем вопрос до любых изменений.
+    text = config.user_text() or ""
+    if not params.get("at") and re.search(
+        r"вчера|позавчера|назад|" + _WEEKDAY_HINT_RE.pattern, text, re.IGNORECASE
+    ):
+        conn.close()
+        return json.dumps({"error": "Указан другой день приёма: передай at с датой фактического укола/приёма, а не сообщения. Если часы неизвестны, передай только дату YYYY-MM-DD."}, ensure_ascii=False)
     at = _fix_event_ts(params.get("at"), conn, user_id)
+
+    # Явное «в прошлое воскресенье» проверяем относительно местного дня:
+    # даже корректный ISO сегодняшней даты здесь не является датой события.
+    past_weekdays = _PAST_WEEKDAY_RE.findall(text)
+    if len(past_weekdays) == 1:
+        weekday = next(i for i, stem in enumerate(
+            ("понедельник", "вторник", "сред", "четверг", "пятниц", "суббот", "воскресень")
+        ) if past_weekdays[0].casefold().startswith(stem))
+        today = config.user_now(conn, user_id).date()
+        expected_date = (today - timedelta(days=(today.weekday() - weekday) % 7 or 7)).isoformat()
+        if at[:10] != expected_date:
+            conn.close()
+            return json.dumps({
+                "error": "Дата at не соответствует названному прошедшему дню недели. Запись не сохранена; повтори с датой фактического приёма.",
+                "expected_date": expected_date,
+            }, ensure_ascii=False)
 
     # Normalize timestamp
     if "T" in at and at.count(":") == 1:
@@ -2183,7 +2253,7 @@ def handle_log_med(params: dict) -> str:
             if sched["every_days"]:
                 # Шагаем по сетке расписания, пока не окажемся после фактического приёма:
                 # поздняя доза не оставляет просроченный next_at, а день недели не уползает.
-                new_next = _advance_next(sched["next_at"] or at, sched["every_days"])
+                new_next = sched["next_at"] or _advance_next(at, sched["every_days"])
                 while new_next <= at:
                     new_next = _advance_next(new_next, sched["every_days"])
             conn.execute("UPDATE med_schedule SET stock_doses=?, next_at=?, updated_at=? WHERE id=?",
@@ -2207,6 +2277,7 @@ def handle_log_med(params: dict) -> str:
         "drug": drug,
         "dose": dose,
         "route": route,
+        "at": at,
         "alerts": alerts,
     }
     if dose_differs:
@@ -5393,9 +5464,16 @@ def handle_set_milestone(params: dict) -> str:
         "achieved_at": m["achieved_at"],
     }
 
-    # Если есть срок — сразу проверить достижимость, чтобы модель могла
-    # честно сказать человеку и предложить скорректировать.
+    # Если есть срок — сразу пересчитать сегодняшнюю цель и проверить
+    # достижимость, чтобы модель могла честно сказать человеку и предложить скорректировать.
     # Вердикту нужны замеры и лог еды — на свежем профиле их нет, и это не ошибка.
+    if metric == "weight_kg":
+        try:
+            today_str = _today_iso(conn, user_id)
+            if conn.execute("SELECT 1 FROM daily_targets WHERE user_id=? AND date=?", (user_id, today_str)).fetchone():
+                daily_target(conn, user_id, today_str)
+        except Exception:
+            pass
     if deadline:
         try:
             from health_core.energy import deadline_verdict
@@ -5824,7 +5902,7 @@ def _admin_export() -> str:
         user_id = _get_user_id({}, conn=conn)
         out_dir = os.environ.get("HEALTH_EXPORT_DIR", str(DB_PATH.parent / "export"))
         result = export_all(conn, user_id, out_dir)
-        return json.dumps({"text": f"Export complete: {result}"}, ensure_ascii=False)
+        return json.dumps({"text": "Файлы созданы на сервере. Для получения архива в Telegram вызовите export_data или /export.", "delivered": False, "files": len(result["files"]), "rows": result["rows"]}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
     finally:

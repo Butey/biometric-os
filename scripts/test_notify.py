@@ -4,7 +4,7 @@
     PYTHONIOENCODING=utf-8 python scripts/test_notify.py
 
 HEALTH_DB указывает на временный файл ДО импорта health_core.db — боевую
-~/.hermes/health.db не трогаем.
+<проект>/health.db не трогаем.
 """
 import io
 import os

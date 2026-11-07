@@ -14,14 +14,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")
 
-from health_core.config import load, user_now, user_today
+from health_core.config import load, user_now
 from health_core.db import connect, migrate, get_target_users
 from health_core.report import day_summary, water_pace
 
 
 def reminder(conn, user_id: int) -> str | None:
     now = user_now(conn, user_id)
-    d = day_summary(conn, user_id, user_today(conn, user_id))
+    d = day_summary(conn, user_id, now.date().isoformat(), as_of=now)
     pace = water_pace(d.get("water_ml", 0), d.get("water_target_ml"), now)
     portion = load()["policy"].get("water_reminder_portion_ml", 250)
     if not pace or pace["behind_ml"] < portion:
