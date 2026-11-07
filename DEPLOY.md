@@ -62,6 +62,50 @@ sudo systemctl enable --now health-dispatch.timer health-backup.timer
 Панель по умолчанию слушает 127.0.0.1:8765; доступ — SSH-туннель или TLS-прокси
 с настройкой `ADMIN_BEHIND_TLS=1`. Подробности — `admin/README-proxy.md`.
 
+### Управление сервисами на сервере
+
+Команды выполняются по SSH на сервере из любого каталога:
+
+```bash
+# Остановить / запустить / перезапустить бота
+sudo systemctl stop health-agent.service
+sudo systemctl start health-agent.service
+sudo systemctl restart health-agent.service
+
+# Проверить состояние и смотреть журнал (выход — Ctrl+C)
+sudo systemctl status health-agent.service
+sudo journalctl -u health-agent.service -f
+
+# Перезапустить бота и административную панель после обновления кода или .env
+sudo systemctl restart health-agent.service health-admin.service
+```
+
+Админ-панель управляется теми же командами с именем `health-admin.service`.
+Перезапуск бота прерывает обрабатываемые ответы. После изменения самих
+unit-файлов сначала скопируйте их в `/etc/systemd/system/` и выполните
+`sudo systemctl daemon-reload`, затем перезапустите нужные службы.
+
+Перед обслуживанием или переносом базы остановите бота, панель и таймеры:
+
+```bash
+sudo systemctl stop health-agent.service health-admin.service \
+  health-dispatch.timer health-backup.timer
+
+# Убедиться, что запущенные ранее фоновые задания завершились
+sudo systemctl status health-dispatch.service health-backup.service
+```
+
+Остановка таймера не прерывает уже запущенное задание. Если фоновые службы
+ещё активны, дождитесь их завершения перед переносом базы. Также приостановите
+отдельные cron-задания, если они настроены вне systemd.
+
+После обслуживания:
+
+```bash
+sudo systemctl start health-agent.service health-admin.service \
+  health-dispatch.timer health-backup.timer
+```
+
 ## Проверки и резервные копии
 
 ```bash
