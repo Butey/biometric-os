@@ -8,7 +8,7 @@
 import logging
 import sqlite3
 import statistics
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from health_core.config import load, local_now, user_now, user_today
 from health_core.db import connect, migrate
@@ -314,41 +314,28 @@ def check_whr(conn: sqlite3.Connection, user_id: int):
 # ---------------------------------------------------------------- RATE_HIGH
 
 def check_rate_high(conn: sqlite3.Connection, user_id: int):
-    """Темп снижения веса — медианы по 3 первым и 3 последним взвешиваниям
-    окна, а не голые эндпоинты: один шумный день на весах не должен решать
-    сам по себе, сработал ли гардрейл. Покрытие меньше 10 дней между первым и
-    последним замером окна — темп неизвестен, гардрейл молчит."""
+    """Темп снижения веса - медиана попарных наклонов (Theil-Sen) по утренним
+    дневным медианам окна: один шумный день на весах не решает сам по себе.
+    Прежние медианы 3 первых и 3 последних СТРОК брали три взвешивания одного
+    утра за три точки: водный пик 31.10 (113.7/113.8/113.6) дал 2.10 кг/нед при
+    наклоне окна 1.4. Покрытие меньше 10 дней между первым и последним днём -
+    темп неизвестен, гард молчит."""
+    from health_core.energy import _morning_weights
+
     cfg = _cfg()
-    window_days = cfg["weight_rate_window_days"]
-    min_points = cfg["weight_rate_min_points"]
-    since = (_now(conn, user_id) - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
-    rows = conn.execute(
-        "SELECT measured_at, weight_kg FROM body_metrics WHERE user_id=? AND measured_at>=? ORDER BY measured_at",
-        (user_id, since),
-    ).fetchall()
-    if len(rows) < min_points:
+    today = _now(conn, user_id).date()
+    start = today - timedelta(days=cfg["weight_rate_window_days"])
+    pts = _morning_weights(conn, user_id, start.isoformat(), today.isoformat())
+    if len(pts) < cfg["weight_rate_min_points"] or pts[-1][0] - pts[0][0] < 10:
         return None
-    # .date()-разница, не полных datetime: timedelta.days округляет вниз (см.
-    # _gap_days выше) — на границе окна округление молчало бы про RATE_HIGH.
-    days_covered = (_parse(rows[-1]["measured_at"]).date() - _parse(rows[0]["measured_at"]).date()).days
-    if days_covered < 10:
-        return None  # темп неизвестен на коротком покрытии
-
-    k = min(3, len(rows))
-    first_med = statistics.median(r["weight_kg"] for r in rows[:k])
-    last_med = statistics.median(r["weight_kg"] for r in rows[-k:])
-    weight_delta = last_med - first_med
-    if weight_delta >= 0:
+    kg_per_week = -7 * statistics.median(
+        (w2 - w1) / (d2 - d1) for i, (d1, w1) in enumerate(pts) for d2, w2 in pts[i + 1:]
+    )
+    if kg_per_week <= 0:
         return None  # only fire on loss, not gain
-
-    # Медианы лежат в строках k//2 и -1-k//2, а не на краях окна: темп делим на
-    # расстояние между ними, иначе он занижен.
-    span = (_parse(rows[-1 - k // 2]["measured_at"]).date() - _parse(rows[k // 2]["measured_at"]).date()).days
-    if span < 5:  # при <6 точках окна пересекаются, медианы почти рядом - темп шумный
-        return None
-    kg_per_week = abs(weight_delta) * 7 / span
-    pct_per_week = (abs(weight_delta) / first_med) * 100 * 7 / span
-    threshold = min(cfg["weight_rate_kg_week_max"], first_med * cfg["weight_rate_pct_week_max"] / 100)
+    weight = statistics.median(w for _, w in pts)
+    pct_per_week = kg_per_week / weight * 100
+    threshold = min(cfg["weight_rate_kg_week_max"], weight * cfg["weight_rate_pct_week_max"] / 100)
     if kg_per_week > threshold:
         return _alert(
             "RATE_HIGH", "warning",
@@ -611,59 +598,61 @@ def check_measure_soon(conn: sqlite3.Connection, user_id: int):
 # ---------------------------------------------------------------- BINGE_RISK
 
 def check_binge_risk(conn: sqlite3.Connection, user_id: int):
-    """Триада риска пищевого срыва: накопленный дефицит калорий за окно,
+    """Триада риска пищевого срыва: накопленный недобор к плану питания за окно,
     короткий сон прошлой ночью, мало белка на завтрак (или завтрак пропущен).
 
     Каждый фактор — True/False/None(неизвестно). Неизвестный фактор никогда не
     считается сработавшим — гардрейл молчит на тонких данных, а не гадает."""
-    from health_core import energy
-
     cfg = _cfg()
     now = _now(conn, user_id)
     today = now.date()
     yesterday = today - timedelta(days=1)
     window_days = cfg["binge_window_days"]
 
-    # --- фактор 1: накопленный дефицit за window_days дней, заканчивающихся вчера
+    # --- фактор 1: недобор К ПЛАНУ за window_days дней, заканчивающихся вчера.
+    # Считаем от цели дня (daily_targets), а не от расхода: дефицит к расходу
+    # заложен в сам план (740-950 ккал/сут), и порог к расходу был выполнен в
+    # любой плановый день - гард вырождался в «спал меньше 6.5 ч».
     deficit_fired = None
     deficit_msg = None
-    tdee = energy.adaptive_tdee(conn, user_id, for_date=yesterday.isoformat())
-    if tdee is not None:
-        window_start = yesterday - timedelta(days=window_days - 1)
-        window_start_s, window_end_s = window_start.isoformat(), yesterday.isoformat()
-        # Дни рефида/болезни исключаются целиком — как в energy._adaptive_tdee_core
-        # и check_weight_regain: интейк там сознательно поднят до maintenance и не
-        # отражает обычное питание на дефиците, а его включение размывало бы
-        # deficit_sum и молча гасило гард.
-        refeed_sick_dates = {r["date"] for r in conn.execute(
-            "SELECT date FROM refeed_days WHERE user_id=? AND date BETWEEN ? AND ? "
-            "UNION SELECT date FROM sick_days WHERE user_id=? AND date BETWEEN ? AND ?",
-            (user_id, window_start_s, window_end_s, user_id, window_start_s, window_end_s),
-        ).fetchall()}
-        logged_days = 0
-        counted_days = 0
-        deficit_sum = 0.0
-        for i in range(window_days):
-            d = (window_start + timedelta(days=i)).isoformat()
-            if d in refeed_sick_dates:
-                continue
-            counted_days += 1
-            row = conn.execute(
-                "SELECT COUNT(*) n, COALESCE(SUM(fi.kcal),0) kcal FROM food_log fl "
-                "JOIN food_items fi ON fi.food_log_id=fl.id "
-                "WHERE fl.user_id=? AND date(fl.eaten_at)=?", (user_id, d),
-            ).fetchone()
-            if row["n"] > 0:
-                logged_days += 1
-                deficit_sum += tdee - row["kcal"]
-        if logged_days >= counted_days - 1:
-            threshold_deficit = cfg["binge_deficit_kcal"]
-            deficit_fired = deficit_sum > threshold_deficit
-            if deficit_fired:
-                deficit_msg = (
-                    f"дефицит {deficit_sum:.0f} ккал за {window_days} дн "
-                    f"(порог {threshold_deficit:.0f})"
-                )
+    window_start = yesterday - timedelta(days=window_days - 1)
+    window_start_s, window_end_s = window_start.isoformat(), yesterday.isoformat()
+    # Дни рефида/болезни исключаются целиком — как в energy._adaptive_tdee_core
+    # и check_weight_regain.
+    refeed_sick_dates = {r["date"] for r in conn.execute(
+        "SELECT date FROM refeed_days WHERE user_id=? AND date BETWEEN ? AND ? "
+        "UNION SELECT date FROM sick_days WHERE user_id=? AND date BETWEEN ? AND ?",
+        (user_id, window_start_s, window_end_s, user_id, window_start_s, window_end_s),
+    ).fetchall()}
+    targets = {r["date"]: r["kcal_target"] for r in conn.execute(
+        "SELECT date, kcal_target FROM daily_targets WHERE user_id=? AND date BETWEEN ? AND ? "
+        "AND kcal_target IS NOT NULL",
+        (user_id, window_start_s, window_end_s),
+    )}
+    logged_days = 0
+    counted_days = 0
+    deficit_sum = 0.0
+    for i in range(window_days):
+        d = (window_start + timedelta(days=i)).isoformat()
+        if d in refeed_sick_dates:
+            continue
+        counted_days += 1
+        row = conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(fi.kcal),0) kcal FROM food_log fl "
+            "JOIN food_items fi ON fi.food_log_id=fl.id "
+            "WHERE fl.user_id=? AND date(fl.eaten_at)=?", (user_id, d),
+        ).fetchone()
+        if row["n"] > 0 and d in targets:
+            logged_days += 1
+            deficit_sum += targets[d] - row["kcal"]
+    if logged_days and logged_days >= counted_days - 1:
+        threshold_deficit = cfg["binge_deficit_kcal"]
+        deficit_fired = deficit_sum > threshold_deficit
+        if deficit_fired:
+            deficit_msg = (
+                f"дефицит сверх плана {deficit_sum:.0f} ккал за {window_days} дн "
+                f"(порог {threshold_deficit:.0f})"
+            )
 
     # --- фактор 2: сон прошлой ночью (night_date = сегодняшнее утреннее пробуждение)
     sleep_fired = None
@@ -918,30 +907,48 @@ def check_all(conn: sqlite3.Connection, user_id: int) -> list[dict]:
     return out
 
 
-def record(conn: sqlite3.Connection, user_id: int, alerts: list[dict]) -> None:
+def record(conn: sqlite3.Connection, user_id: int, alerts: list[dict]) -> list[dict]:
+    """Пишет в alerts только новые срабатывания и возвращает их же: хендлеры
+    отдают модели этот список, а не весь check_all, иначе один и тот же гард
+    повторяется на каждой записи еды/воды/веса (WHR_HIGH - 78 раз за 80 дней).
+
+    Правило молчит guards.alert_repeat_days[code] дней после своей последней
+    записи (по умолчанию 1 - раз в день). Исключение - critical с новым текстом
+    у правил с суточным повтором: эскалация (BINGE_RISK 2 -> 3 фактора) проходит.
+    Живое состояние гардов по-прежнему видно в status_bar и пульте (check_all)."""
     if not alerts:
-        return
+        return []
+    repeat = _cfg().get("alert_repeat_days") or {}
     now = _now(conn, user_id)
-    today = now.strftime("%Y-%m-%d")
+    today = now.date()
     ts = now.strftime("%Y-%m-%d %H:%M:%S")
-    # Один и тот же гард срабатывает на КАЖДОМ логировании за день (каждый вызов
-    # check_all+record из хендлеров). Пропускаем только то же правило с тем же
-    # текстом, иначе таблица распухает; эскалация или новый текст пишется заново.
-    already = {
-        (r[0], r[1])
-        for r in conn.execute(
-            "SELECT rule, message FROM alerts WHERE user_id=? AND date(created_at)=?",
-            (user_id, today),
+    since = (today - timedelta(days=max([1, *repeat.values()]))).isoformat()
+    last: dict[str, str] = {}
+    seen_today: set[tuple[str, str]] = set()
+    for r in conn.execute(
+        "SELECT rule, message, date(created_at) d FROM alerts WHERE user_id=? AND date(created_at)>? ORDER BY created_at",
+        (user_id, since),
+    ):
+        last[r["rule"]] = r["d"]
+        if r["d"] == today.isoformat():
+            seen_today.add((r["rule"], r["message"]))
+    fresh = []
+    for a in alerts:
+        code, days = a["code"], int(repeat.get(a["code"], 1))
+        quiet = code in last and (today - date.fromisoformat(last[code])).days < days
+        escalation = days == 1 and a.get("severity") == "critical" and (code, a["message"]) not in seen_today
+        if quiet and not escalation:
+            continue
+        fresh.append(a)
+        last[code] = today.isoformat()
+        seen_today.add((code, a["message"]))
+    if fresh:
+        conn.executemany(
+            "INSERT INTO alerts(user_id, created_at, rule, message) VALUES (?, ?, ?, ?)",
+            [(user_id, ts, a["code"], a["message"]) for a in fresh],
         )
-    }
-    fresh = [(user_id, ts, a["code"], a["message"]) for a in alerts if (a["code"], a["message"]) not in already]
-    if not fresh:
-        return
-    conn.executemany(
-        "INSERT INTO alerts(user_id, created_at, rule, message) VALUES (?, ?, ?, ?)",
-        fresh,
-    )
-    conn.commit()
+        conn.commit()
+    return fresh
 
 
 # ---------------------------------------------------------------- описания и обоснования
@@ -1104,7 +1111,7 @@ GUARD_DEFINITIONS = {
         "name": "Риск пищевого срыва (триада)",
         "category": "Питание и калории",
         "default_severity": "warning",
-        "description": "Триада факторов риска срыва: накопленный дефицит калорий за окно, короткий сон прошлой ночью, мало белка на завтрак (или завтрак пропущен). Срабатывает при совпадении не менее двух факторов из трёх.",
+        "description": "Триада факторов риска срыва: накопленный недобор калорий к плану питания за окно, короткий сон прошлой ночью, мало белка на завтрак (или завтрак пропущен). Срабатывает при совпадении не менее двух факторов из трёх.",
         "rationale": "Ограничение сна повышает грелин и снижает лептин, усиливая голод и тягу к калорийной еде (Spiegel et al., 2004). Большой накопленный дефицит энергии сам по себе провоцирует компенсаторное переедание. Более высокобелковый завтрак повышает насыщение и снижает потребление калорий в течение дня (Leidy et al., 2013). По отдельности факторы шумные, но их совпадение — устойчивый предиктор срыва.",
         "action": "Полноценный белковый приём пищи в ближайшее время, не углублять дефицит сегодня.",
         "keys": ["binge_window_days", "binge_deficit_kcal", "binge_sleep_min", "binge_breakfast_protein_g", "binge_min_factors"],
@@ -1587,7 +1594,7 @@ if __name__ == "__main__":
             whr_fired11 = [a for a in alerts11 if a["code"] == "WHR_HIGH"]
             assert not whr_fired11, f"WHR_HIGH должен молчать при отсутствии таза, получили {alerts11}"
 
-            # RATE_HIGH tests (медианы 3 первых/последних, покрытие >= 10 дней)
+            # RATE_HIGH tests (Theil-Sen по дневным медианам, покрытие >= 10 дней)
             u_rate_short = make_user(160, height_cm=185, created_days_ago=30)
             # 4 кг за 5 дней -> темп огромный, но покрытие 5 дней < 10 -> темп неизвестен, молчит
             add_metric(u_rate_short, 5, 125.0, 78.0)
@@ -1601,7 +1608,7 @@ if __name__ == "__main__":
 
             u_rate_outlier = make_user(161, height_cm=185, created_days_ago=30)
             # Мягкий реальный темп (~1 кг/нед), но один шумный выброс в последней точке
-            # (116.0 вместо ~119) — median(последних 3) гасит его, наивная разница
+            # (116.0 вместо ~119) — медиана попарных наклонов гасит его, наивная разница
             # эндпоинтов дала бы 5 кг/13 дн = 2.7 кг/нед и ложно сработала бы
             add_metric(u_rate_outlier, 13, 121.0, 78.0)
             add_metric(u_rate_outlier, 10, 120.8, 78.0)
@@ -1617,8 +1624,7 @@ if __name__ == "__main__":
             )
 
             u_rate_real = make_user(162, height_cm=185, created_days_ago=30)
-            # Реальный темп far above threshold: медиана первых 3 (127.0) к медиане
-            # последних 3 (119.5) за 13 дней -> ~4 кг/нед, > min(1.5 кг, 1.5%)
+            # Реальный темп far above threshold: 13 кг за 13 дней -> ~7 кг/нед, > min(1.5 кг, 1.5%)
             add_metric(u_rate_real, 13, 130.0, 78.0)
             add_metric(u_rate_real, 10, 127.0, 78.0)
             add_metric(u_rate_real, 8, 125.0, 78.0)
@@ -1645,8 +1651,7 @@ if __name__ == "__main__":
             rate_fired_gain = [a for a in alerts_rate_gain if a["code"] == "RATE_HIGH"]
             assert not rate_fired_gain, f"RATE_HIGH должен молчать на приросте, получили {alerts_rate_gain}"
 
-            # Темп делится на расстояние между строками с медианами (день 9 -> день 4 = 5 дней),
-            # а не на покрытие окна (13 дней): 1.8 кг за 5 дней = 2.5 кг/нед, старая формула давала 0.97
+            # Неравномерные интервалы: наклон считается по датам, а не по номеру точки -> ~2.5 кг/нед
             u_rate_span = make_user(164, height_cm=185, created_days_ago=30)
             add_metric(u_rate_span, 13, 100.0, 78.0)
             add_metric(u_rate_span, 9, 99.0, 78.0)
@@ -1654,7 +1659,18 @@ if __name__ == "__main__":
             add_metric(u_rate_span, 0, 95.36, 78.0)
             conn.commit()
             rate_fired_span = [a for a in check_all(conn, u_rate_span) if a["code"] == "RATE_HIGH"]
-            assert rate_fired_span and rate_fired_span[0]["value"] > 2.0, f"RATE_HIGH по медианам за 5 дней: {rate_fired_span}"
+            assert rate_fired_span and rate_fired_span[0]["value"] > 2.0, f"RATE_HIGH на неравномерных интервалах: {rate_fired_span}"
+
+            # Три взвешивания одного утра на водном пике в начале окна - одна точка, а не три:
+            # тренд 0.7 кг/нед, прежние медианы по строкам давали (103.0-99.0)/12*7 = 2.3 кг/нед
+            u_rate_burst = make_user(169, height_cm=185, created_days_ago=30)
+            for hour in (7, 8, 9):
+                add_metric(u_rate_burst, 13, 103.0, 78.0, hour=hour)
+            for da, w in ((12, 100.2), (10, 100.0), (8, 99.8), (6, 99.6), (4, 99.4), (2, 99.2), (0, 99.0)):
+                add_metric(u_rate_burst, da, w, 78.0)
+            conn.commit()
+            rate_fired_burst = [a for a in check_all(conn, u_rate_burst) if a["code"] == "RATE_HIGH"]
+            assert not rate_fired_burst, f"RATE_HIGH не должен срабатывать на водном пике одного утра: {rate_fired_burst}"
 
             # Вес растёт или почти не меняется при падении FFM: доли потери нет, LBM_* молчат
             for tg, wts in ((164 + 1, (100.0, 100.2, 100.5, 100.8)), (164 + 2, (100.0, 99.9, 99.8, 99.7))):
@@ -1664,6 +1680,23 @@ if __name__ == "__main__":
                 conn.commit()
                 lbm_flat = [a for a in check_all(conn, u_flat) if a["code"] in ("LBM_RATIO", "LBM_DRIFT")]
                 assert not lbm_flat, f"LBM_* не должны срабатывать без потери веса (вес {wts}): {lbm_flat}"
+
+            # record(): повтор в тот же день глушится, медленное правило молчит неделю,
+            # critical с новым текстом (эскалация) проходит
+            u_rec = make_user(168, height_cm=185, created_days_ago=30)
+            whr_a = _alert("WHR_HIGH", "warning", "WHR 1.00", 1.0, 0.9)
+            binge_w = _alert("BINGE_RISK", "warning", "2 из 3", 2, 2)
+            binge_c = _alert("BINGE_RISK", "critical", "3 из 3", 3, 2)
+            assert [a["code"] for a in record(conn, u_rec, [whr_a, binge_w])] == ["WHR_HIGH", "BINGE_RISK"]
+            assert record(conn, u_rec, [whr_a, binge_w]) == [], "повтор в тот же день должен молчать"
+            assert record(conn, u_rec, [whr_a, binge_c]) == [binge_c], "эскалация до critical должна пройти"
+            conn.execute("UPDATE alerts SET created_at=datetime(created_at, '-3 days') WHERE user_id=?", (u_rec,))
+            conn.commit()
+            assert record(conn, u_rec, [whr_a, binge_w]) == [binge_w], "WHR_HIGH молчит 7 дней, BINGE_RISK - сутки"
+            conn.execute("UPDATE alerts SET created_at=datetime(created_at, '-7 days') WHERE user_id=? AND rule='WHR_HIGH'", (u_rec,))
+            conn.commit()
+            assert record(conn, u_rec, [whr_a]) == [whr_a], "через неделю WHR_HIGH напоминает снова"
+            print("OK: record() отдаёт только новые алерты: суточный и недельный повтор, эскалация проходит")
 
             print("OK: WHR_HIGH срабатывает; RATE_HIGH молчит на коротком покрытии и на одиночном "
                   "выбросе, срабатывает на реальном темпе без упоминания сухой массы, молчит на приросте")
@@ -1939,8 +1972,6 @@ if __name__ == "__main__":
             print("Все тесты медианы для LBM_RATIO прошли.")
 
             # ---------------------------------------------------------------- BINGE_RISK tests
-            import health_core.energy as energy_mod
-
             def _add_binge_food(uid, days_ago, kcal, protein_g=10.0, meal_slot=None, hour=13):
                 d = (_now().date() - timedelta(days=days_ago)).isoformat()
                 ts = f"{d} {hour:02d}:00:00"
@@ -1957,15 +1988,19 @@ if __name__ == "__main__":
                     (uid, night_date, duration_min),
                 )
 
+            def _add_binge_targets(uid, kcal=2500.0):
+                for days_ago in range(1, 6):
+                    d = (_now().date() - timedelta(days=days_ago)).isoformat()
+                    conn.execute("INSERT INTO daily_targets(user_id, date, kcal_target) VALUES (?,?,?)", (uid, d, kcal))
+
             _now_real = _now
-            orig_adaptive_tdee = energy_mod.adaptive_tdee
             today_iso = _now().date().isoformat()
 
             # Сценарий A: все три фактора -> critical
             u40 = make_user(140, height_cm=185, created_days_ago=30)
-            energy_mod.adaptive_tdee = lambda conn, user_id, window_days=14, for_date=None: 2500.0
+            _add_binge_targets(u40)
             for days_ago in range(1, 5):  # 4 из 5 дней окна залогированы (>= window-1)
-                _add_binge_food(u40, days_ago, 700)  # дефицит (2500-700)*4 = 7200 > 3500
+                _add_binge_food(u40, days_ago, 700)  # недобор к плану (2500-700)*4 = 7200 > порога
             _add_binge_sleep(u40, today_iso, 300)  # < 390 мин
             _add_binge_food(u40, 0, 300, protein_g=10.0, meal_slot="breakfast")  # < 20 г
             conn.commit()
@@ -1976,6 +2011,7 @@ if __name__ == "__main__":
 
             # Сценарий B: ровно 2 фактора (завтрак в норме) -> warning
             u41 = make_user(141, height_cm=185, created_days_ago=30)
+            _add_binge_targets(u41)
             for days_ago in range(1, 5):
                 _add_binge_food(u41, days_ago, 700)
             _add_binge_sleep(u41, today_iso, 300)
@@ -1988,14 +2024,13 @@ if __name__ == "__main__":
 
             # Сценарий C: только 1 фактор (сон) -> None
             u42 = make_user(142, height_cm=185, created_days_ago=30)
-            energy_mod.adaptive_tdee = lambda conn, user_id, window_days=14, for_date=None: None
             _add_binge_sleep(u42, today_iso, 300)  # сон сработал в одиночку, еды сегодня нет
             conn.commit()
             alerts42 = check_all(conn, u42)
             binge42 = [a for a in alerts42 if a["code"] == "BINGE_RISK"]
             assert not binge42, f"BINGE_RISK не должен сработать при 1 факторе, получили {alerts42}"
 
-            # Сценарий D: нет сна, tdee=None, нет еды сегодня -> None (все три неизвестны)
+            # Сценарий D: нет сна, целей нет, нет еды сегодня -> None (все три неизвестны)
             u43 = make_user(143, height_cm=185, created_days_ago=30)
             conn.commit()
             alerts43 = check_all(conn, u43)
@@ -2003,7 +2038,7 @@ if __name__ == "__main__":
             assert not binge43, f"BINGE_RISK должен молчать без данных (все факторы неизвестны), получили {alerts43}"
 
             # Сценарий E: завтрак пропущен после 12:00 при активном логировании + короткий
-            # сон -> 2 фактора (дефицит неизвестен, tdee=None), warning
+            # сон -> 2 фактора (недобор неизвестен, целей нет), warning
             u44 = make_user(144, height_cm=185, created_days_ago=30)
             _now = lambda conn=None, user_id=None: _now_real().replace(hour=13, minute=0, second=0, microsecond=0)
             _add_binge_food(u44, 0, 500, protein_g=15.0, meal_slot="lunch", hour=13)  # еда сегодня, не завтрак
@@ -2021,7 +2056,7 @@ if __name__ == "__main__":
             # (8000 ккал) разбавил бы реальный дефицит (4×1800=7200) ниже порога
             # (7200-5500=1700 < 3500) и молча погасил бы фактор 1.
             u45 = make_user(145, height_cm=185, created_days_ago=30)
-            energy_mod.adaptive_tdee = lambda conn, user_id, window_days=14, for_date=None: 2500.0
+            _add_binge_targets(u45)
             for days_ago in range(1, 5):
                 _add_binge_food(u45, days_ago, 700)  # 4 дня реального дефицита, (2500-700)*4=7200
             refeed_date = (_now().date() - timedelta(days=5)).isoformat()
@@ -2034,7 +2069,17 @@ if __name__ == "__main__":
             assert binge45, f"BINGE_RISK должен сработать: рефид-день исключён из окна дефицита, получили {alerts45}"
             assert "дефицит" in binge45[0]["message"], binge45[0]
 
-            energy_mod.adaptive_tdee = orig_adaptive_tdee
+            # Сценарий G: питание по плану (цель 1800, съедено 1750) + короткий сон -> молчит:
+            # плановый дефицит к расходу больше не считается фактором срыва
+            u46 = make_user(146, height_cm=185, created_days_ago=30)
+            _add_binge_targets(u46, 1800.0)
+            for days_ago in range(1, 6):
+                _add_binge_food(u46, days_ago, 1750)
+            _add_binge_sleep(u46, today_iso, 300)
+            conn.commit()
+            binge46 = [a for a in check_all(conn, u46) if a["code"] == "BINGE_RISK"]
+            assert not binge46, f"BINGE_RISK должен молчать при питании по плану: {binge46}"
+
             print("OK: BINGE_RISK — 3 фактора critical, 2 фактора warning, 1 фактор молчит, "
                   "без данных молчит, пропуск завтрака после 12:00 засчитан как фактор")
 

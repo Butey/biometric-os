@@ -22,3 +22,4 @@ test_output.txt
 /backups/
 /export/
 history_archive/
+*.tar.gz

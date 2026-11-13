@@ -759,8 +759,7 @@ def handle_log_food(params: dict) -> str:
     pantry_done, pantry_skipped = _pantry_deduct(conn, user_id, items, item_ids)
 
     # Check guards and record alerts
-    alerts = check_all(conn, user_id)
-    record(conn, user_id, alerts)
+    alerts = record(conn, user_id, check_all(conn, user_id))
 
     # Return status bar with alerts
     bar = status_bar(conn, user_id)
@@ -1093,8 +1092,7 @@ def handle_log_water(params: dict) -> str:
     conn.commit()
 
     # Check guards and record alerts
-    alerts = check_all(conn, user_id)
-    record(conn, user_id, alerts)
+    alerts = record(conn, user_id, check_all(conn, user_id))
 
     # Get day summary for water info — за дату записи (at), не за сегодня
     record_date = at[:10] if at else _today_iso()
@@ -1390,8 +1388,7 @@ def handle_log_glucose(params: dict) -> str:
     conn.commit()
 
     # Check guards and record alerts
-    alerts = check_all(conn, user_id)
-    record(conn, user_id, alerts)
+    alerts = record(conn, user_id, check_all(conn, user_id))
 
     # Тренд: против ближайшего предыдущего по времени замера, а не по порядку вставки
     prev = conn.execute(
@@ -1489,8 +1486,7 @@ def handle_log_bp(params: dict) -> str:
         (user_id, at, sys_v, dia_v, pulse, params.get("context")),
     )
     conn.commit()
-    alerts = check_all(conn, user_id)
-    record(conn, user_id, alerts)
+    alerts = record(conn, user_id, check_all(conn, user_id))
     conn.close()
     return json.dumps({"bp_id": cur.lastrowid, "systolic": sys_v, "diastolic": dia_v, "pulse": pulse,
                        "category": bp.category(sys_v, dia_v), "alerts": alerts}, ensure_ascii=False)
@@ -1924,8 +1920,7 @@ def handle_log_weight(params: dict) -> str:
     conn.commit()
 
     # Check guards and record alerts
-    alerts = check_all(conn, user_id)
-    record(conn, user_id, alerts)
+    alerts = record(conn, user_id, check_all(conn, user_id))
 
     delta = None
     if prev:
@@ -2060,8 +2055,7 @@ def handle_log_anthropometry(params: dict) -> str:
     conn.commit()
 
     # Check guards and record alerts
-    alerts = check_all(conn, user_id)
-    record(conn, user_id, alerts)
+    alerts = record(conn, user_id, check_all(conn, user_id))
     achieved = mark_achieved_milestones(conn, user_id)
 
     delta = None
@@ -2299,8 +2293,7 @@ def handle_log_med(params: dict) -> str:
             dose_differs = True
 
     # Check guards and record alerts
-    alerts = check_all(conn, user_id)
-    record(conn, user_id, alerts)
+    alerts = record(conn, user_id, check_all(conn, user_id))
 
     conn.close()
 
@@ -2424,8 +2417,7 @@ def handle_log_workout(params: dict) -> str:
         except Exception:
             pass
 
-    alerts = check_all(conn, user_id)
-    record(conn, user_id, alerts)
+    alerts = record(conn, user_id, check_all(conn, user_id))
     conn.close()
 
     result = {
@@ -2535,8 +2527,7 @@ def handle_import_scale_export(params: dict) -> str:
             shutil.rmtree(pulled_dir, ignore_errors=True)
 
     # Check guards and record alerts
-    alerts = check_all(conn, user_id)
-    record(conn, user_id, alerts)
+    alerts = record(conn, user_id, check_all(conn, user_id))
 
     # Импорт весов может закрыть веху так же, как log_weight
     achieved = mark_achieved_milestones(conn, user_id)
@@ -5047,8 +5038,11 @@ def handle_explain_target(params: dict) -> str:
     # Честный вердикт срока (CONTEXT.md «Недостижимый срок») — computed_from
     # несёт только тег "deadline_unreachable" (план ниже пола), не сам вердикт
     # о недостижимости, который требует ещё и прогноза по факту.
-    from health_core.energy import deadline_verdict, daily_expenditure
+    from health_core.energy import deadline_verdict, daily_expenditure, _min_deficit
     explanation["deadline_verdict"] = deadline_verdict(conn, user_id, date_str)
+    # Тег "min_deficit" в computed_from: дефицит взят по нижней границе темпа
+    # (policy.min_deficit_pct_week), а не от срока вехи.
+    explanation["min_deficit_kcal"] = round(_min_deficit(conn, user_id))
 
     # Расход дня (ADR 0004): части блендера и их доли — модель объясняет, из
     # чего собралась цель, а не только видит итоговый тег "blend:...".

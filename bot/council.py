@@ -196,7 +196,11 @@ async def execute(conn: sqlite3.Connection, user_id: int, run_id: int, reason: s
     async with aiohttp.ClientSession() as session:
         analyst_texts: list[str] = []
         analyst_failures: list[str] = []
-        for model in cfg["analysts"]:
+        # Запасные аналитики зовутся, только пока основной состав не набран: оба
+        # основных на одной квоте Google, и её исчерпание срывало консилиум целиком.
+        for model in cfg["analysts"] + cfg.get("analyst_fallbacks", []):
+            if len(analyst_texts) >= len(cfg["analysts"]):
+                break
             provider = _provider(model)
             text = await _call_one(session, _ANALYST_SYSTEM, pack_text, provider,
                                    timeout_s, retry_delay_s, max_retries)
@@ -284,6 +288,7 @@ if __name__ == "__main__":
     async def main() -> None:
         with patch(__name__ + "._retry_wait", _fast_wait):
             cfg = _cfg()
+            fallbacks = cfg.pop("analyst_fallbacks", [])  # сценарии 1-4 — про основной состав
             assert cfg["analysts"] == ["gemini-3.8-flash", "gemini-3.7-flash"], cfg
             assert cfg["judge"] == "gemini-3.6-flash" and cfg["judge_fallback"] == "gemini-3.5-flash-lite" and cfg["max_retries"] == 1, cfg
 
@@ -355,6 +360,24 @@ if __name__ == "__main__":
             assert result4["status"] == "done" and result4["complete"] == 1, result4
             assert result4["text"] == "итог от fallback-судьи", result4
             print("OK: 4) судья недоступен -> judge_fallback подхватывает")
+
+            # --- 4б) оба основных аналитика лежат -> запасные набирают состав ---
+            os.environ["TKBK_API_KEY"] = "test"
+            cfg["analyst_fallbacks"] = fallbacks
+            assert len(fallbacks) >= 2 and all(_provider(m) for m in fallbacks), fallbacks
+            queue4b = [Exception("квота")] * 4 + [_msg("запасной 1"), _msg("запасной 2"), _msg("итог по запасным")]
+
+            async def _post_fallback_analysts(session, url, headers, payload, timeout_s=None):
+                item = queue4b.pop(0)
+                if isinstance(item, Exception):
+                    raise item
+                return 200, {"choices": [{"message": item}]}
+
+            with patch("bot.llm._post", _post_fallback_analysts):
+                result4b = await run(conn, uid, "manual")
+            assert result4b["status"] == "done" and result4b["complete"] == 1, result4b
+            assert result4b["text"] == "итог по запасным" and not queue4b, (result4b, queue4b)
+            print("OK: 4б) основные аналитики недоступны -> запасные набирают состав")
 
         # --- 5) лок: второй request раньше 6ч по той же причине -> отказ ---
         try:

@@ -418,7 +418,7 @@ def logged_streak(conn: sqlite3.Connection, user_id: int, end: date) -> tuple[in
 
 
 def adaptive_tdee(
-    conn: sqlite3.Connection, user_id: int, window_days: int = 14, for_date: str | None = None
+    conn: sqlite3.Connection, user_id: int, window_days: int | None = None, for_date: str | None = None
 ) -> float | None:
     """TDEE_факт = средний_intake_Nд - наклон_веса_кг_в_день · 7700 (линейная регрессия по утренним весам окна).
 
@@ -431,6 +431,9 @@ def adaptive_tdee(
     streak, anchor = logged_streak(conn, user_id, end)
     if streak < MIN_LOG_STREAK_DAYS:
         return None
+    # То же окно, что у блендера (см. daily_expenditure): 14 дней шумят от воды.
+    if window_days is None:
+        window_days = load()["policy"].get("blend_adaptive_window_days", 28)
     window = min(window_days, streak)
     tdee, _logged_days = _adaptive_tdee_core(conn, user_id, window, anchor.isoformat(), window)
     return tdee
@@ -506,6 +509,24 @@ def _deadline_deficit(conn: sqlite3.Connection, user_id: int, milestone: sqlite3
     if days_remaining <= 0:
         return float("inf")
     return required_kg * _KCAL_PER_KG / days_remaining
+
+
+def _min_deficit(conn: sqlite3.Connection, user_id: int) -> float:
+    """Нижняя граница дефицита, пока есть недостигнутая весовая веха ниже
+    текущего веса (со сроком или без): policy.min_deficit_pct_week % веса в
+    неделю. Без неё опережение срока сжимало дефицит к нулю (0.4 кг до вехи за
+    17 дней -> 180 ккал), а веха без срока не давала дефицита вовсе. Пол
+    калоража (kcal_floor) по-прежнему сильнее."""
+    pct = load()["policy"].get("min_deficit_pct_week") or 0
+    weight = _smoothed_weight_kg(conn, user_id)
+    if not pct or weight is None:
+        return 0.0
+    has_goal = conn.execute(
+        "SELECT 1 FROM milestones WHERE user_id=? AND achieved_at IS NULL "
+        "AND metric='weight_kg' AND threshold < ? LIMIT 1",
+        (user_id, weight),
+    ).fetchone()
+    return weight * pct / 100 * _KCAL_PER_KG / 7 if has_goal else 0.0
 
 
 def _is_refeed(conn: sqlite3.Connection, user_id: int, date_: str) -> bool:
@@ -619,12 +640,12 @@ def daily_expenditure(conn: sqlite3.Connection, user_id: int, date: str) -> dict
 
     parts: {"adaptive"|"steps"|"watch"|"activity_factor": {"estimate", "share"}
     или None, если часть недоступна}. kcal = Σ estimate × share. logged_days —
-    дни с логом еды в 14-дневном окне (та же величина двигает долю адаптивной
-    части). tags — имена частей с долей > 0, в порядке
+    дни с логом еды в окне policy.blend_adaptive_window_days (та же величина
+    двигает долю адаптивной части). tags — имена частей с долей > 0, в порядке
     adaptive/steps/watch/activity_factor: источник тега "blend:..." в
     daily_target().
 
-    Доля адаптивной части a = policy.blend_adaptive_max_share × logged_days/14,
+    Доля адаптивной части a = policy.blend_adaptive_max_share × min(1, logged_days/14),
     и только если сама часть доступна (иначе a=0). Остаток 1-a делят поровну
     доступные {steps, watch}; если недоступна ни одна — весь остаток уходит
     activity_factor (BMR × коэффициент активности). Тренировочная добавка
@@ -638,13 +659,16 @@ def daily_expenditure(conn: sqlite3.Connection, user_id: int, date: str) -> dict
     bmr = bmr_floor(conn, user_id)
 
     min_days = policy.get("blend_min_logged_days", 4)
-    adaptive_est, logged_days = _adaptive_tdee_core(conn, user_id, 14, date, min_days)
+    # Окно 28 дней, не 14: водные колебания ±1 кг на 14 днях дают ±550 ккал/сут
+    # в наклоне × 7700, и оценка за 9 дней гуляла 2090 -> 3490 при ровном питании.
+    window = policy.get("blend_adaptive_window_days", 28)
+    adaptive_est, logged_days = _adaptive_tdee_core(conn, user_id, window, date, min_days)
     # Среднее за последние дни: оценка по наклону веса шумная (5-7 точек после
     # вымывания рефида), и без сглаживания цель прыгает на сотни ккал за день.
     day = datetime.fromisoformat(date[:10]).date()
     ests = [adaptive_est] if adaptive_est is not None else []
     for k in range(1, policy.get("blend_adaptive_smooth_days", 7)):
-        est, _ = _adaptive_tdee_core(conn, user_id, 14, (day - timedelta(days=k)).isoformat(), min_days)
+        est, _ = _adaptive_tdee_core(conn, user_id, window, (day - timedelta(days=k)).isoformat(), min_days)
         if est is not None:
             ests.append(est)
     adaptive_est = sum(ests) / len(ests) if ests else None
@@ -652,7 +676,7 @@ def daily_expenditure(conn: sqlite3.Connection, user_id: int, date: str) -> dict
     parts: dict[str, dict | None] = {"adaptive": None, "steps": None, "watch": None, "activity_factor": None}
     a = 0.0
     if adaptive_est is not None:
-        a = policy.get("blend_adaptive_max_share", 0.6) * logged_days / 14
+        a = policy.get("blend_adaptive_max_share", 0.6) * min(1.0, logged_days / 14)
         parts["adaptive"] = {"estimate": adaptive_est, "share": a}
 
     window_days = policy.get("blend_watch_window_days", 7)
@@ -747,9 +771,14 @@ def daily_target(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
         # политикой по умолчанию" — источник дефицита без активной вехи-со-сроком.
         default_deficit = load()["policy"].get("default_deficit_kcal", 0) or 0
         deficit = milestone_deficit if milestone_deficit is not None else default_deficit
+        min_deficit = _min_deficit(conn, user_id)
+        if min_deficit > deficit:
+            deficit = min_deficit
 
         step2_target = full_tdee - deficit
-        if milestone_deficit:  # реальный дедлайн дал число (не None, не 0, не inf-нейтрально)
+        if deficit == min_deficit and min_deficit:
+            tags.append("min_deficit")
+        elif milestone_deficit:  # реальный дедлайн дал число (не None, не 0, не inf-нейтрально)
             if step2_target < floor:
                 # §09: "если срок требует дефицита ниже пола, отклоняется срок" —
                 # не режем калораж ниже безопасной границы, вместо этого помечаем
@@ -857,6 +886,8 @@ if __name__ == "__main__":
         # на часы и окна ловят не те точки.
         from health_core.config import set_tz
         set_tz((load().get('schedule') or {}).get('default_timezone'))
+        # Сценарии ниже про срок/пол/рефид; минимальный дефицит проверяется отдельно в конце.
+        _min_pct = load()["policy"].pop("min_deficit_pct_week", None)
 
         conn.execute(
             "INSERT INTO users(telegram_user_id, height_cm, birth_date, sex, created_at) "
@@ -1380,6 +1411,23 @@ if __name__ == "__main__":
         conn.execute("DELETE FROM activity WHERE user_id=? AND file_hash='selfcheck-defect2'", (uid,))
         conn.commit()
         print("OK: тренировочная добавка (tcx_net) не поднимает цель питания (defect 2)")
+
+        # ---- минимальный дефицит: веха ниже веса без срока даёт дефицит, без вехи его нет ----
+        _reset_all(uid)
+        _add_metric(0, 100.0)
+        load()["policy"]["min_deficit_pct_week"] = 0.75
+        conn.execute("DELETE FROM milestones WHERE user_id=?", (uid,))
+        conn.commit()
+        no_goal = daily_target(conn, uid, de_date)
+        assert "min_deficit" not in no_goal["source"], no_goal["source"]
+        conn.execute("INSERT INTO milestones(user_id, name, metric, threshold) VALUES (?, 'no-deadline', 'weight_kg', 90)", (uid,))
+        conn.commit()
+        with_goal = daily_target(conn, uid, de_date)
+        want = max(daily_expenditure(conn, uid, de_date)["kcal"] - 100.0 * 0.0075 * 7700 / 7, with_goal["kcal_floor"])
+        assert "min_deficit" in with_goal["source"] and abs(with_goal["kcal"] - want) < 0.01, (with_goal, want)
+        assert with_goal["kcal"] >= with_goal["kcal_floor"], with_goal
+        conn.execute("DELETE FROM milestones WHERE user_id=?", (uid,))
+        print("OK: минимальный дефицит 0.75%/нед включается при вехе ниже веса и не пробивает пол")
 
         _reset_all(uid)
         conn.commit()
