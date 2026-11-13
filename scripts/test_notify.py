@@ -46,6 +46,7 @@ conn.commit()
 conn.close()
 
 sent = []
+orig_send = notify.send
 notify.send = lambda token, chat_id, text: sent.append((chat_id, text))
 
 
@@ -172,6 +173,52 @@ assert not ok and verdict, (ok, verdict)
 ok, verdict = export_backup.check_copy(str(_bad.parent / "missing.db"))
 assert not ok and "не открывается" in verdict, (ok, verdict)
 print("OK: проверка копии - здоровая ok, мусор и отсутствующий файл не ok")
+
+# --- H: повторные попытки send() при сбоях сети (ConnectionResetError / URLError) ---
+import io
+import urllib.request
+
+class MockResponse:
+    def __init__(self, data: bytes):
+        self._data = data
+    def read(self):
+        return self._data
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        pass
+
+calls = 0
+def mock_urlopen_retry(req, timeout=30):
+    global calls
+    calls += 1
+    if calls == 1:
+        raise urllib.error.URLError(ConnectionResetError(104, "Connection reset by peer"))
+    return MockResponse(b'{"ok": true}')
+
+orig_urlopen = urllib.request.urlopen
+try:
+    urllib.request.urlopen = mock_urlopen_retry
+    orig_send("fake-token", "123", "test retry message")
+    assert calls == 2, f"ожидали 2 вызова urlopen, получили {calls}"
+    print("OK: send() повторяет отправку при Connection reset by peer и успешно доставляет")
+
+    calls = 0
+    def mock_urlopen_fail(req, timeout=30):
+        global calls
+        calls += 1
+        raise urllib.error.URLError(ConnectionResetError(104, "Connection reset by peer"))
+
+    urllib.request.urlopen = mock_urlopen_fail
+    failed = False
+    try:
+        orig_send("fake-token", "123", "test retry message")
+    except urllib.error.URLError:
+        failed = True
+    assert failed and calls == 3, f"ожидали 3 попытки и падение, попыток={calls}"
+    print("OK: send() падает только после исчерпания 3 попыток")
+finally:
+    urllib.request.urlopen = orig_urlopen
 
 os.unlink(_tmp_db.name)
 print("ВСЕ ПРОВЕРКИ ПРОШЛИ")

@@ -96,6 +96,10 @@ def get_provider_keys(provider: Provider) -> list[str]:
                 if k and not k.startswith("#") and k not in keys:
                     keys.append(k)
 
+    key_idx = provider.get("key_index")
+    if isinstance(key_idx, int) and not isinstance(key_idx, bool) and 0 <= key_idx < len(keys):
+        return [keys[key_idx]]
+
     return keys
 
 

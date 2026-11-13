@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root: for `migrate` and `plugin`
 
-from admin import auth, pages, upload
+from admin import auth, pages, upload, provider_setup
 from health_core import card_drafts
 from health_core.config import CONFIG_PATH, load as load_config, user_now, user_today
 from health_core.db import DB_PATH, connect, migrate as db_migrate
@@ -273,9 +273,17 @@ def _import_scale_upload(conn, user_id: int, filename: str, data: bytes) -> tupl
 
 
 def _collect_keys_dict() -> dict[str, list[str]]:
-    """Собирает списки настроенных ключей для стандартных переменных окружения."""
+    """Собирает списки настроенных ключей для стандартных и дополнительных переменных окружения."""
     from bot.llm import get_provider_keys
     env_vars = ["GOOGLE_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"]
+    env_vars += [p["api_key_env"] for p in (load_config().get("bot") or {}).get("providers", [])
+                 if p.get("api_key_env") and p["api_key_env"] not in env_vars]
+    try:
+        for k in auth.read_env_vars():
+            if k.endswith("_API_KEY") and k not in env_vars:
+                env_vars.append(k)
+    except Exception:
+        pass
     out: dict[str, list[str]] = {}
     for var in env_vars:
         keys = get_provider_keys({"api_key_env": var})
@@ -289,12 +297,16 @@ def _test_single_key_sync(base_url: str, model: str, key: str, provider_cfg: dic
     import urllib.error
     import urllib.request
 
-    url = f"{base_url.rstrip('/')}/chat/completions"
+    is_anthropic = bool(provider_cfg and provider_cfg.get("api") == "anthropic")
+    url = f"{base_url.rstrip('/')}/v1/messages" if is_anthropic else f"{base_url.rstrip('/')}/chat/completions"
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    if is_anthropic:
+        headers["anthropic-version"] = "2023-06-01"
+        headers["x-api-key"] = key
     payload: dict = {
         "model": model,
         "messages": [{"role": "user", "content": "hi"}],
@@ -363,7 +375,10 @@ def _run_all_key_tests(providers: list[dict], keys_dict: dict[str, list[str]]) -
             model = p.get("model", "")
             base_url = p.get("base_url", "")
             env_var = p.get("api_key_env", "")
-            keys = keys_dict.get(env_var, [])
+            keys = list(keys_dict.get(env_var, []))
+            key_idx = p.get("key_index")
+            if isinstance(key_idx, int) and not isinstance(key_idx, bool) and 0 <= key_idx < len(keys):
+                keys = [keys[key_idx]]
             for k in keys:
                 futures.append(pool.submit(_test_single_key_sync, base_url, model, k, p))
         for f in futures:
@@ -462,7 +477,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        # Security headers on every response.
+        # Security and cache-control headers on every response.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -479,6 +496,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+            self.wfile.flush()
 
     def _html(self, status: int, body: str, set_cookie: str | None = None) -> None:
         self._send(status, "text/html; charset=utf-8", body.encode("utf-8"), set_cookie)
@@ -579,21 +597,27 @@ class Handler(BaseHTTPRequestHandler):
         try:
             routes = {
                 "/login": self._get_login,
+                "/login/code": self._get_login,
                 "/": self._get_dashboard,
                 "/guards": self._get_guards,
+                "/guards/save": self._get_guards,
                 "/milestones": self._get_milestones,
                 "/thresholds": self._get_thresholds,
                 "/keys": self._get_keys,
+                "/keys/test": self._get_keys,
                 "/personas": self._get_personas,
                 "/actions": self._get_actions,
+                "/actions/import-scale": self._get_actions,
                 "/knowledge": self._get_knowledge,
+                "/knowledge/upload": self._get_knowledge,
+                "/knowledge/delete": self._get_knowledge,
                 "/drafts": self._get_drafts,
             }
             if parsed.path == "/alerts":
                 return self._get_alerts(query)
-            if parsed.path == "/plans":
+            if parsed.path in ("/plans", "/plans/save", "/plans/delete", "/plans/template/save", "/plans/template/delete"):
                 return self._get_plans(query)
-            if parsed.path == "/workouts":
+            if parsed.path in ("/workouts", "/workouts/save", "/workouts/delete"):
                 return self._get_workouts(query)
             if parsed.path == "/forecast":
                 return self._get_forecast(query)
@@ -604,6 +628,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             traceback.print_exc(file=sys.stderr)
             self._error_page(500, "Внутренняя ошибка. Подробности в логах сервера.")
+
+    do_HEAD = do_GET
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -990,7 +1016,34 @@ class Handler(BaseHTTPRequestHandler):
 
         action = form.get("action")
         message, error = None, None
-        if action == "save_keys":
+        if action == "list_models":
+            try:
+                provider = provider_setup.from_form(form, require_model=False)
+                models = provider_setup.list_models(provider, form.get("new_api_key", ""))
+                payload = {"models": models}
+                status = 200
+            except ValueError as exc:
+                payload, status = {"error": str(exc)}, 400
+            return self._send(status, "application/json; charset=utf-8",
+                              json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        if action == "add_provider":
+            try:
+                provider = provider_setup.from_form(form)
+                current = list((load_config().get("bot") or {}).get("providers", []))
+                identity = lambda p: (p.get("base_url", "").rstrip("/"), p.get("model"),
+                                      p.get("api", "openai"), p.get("api_key_env"))
+                if any(identity(p) == identity(provider) for p in current):
+                    raise ValueError("Эта модель с такими настройками уже есть в цепочке.")
+                key = form.get("new_api_key", "").strip()
+                if key:
+                    auth.update_env_vars({provider["api_key_env"]: key})
+                _update_providers_in_config(current + [provider])
+                message = "Модель добавлена в конец цепочки. Приоритет можно изменить стрелками."
+            except ValueError as exc:
+                error = str(exc)
+            except OSError:
+                error = "Не удалось сохранить настройки. Проверьте доступ к .env и config.yaml."
+        elif action == "save_keys":
             import re
 
             def parse_keys_input(raw: str) -> list[str]:
@@ -1022,6 +1075,20 @@ class Handler(BaseHTTPRequestHandler):
                 updates[var + "_LIST"] = None
                 for i in range(1, 20):
                     updates[f"{var}_{i}"] = None
+            custom_vars = [
+                v for v in _collect_keys_dict()
+                if v not in ("GOOGLE_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY")
+            ]
+            for var in dict.fromkeys(custom_vars):
+                field_name = f"custom_key__{var}"
+                if field_name in form:
+                    c_keys = parse_keys_input(form.get(field_name, ""))
+                    updates[var] = c_keys[0] if c_keys else ""
+                    if not var.endswith("S"):
+                        updates[var + "S"] = ",".join(c_keys) if c_keys else None
+                        updates[var + "_LIST"] = None
+                    for i in range(1, 20):
+                        updates[f"{var}_{i}"] = None
             auth.update_env_vars(updates)
             auth.load_env_file(force=True)
             message = f"API-ключи успешно сохранены (Google: {len(g_keys)} шт., Groq: {len(groq_keys)} шт.). Ротация активна."
@@ -1075,6 +1142,51 @@ class Handler(BaseHTTPRequestHandler):
                 message = f"Основная модель успешно изменена на {target_model}!"
             except Exception as exc:
                 error = f"Ошибка смены основной модели: {exc}"
+        elif action == "delete_provider":
+            try:
+                cfg = load_config()
+                current_providers = list((cfg.get("bot") or {}).get("providers", []))
+                idx = int(form.get("provider_idx", ""))
+                if not 0 <= idx < len(current_providers):
+                    raise ValueError("Модель не найдена в цепочке.")
+                if len(current_providers) <= 1:
+                    raise ValueError("Нельзя удалить единственную модель из цепочки.")
+                removed = current_providers.pop(idx)
+                _update_providers_in_config(current_providers)
+                message = f"Модель {removed.get('model')} удалена из цепочки."
+            except Exception as exc:
+                error = f"Ошибка удаления модели: {exc}"
+        elif action == "set_provider_key":
+            import re
+            try:
+                cfg = load_config()
+                current_providers = list((cfg.get("bot") or {}).get("providers", []))
+                idx = int(form.get("provider_idx", ""))
+                if not 0 <= idx < len(current_providers):
+                    raise ValueError("Модель не найдена в цепочке.")
+                key_spec = (form.get("key_spec") or "").strip()
+                if ":" in key_spec:
+                    env_var, raw_kidx = key_spec.split(":", 1)
+                    k_idx: int | None = int(raw_kidx)
+                    if k_idx < 0:
+                        raise ValueError("Некорректный индекс ключа.")
+                else:
+                    env_var = key_spec
+                    k_idx = None
+                if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,65}_API_KEY", env_var):
+                    raise ValueError("Некорректное имя переменной ключа.")
+                target = dict(current_providers[idx])
+                target["api_key_env"] = env_var
+                if k_idx is not None:
+                    target["key_index"] = k_idx
+                else:
+                    target.pop("key_index", None)
+                current_providers[idx] = target
+                _update_providers_in_config(current_providers)
+                suffix = f" (ключ #{k_idx + 1})" if k_idx is not None else " (все ключи / ротация)"
+                message = f"Для модели {target.get('model')} назначен ключ {env_var}{suffix}."
+            except Exception as exc:
+                error = f"Ошибка выбора ключа: {exc}"
         else:
             error = "Неизвестное действие."
 

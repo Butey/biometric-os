@@ -5,6 +5,7 @@ alert messages, device strings, the lot. That is the entire XSS defense for a
 panel serving personal medical data, so it is applied without exception.
 """
 import html
+import json
 from datetime import datetime, timezone as _tz_module
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -370,6 +371,28 @@ def _document(title: str, body_html: str) -> str:
         "document.addEventListener('DOMContentLoaded', updateThemeUI);\n"
         "</script>\n"
         "<script>\n"
+        "(function(){\n"
+        "  try{\n"
+        "    var map = {\n"
+        "      '/guards/save': '/guards',\n"
+        "      '/keys/test': '/keys',\n"
+        "      '/actions/import-scale': '/actions',\n"
+        "      '/knowledge/upload': '/knowledge',\n"
+        "      '/knowledge/delete': '/knowledge',\n"
+        "      '/plans/save': '/plans',\n"
+        "      '/plans/delete': '/plans',\n"
+        "      '/plans/template/save': '/plans',\n"
+        "      '/plans/template/delete': '/plans',\n"
+        "      '/workouts/save': '/workouts',\n"
+        "      '/workouts/delete': '/workouts',\n"
+        "      '/login/code': '/login'\n"
+        "    };\n"
+        "    var p = window.location.pathname;\n"
+        "    if(window.history && window.history.replaceState && map[p]){\n"
+        "      window.history.replaceState(null, '', map[p] + window.location.search);\n"
+        "    }\n"
+        "  }catch(e){}\n"
+        "})();\n"
         "document.addEventListener('submit', function(e){\n"
         "  var msg = e.target && e.target.dataset && e.target.dataset.confirm;\n"
         "  if(msg && !window.confirm(msg)) e.preventDefault();\n"
@@ -503,7 +526,12 @@ def login_code_page(csrf_token: str, error: str | None = None) -> str:
 
 
 def login_ok_page() -> str:
-    body = '<main style="max-width:360px;margin:80px auto;padding:16px"><div class="card"><p class="msg">Вход выполнен.</p><p><a href="/">Перейти в панель</a></p></div></main>'
+    body = (
+        '<main style="max-width:360px;margin:80px auto;padding:16px">'
+        '<div class="card"><p class="msg">Вход выполнен.</p>'
+        '<p><a href="/">Перейти в панель</a></p></div></main>'
+        '<script>window.location.replace("/");</script>'
+    )
     return _document("Вход выполнен", body)
 
 
@@ -2142,6 +2170,10 @@ _REORDER_SCRIPT = """<script>
   }
 
   function handleDragStart(e) {
+    if (e.target && e.target.closest && e.target.closest('select, button, input, a')) {
+      e.preventDefault();
+      return false;
+    }
     dragSrcEl = this;
     this.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
@@ -2310,16 +2342,63 @@ def keys_page(
     ])
 
     # Таблица моделей с drag & drop и стрелочками приоритета
+    all_key_vars = list(keys_dict.keys())
+    for p in providers_list:
+        ev = p.get("api_key_env", "")
+        if ev and ev not in all_key_vars:
+            all_key_vars.append(ev)
+
     provider_rows = []
     for idx, p in enumerate(providers_list, 1):
         m = p.get("model", "—")
         url = p.get("base_url", "—")
         env_var = p.get("api_key_env", "—")
+        key_idx = p.get("key_index")
+        if not (isinstance(key_idx, int) and not isinstance(key_idx, bool)):
+            key_idx = None
         assigned_keys = keys_dict.get(env_var, [])
         keys_count = len(assigned_keys)
-        
-        status_badge = f'<span class="chip ok">✓ {keys_count} ключ(ей)</span>' if keys_count > 0 else '<span class="chip bad">⚠ Нет ключей</span>'
-        
+
+        if key_idx is not None and 0 <= key_idx < keys_count:
+            k_tail = assigned_keys[key_idx][-4:] if len(assigned_keys[key_idx]) >= 4 else "***"
+            status_badge = f'<span class="chip ok">✓ ключ #{key_idx + 1} (...{html.escape(k_tail)})</span>'
+        elif keys_count > 0:
+            status_badge = f'<span class="chip ok">✓ {keys_count} ключ(ей)</span>'
+        else:
+            status_badge = '<span class="chip bad">⚠ Нет ключей</span>'
+
+        current_spec = f"{env_var}:{key_idx}" if key_idx is not None else env_var
+        key_opts = []
+        for kvar in all_key_vars:
+            klist = keys_dict.get(kvar, [])
+            kvar_e = html.escape(kvar)
+            if len(klist) == 0:
+                sel = " selected" if current_spec == kvar else ""
+                key_opts.append(f'<option value="{kvar_e}"{sel}>{kvar_e} (нет ключей)</option>')
+            elif len(klist) == 1:
+                tail = html.escape(klist[0][-4:] if len(klist[0]) >= 4 else "***")
+                sel = " selected" if current_spec in (kvar, f"{kvar}:0") else ""
+                key_opts.append(f'<option value="{kvar_e}"{sel}>{kvar_e} (...{tail})</option>')
+            else:
+                sel_all = " selected" if current_spec == kvar else ""
+                key_opts.append(f'<option value="{kvar_e}"{sel_all}>{kvar_e} (все {len(klist)} шт., ротация)</option>')
+                for ki, kv in enumerate(klist):
+                    tail = html.escape(kv[-4:] if len(kv) >= 4 else "***")
+                    spec = f"{kvar}:{ki}"
+                    sel_k = " selected" if current_spec == spec else ""
+                    key_opts.append(f'<option value="{html.escape(spec)}"{sel_k}>↳ {kvar_e} #{ki + 1} (...{tail})</option>')
+
+        key_select_form = (
+            f'<form method="post" action="/keys" style="margin:0 0 3px 0">'
+            f'{_csrf_field(csrf_token)}'
+            f'<input type="hidden" name="action" value="set_provider_key">'
+            f'<input type="hidden" name="provider_idx" value="{idx - 1}">'
+            f'<select name="key_spec" onchange="this.form.submit()" title="Выбрать ключ для этой модели" '
+            f'style="padding:4px 8px;font-size:12px;border-radius:6px;max-width:250px;background:var(--bg2);color:var(--fg)">'
+            f'{"".join(key_opts)}</select>'
+            f'</form>'
+        )
+
         priority_badge = (
             f'<span class="chip priority-badge priority-badge-primary">🟢 #1 ОСНОВНАЯ</span>'
             if idx == 1 else
@@ -2335,12 +2414,23 @@ def keys_page(
             extra_badges.append('<span class="comment" style="font-size:11px;margin-left:4px">thinking</span>')
         extra_badges_html = " ".join(extra_badges)
 
+        del_disabled = " disabled" if len(providers_list) <= 1 else ""
+        delete_form = (
+            f'<form method="post" action="/keys" style="display:inline;margin:0 0 0 4px" '
+            f'data-confirm="Удалить модель {html.escape(m, quote=True)} из цепочки?">'
+            f'{_csrf_field(csrf_token)}'
+            f'<input type="hidden" name="action" value="delete_provider">'
+            f'<input type="hidden" name="provider_idx" value="{idx - 1}">'
+            f'<button type="submit" class="btn-arrow danger" title="Удалить модель из цепочки"{del_disabled}>✕</button>'
+            f'</form>'
+        )
+
         provider_rows.append(
             f'<tr class="model-row" draggable="true" data-model="{html.escape(m)}" data-idx="{idx-1}">'
             f'<td class="drag-handle" title="Потяните для перетаскивания (Drag & Drop)">⠿</td>'
             f'<td class="priority-cell">{priority_badge}</td>'
             f'<td><code style="font-size:13px;font-weight:600">{html.escape(m)}</code>{extra_badges_html}</td>'
-            f'<td><div><code>{html.escape(env_var)}</code></div><small style="color:var(--muted);font-size:11px">{html.escape(url)}</small></td>'
+            f'<td>{key_select_form}<small style="color:var(--muted);font-size:11px">{html.escape(url)}</small></td>'
             f'<td>{status_badge}</td>'
             f'<td style="text-align:center;white-space:nowrap">'
             f'<button type="button" class="btn-arrow btn-up" onclick="moveRowUp(this)" title="Поднять выше в цепочке"'
@@ -2349,6 +2439,7 @@ def keys_page(
             f'{" disabled" if idx == len(providers_list) else ""}>▼</button>'
             f'<button type="button" class="btn-arrow btn-top" onclick="makePrimary(this)" title="Сделать основной моделью (#1) прямо сейчас"'
             f'{" disabled" if idx == 1 else ""}>🔝</button>'
+            f'{delete_form}'
             f'</td></tr>'
         )
 
@@ -2382,6 +2473,7 @@ def keys_page(
         '<div class="comment" style="margin-top:2px">Нажмите «Сохранить новый порядок», чтобы применить изменения для бота.</div></div>'
         '<button type="submit" class="highlight-pulse" style="background:linear-gradient(135deg,#12905f,#0a7048);color:#fff;padding:8px 16px">'
         '💾 Сохранить новый порядок</button></div></div>'
+        '</form>'
         '<div class="table-responsive">'
         '<table class="reorder-table" id="models-table">'
         '<thead><tr>'
@@ -2390,16 +2482,15 @@ def keys_page(
         '<th>Модель</th>'
         '<th>Ключ / Base URL</th>'
         '<th>Ключи</th>'
-        '<th style="width:140px;text-align:center">Действия</th>'
+        '<th style="width:170px;text-align:center">Действия</th>'
         '</tr></thead>'
         f'<tbody id="models-tbody">{"".join(provider_rows)}</tbody>'
         '</table>'
         '</div>'
         '<p style="margin-top:14px">'
-        '<button type="submit" id="save-order-btn-bottom" style="display:none;background:linear-gradient(135deg,#12905f,#0a7048);color:#fff">'
+        '<button type="submit" form="reorder-form" id="save-order-btn-bottom" style="display:none;background:linear-gradient(135deg,#12905f,#0a7048);color:#fff">'
         '💾 Сохранить новый порядок моделей</button>'
         '</p>'
-        '</form>'
     )
 
     # Результаты тестирования
@@ -2429,10 +2520,82 @@ def keys_page(
   </div>
 </div>"""
 
+    profile_options = ['<option value="custom">Новый / другой провайдер</option>']
+    seen_profiles = set()
+    for p in providers_list:
+        identity = (p.get("base_url", ""), p.get("api_key_env", ""), p.get("api", "openai"))
+        if identity in seen_profiles:
+            continue
+        seen_profiles.add(identity)
+        url, env_var, api = identity
+        model_ids = [str(item.get("model", "")) for item in providers_list
+                     if (item.get("base_url", ""), item.get("api_key_env", ""), item.get("api", "openai")) == identity]
+        attrs = ' '.join(f'data-{key}="{html.escape(value, quote=True)}"' for key, value in
+                         {"url": url, "env": env_var, "api": api,
+                          "models": json.dumps(model_ids, ensure_ascii=False)}.items())
+        profile_options.append(f'<option value="{len(profile_options)}" {attrs}>'
+                               f'{html.escape(url)} ({html.escape(env_var)})</option>')
+    add_provider_form = f"""
+  <details open style="margin-top:16px">
+    <summary><b>Добавить модель / провайдера</b></summary>
+    <form id="add-provider-form" method="post" action="/keys" style="margin-top:12px">
+      {_csrf_field(csrf_token)}
+      <input type="hidden" name="action" value="add_provider">
+      <label for="provider-profile">Провайдер</label>
+      <select id="provider-profile">{''.join(profile_options)}</select>
+      <div class="grid">
+        <div><label for="provider-url">Base URL</label>
+          <input id="provider-url" name="base_url" type="url" required placeholder="https://provider.example/v1">
+        </div>
+        <div><label for="provider-api">Формат API</label>
+          <select id="provider-api" name="api"><option value="openai">OpenAI-совместимый</option>
+          <option value="anthropic">Anthropic Messages</option></select>
+        </div>
+      </div>
+      <div class="grid">
+        <div><label for="provider-env">Переменная API-ключа</label>
+          <input id="provider-env" name="api_key_env" required placeholder="CUSTOM_API_KEY">
+        </div>
+        <div><label for="provider-key">API-ключ (необязательно, если уже сохранён)</label>
+          <input id="provider-key" name="new_api_key" type="password" autocomplete="new-password">
+        </div>
+      </div>
+      <p class="comment">Base URL — адрес API без /chat/completions или /messages.
+      При новом адресе укажите предназначенный для него ключ. Введённый ключ заменяет
+      основное значение выбранной переменной в .env; оставьте поле пустым, чтобы сохранить текущий.</p>
+      <button id="load-provider-models" type="button">Загрузить модели</button>
+      <p id="provider-model-status" role="status" class="comment"></p>
+      <div class="grid">
+        <div><label for="provider-model">Модель из списка</label>
+          <select id="provider-model" name="model"><option value="">Выберите модель</option></select>
+        </div>
+        <div><label for="provider-custom-model">Или точный ID модели вручную</label>
+          <input id="provider-custom-model" name="custom_model" placeholder="ID модели из кабинета провайдера">
+        </div>
+      </div>
+      <p><button type="submit">Добавить в цепочку</button></p>
+    </form>
+  </details>"""
+
     joined_google = "\n".join(google_keys)
     joined_groq = "\n".join(groq_keys)
     joined_openrouter = "\n".join(openrouter_keys)
     joined_openai = "\n".join(openai_keys)
+
+    std_vars = {"GOOGLE_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"}
+    custom_key_blocks = []
+    for var, c_keys in keys_dict.items():
+        if var in std_vars:
+            continue
+        joined_c = "\n".join(c_keys)
+        var_e = html.escape(var)
+        custom_key_blocks.append(
+            f'<div style="margin-bottom:16px">'
+            f'<label for="custom_key__{var_e}"><b>{var_e}</b> (дополнительный провайдер из цепочки)</label>'
+            f'<textarea id="custom_key__{var_e}" name="custom_key__{var_e}" style="min-height:60px;margin-top:6px" placeholder="Ключи (каждый с новой строки)">{html.escape(joined_c)}</textarea>'
+            f'</div>'
+        )
+    custom_keys_html = "".join(custom_key_blocks)
 
     return f"""
 <div class="card">
@@ -2443,7 +2606,7 @@ def keys_page(
 
 <div class="card">
   <h3>1. Список API-ключей</h3>
-  <p class="comment">Ключи сохраняются в <code>.env</code> с правами 0600 и подхватываются ботом на лету без перезагрузки.
+  <p class="comment">Ключи сохраняются в <code>.env</code> с правами 0600. После замены уже используемого ключа перезапустите бота, чтобы обновить его окружение.
   Если задано несколько ключей (каждый с новой строки), бот циклически распределяет нагрузку между ними (Round-Robin) и автоматически переключается на следующий при ошибке 429 (Resource Exhausted / исчерпание квоты).</p>
   
   <form method="post" action="/keys">
@@ -2473,6 +2636,8 @@ def keys_page(
       </div>
     </div>
 
+    {custom_keys_html}
+
     <p><button type="submit">💾 Сохранить API-ключи</button></p>
   </form>
 </div>
@@ -2484,6 +2649,7 @@ def keys_page(
   </div>
   <p class="comment" style="margin-top:0">Порядок обращения: бот пробует первую модель (#1) со всеми её ключами. Если модель исчерпала квоту или вернула ошибку, запрос автоматически передаётся следующей модели в цепочке.</p>
   {providers_table}
+  {add_provider_form}
 
   <details style="margin-top:16px">
     <summary style="cursor:pointer;font-weight:600;color:var(--accent)">Прямое редактирование в YAML (config.yaml)</summary>
@@ -2508,5 +2674,65 @@ def keys_page(
 {test_html}
 
 {_REORDER_SCRIPT}
+{_ADD_PROVIDER_SCRIPT}
 """
 
+
+
+_ADD_PROVIDER_SCRIPT = r"""
+<script>
+(function () {
+  const form = document.getElementById('add-provider-form');
+  if (!form) return;
+  const profile = document.getElementById('provider-profile');
+  const model = document.getElementById('provider-model');
+  const status = document.getElementById('provider-model-status');
+  const button = document.getElementById('load-provider-models');
+  let generation = 0;
+  function setModels(ids) {
+    model.replaceChildren(new Option('Выберите модель', ''));
+    ids.forEach(id => model.add(new Option(id, id)));
+  }
+  function invalidate() {
+    generation++;
+    setModels([]);
+    status.textContent = '';
+  }
+  ['base_url', 'api', 'api_key_env', 'new_api_key'].forEach(name =>
+    form.elements[name].addEventListener('input', invalidate));
+  profile.addEventListener('change', function () {
+    invalidate();
+    const data = profile.selectedOptions[0].dataset;
+    form.elements.base_url.value = data.url || '';
+    form.elements.api_key_env.value = data.env || '';
+    form.elements.api.value = data.api || 'openai';
+    form.elements.new_api_key.value = '';
+    form.elements.custom_model.value = '';
+    setModels(JSON.parse(data.models || '[]'));
+  });
+  button.addEventListener('click', async function () {
+    if (!form.elements.base_url.reportValidity() || !form.elements.api_key_env.reportValidity()) return;
+    const requestGeneration = ++generation;
+    const data = new FormData(form);
+    data.set('action', 'list_models');
+    button.disabled = true;
+    status.textContent = 'Загрузка…';
+    try {
+      const response = await fetch('/keys', {
+        method: 'POST', body: new URLSearchParams(data), credentials: 'same-origin'
+      });
+      const result = await response.json();
+      if (requestGeneration !== generation) return;
+      if (!response.ok || result.error) throw new Error(result.error || 'Не удалось загрузить список.');
+      setModels(result.models);
+      status.textContent = 'Получено моделей: ' + result.models.length + '. Выберите подходящую для чата и инструментов.';
+    } catch (error) {
+      if (requestGeneration === generation) status.textContent =
+        error instanceof SyntaxError ? 'Сессия могла истечь. Обновите страницу и войдите снова.' : error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+})();
+</script>
+"""

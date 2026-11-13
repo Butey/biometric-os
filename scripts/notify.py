@@ -11,6 +11,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -60,10 +61,21 @@ def send(token: str, chat_id: str, text: str) -> None:
             }).encode()
             req = urllib.request.Request(
                 f"https://api.telegram.org/bot{token}/sendMessage", data=data)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body = json.loads(resp.read())
-            if not body.get("ok"):
-                print(f"telegram отказал для {chat_id}: {body}", file=sys.stderr)
+            last_err = None
+            for attempt in range(3):
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        body = json.loads(resp.read())
+                    if not body.get("ok"):
+                        print(f"telegram отказал для {chat_id}: {body}", file=sys.stderr)
+                    last_err = None
+                    break
+                except (urllib.error.URLError, TimeoutError, OSError) as e:
+                    last_err = e
+                    if attempt < 2:
+                        time.sleep(1.0)
+            if last_err is not None:
+                raise last_err
                 
     for mf in media_files:
         if not os.path.exists(mf):

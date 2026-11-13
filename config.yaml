@@ -332,27 +332,33 @@ bot:
   # Ключи здесь НЕ хранятся, только имя переменной окружения из .env.
   # На free tier цепочка обязательна: выбив лимит, бот иначе просто замолкает.
   providers:
+    - base_url: https://api.tkbk.online/openai/v1
+      api_key_env: TKBK_API_KEY
+      model: gpt-6-sol
+      timeout_s: 60
+    - base_url: https://api.tkbk.online/openai/v1
+      model: deepseek-v4.1-flash
+      api_key_env: TKBK_API_KEY
+    - base_url: https://api.tkbk.online/openai/v1
+      model: deepseek-v4-pro
+      api_key_env: TKBK_API_KEY
+    - base_url: https://generativelanguage.googleapis.com/v1beta/openai
+      api_key_env: GOOGLE_API_KEY
+      model: gemini-3.8-flash
+    - base_url: https://generativelanguage.googleapis.com/v1beta/openai
+      api_key_env: GOOGLE_API_KEY
+      model: gemini-3.7-flash
     - base_url: https://api.tkbk.online/claude
       api: anthropic
       api_key_env: TKBK_API_KEY
       model: claude-sonnet-5
       timeout_s: 60
-    - base_url: https://api.tkbk.online/openai/v1
-      api_key_env: TKBK_API_KEY
-      model: gpt-6-sol
-      timeout_s: 60
-    - base_url: https://generativelanguage.googleapis.com/v1beta/openai
-      api_key_env: GOOGLE_API_KEY
-      model: gemini-3.8-flash
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
       model: gemini-3.5-flash-lite
     - base_url: https://generativelanguage.googleapis.com/v1beta/openai
       api_key_env: GOOGLE_API_KEY
       model: gemini-3.6-flash
-    - base_url: https://generativelanguage.googleapis.com/v1beta/openai
-      api_key_env: GOOGLE_API_KEY
-      model: gemini-3.7-flash
     - base_url: https://openrouter.ai/api/v1
       api_key_env: OPENROUTER_API_KEY
       model: google/gemma-4-31b-it:free
