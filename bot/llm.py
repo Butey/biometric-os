@@ -687,7 +687,46 @@ def _error_text(result: str) -> str | None:
     return str(data["error"]) if isinstance(data, dict) and "error" in data else None
 
 
-_CLAIMS_WRITE = re.compile(r"\b(записал\w*|записан\w*|добавил\w*|внёс|внес\w*|сохранил\w*)\b", re.IGNORECASE)
+# Только утверждение о сделанном: «внести/внесу/записать» - предложение, «записанное питание»
+# и «Записано воды» из статус-бара - не заявка на запись, «ты записал» - про человека.
+_CLAIMS_WRITE = re.compile(
+    r"(?<!ты )\b(?:записал[аи]?|внёс|внесл[аи]|добавил[аи]?|сохранил[аи]?|зафиксировал[аи]?)\b"
+    r"|^[\W_]*записан[оаы]?[.!:]",
+    re.IGNORECASE | re.MULTILINE)
+# Пишут не только log_*: покупка в pharma, карточка продукта, запасы, планы. Не считать их
+# записью = поправка «вызови запись» провоцирует повтор уже сделанного (дубль покупки).
+_WRITE_TOOLS = frozenset({"pharma", "pantry", "food_lookup", "plan_day", "plans", "register_user",
+                          "set_milestone", "equipment", "refeed", "sick", "style",
+                          "import_scale_export", "drug_card_draft"})
+_READ_ACTIONS = frozenset({"list", "get", "status", "show", "match", "search", "derived", "vs_actual", "fetch"})
+_NOT_WRITTEN = ("Ничего не записал в базу: ответ утверждал запись, но ни одна запись не выполнилась. "
+                "Повтори сообщение - запишу заново.")
+
+
+def _is_write(name: str, args: dict | None) -> bool:
+    return (name.startswith("log_") or name in _WRITE_TOOLS) and (args or {}).get("action") not in _READ_ACTIONS
+
+
+def _receipt(name: str, args: dict | None, result: str) -> tuple[str | None, str | None]:
+    """(строка о записи, строка итога дня) из результата инструмента - числа из базы,
+    а не пересказ модели (она путала итоги и выдавала невыполненные записи)."""
+    try:
+        data = json.loads(result)
+    except (ValueError, TypeError):
+        return None, None
+    if not isinstance(data, dict) or "error" in data:
+        return None, None
+    if name == "log_food" and "food_log_id" in data:
+        items = ", ".join(f"{i.get('name')} {round(float(i['kcal']))} ккал" if i.get("kcal") is not None
+                          else str(i.get("name")) for i in data.get("items") or [])
+        day = re.search(r"По записям:[^\n]*", data.get("status_bar") or "")
+        return f"Запись в журнале #{data['food_log_id']}: {items}.", day[0] if day else None
+    if name == "log_water" and "water_id" in data and (args or {}).get("ml") is not None:
+        line = f"Вода #{data['water_id']}: +{float(args['ml']):g} мл"
+        if data.get("water_ml") is not None and data.get("water_target_ml"):
+            line += f", за день {data['water_ml'] / 1000:.1f} / {data['water_target_ml'] / 1000:.1f} л"
+        return line + ".", None
+    return None, None
 
 
 async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict],
@@ -701,8 +740,10 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
     """
     messages = list(messages)
     failed: dict[tuple[str, str], str] = {}  # вызовы с ошибкой в ЭТОМ ходе -> текст ошибки
-    wrote = False  # был ли в этом ходе успешный log_*
+    wrote = False  # была ли в этом ходе успешная запись (см. _is_write)
     nudge = None   # служебная реплика-поправка, в историю не попадает
+    receipts: list[str] = []
+    day_line = None
 
     for _ in range(max_iters):
         message = await chat(session, messages, tools, providers, timeout_s=timeout_s)
@@ -723,16 +764,24 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
                 messages[-1]["content"] = answer
             # Ответ «записал» без единого успешного log_* в этом ходе - выдумка (слабая
             # модель берёт цифры из вчерашней истории). Один раз просим сделать запись.
-            if nudge is None and not wrote and _CLAIMS_WRITE.search(answer):
-                log.warning("ответ утверждает запись без log_*, повтор: %s", _short(answer))
-                messages.pop()
-                nudge = {"role": "user", "content": (
-                    "[Система] В этом ходе не было ни одного успешного вызова log_*, но ты написал, "
-                    "что запись сделана. Вызови нужный log_* с данными из последнего сообщения человека "
-                    "или честно скажи, что ничего не записано. Числа дня бери только из результатов "
-                    "инструментов этого хода, не из прошлых сообщений.")}
-                messages.append(nudge)
-                continue
+            if not wrote and _CLAIMS_WRITE.search(answer):
+                if nudge is None:
+                    log.warning("ответ утверждает запись без записи, повтор: %s", _short(answer))
+                    messages.pop()
+                    nudge = {"role": "user", "content": (
+                        "[Система] В этом ходе не было ни одной успешной записи в базу, но ты написал, "
+                        "что запись сделана. Если человек просил записать - вызови нужный инструмент с данными "
+                        "из его последних сообщений. Иначе честно скажи, что ничего не записано. Числа дня "
+                        "бери только из результатов инструментов этого хода, не из прошлых сообщений.")}
+                    messages.append(nudge)
+                    continue
+                # Повтор с поправкой снова соврал - человеку уходит текст кода, не выдумка модели
+                log.warning("ответ после поправки снова утверждает запись без записи: %s", _short(answer))
+                answer = _NOT_WRITTEN
+                messages[-1]["content"] = answer
+            if receipts:
+                answer = answer.rstrip() + "\n\n" + "\n".join(receipts + ([day_line] if day_line else []))
+                messages[-1]["content"] = answer
             if nudge is not None:
                 messages = [m for m in messages if m is not nudge]
             return answer, messages
@@ -751,10 +800,19 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
                 continue
             results.append(await _run_one(call, dispatch))
             err = _error_text(results[-1])
+            name = call["function"]["name"]
+            try:
+                args = _tool_arguments(call)
+            except ValueError:
+                args = None
             if key and err is not None:
                 failed[key] = err
-            elif call["function"]["name"].startswith("log_"):
+            elif err is None and args is not None and _is_write(name, args):
                 wrote = True
+                line, day = _receipt(name, args, results[-1])
+                if line:
+                    receipts.append(line)
+                day_line = day or day_line
         for call, result in zip(tool_calls, results, strict=True):
             messages.append({
                 "role": "tool",
@@ -1008,6 +1066,49 @@ if __name__ == "__main__":
                 assert "[Система]" in sent[1][-1]["content"], sent[1][-1]
                 assert not any("[Система]" in str(m.get("content")) or m.get("content") == "Записал завтрак." for m in msgs), msgs
             print("OK: 6b) ответ «записал» без log_* получает один повтор, ложный ответ и поправка не попадают в историю")
+
+            # --- 6c. повтор с поправкой снова врёт -> человеку текст кода ---
+            replies = iter(["**Записал завтрак.**", "Записано."])
+            sent.clear()
+            with patch(__name__ + "._post", _post_claim):
+                text, msgs = await run_loop(session, [{"role": "user", "content": "завтрак"}], [{"type": "function"}],
+                                             PROVIDERS, lambda n, a: "{}")
+                assert text == _NOT_WRITTEN and len(sent) == 2, (text, len(sent))
+                assert msgs[-1]["content"] == _NOT_WRITTEN, msgs[-1]
+            print("OK: 6c) вторая ложная «запись» заменяется честным текстом кода")
+
+            # --- 6d. что считается заявкой и записью ---
+            for s in ("Могу внести в план?", "Записать как съеденное?", "Записано воды 0.7 / 2.6 л.",
+                      "записанное питание неполное", "Ты записал 2 яйца вчера."):
+                assert not _CLAIMS_WRITE.search(s), s
+            for s in ("Записал завтрак.", "**Записано.**", "Внёс покупку.", "Добавил в запас:"):
+                assert _CLAIMS_WRITE.search(s), s
+            assert _is_write("pharma", {"action": "restock"}) and not _is_write("pharma", {"action": "status"})
+            assert _is_write("food_lookup", {"action": "remember"}) and not _is_write("food_lookup", {"action": "match"})
+            assert _is_write("log_water", {"ml": 300}) and not _is_write("log_water", {"action": "list"})
+            assert not _is_write("get_day_summary", {})
+
+            tc_list = {"id": "c_l", "type": "function", "function": {"name": "log_water", "arguments": '{"action": "list"}'}}
+            queue = [_resp(200, _msg(content=None, tool_calls=[tc_list])),
+                     _resp(200, _msg(content="Записал воду.")), _resp(200, _msg(content="Ничего не записано."))]
+            with patch(__name__ + "._post", _post_ok):
+                text, _ = await run_loop(session, [{"role": "user", "content": "вода"}], [{"type": "function"}],
+                                         PROVIDERS, lambda n, a: '{"entries": []}')
+                assert text == "Ничего не записано.", text
+            print("OK: 6d) «внести/записать?» и статус-бар не заявка; list не запись; pharma restock - запись")
+
+            # --- 6e. успешный log_food -> строка записи и итог дня из результата, не от модели ---
+            tc_food = {"id": "c_f", "type": "function", "function": {"name": "log_food", "arguments": '{"items": []}'}}
+            food_res = json.dumps({"food_log_id": 479, "items": [{"name": "Хлеб", "kcal": 126.3}],
+                                   "status_bar": "Сегодня 20.11.\nПо записям: съедено 126 / Б 4.\nТренд"},
+                                  ensure_ascii=False)
+            queue = [_resp(200, _msg(content=None, tool_calls=[tc_food])), _resp(200, _msg(content="Записал хлеб."))]
+            with patch(__name__ + "._post", _post_ok):
+                text, msgs = await run_loop(session, [{"role": "user", "content": "хлеб"}], [{"type": "function"}],
+                                             PROVIDERS, lambda n, a: food_res)
+                assert text == "Записал хлеб.\n\nЗапись в журнале #479: Хлеб 126 ккал.\nПо записям: съедено 126 / Б 4.", text
+                assert msgs[-1]["content"] == text, msgs[-1]
+            print("OK: 6e) после log_food к ответу добавлены #id, ккал и итог дня из базы")
 
             # --- 7. reasoning с промежуточного хода tool_calls не протекает в
             # уведомление о пустом финальном ответе (утечка chain-of-thought) ---

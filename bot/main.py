@@ -23,6 +23,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 
 import aiohttp
@@ -1288,6 +1289,30 @@ def _user_time_context(conn, uid: str) -> str:
     return ctx
 
 
+_RECENT_TEXT_MIN = 15
+
+
+def _recent_user_text(uid: str, text: str) -> str:
+    """Реплика человека плюс его сообщения за последние _RECENT_TEXT_MIN минут - по ним
+    инструменты решают, называлось ли время события. Время часто в соседнем сообщении:
+    «обед в 13:00» + фото этикеток + «запиши как обед» - и метка 13:00 терялась.
+    Окно короткое: модель подставляет время из давней истории (вода утром легла во вчера)."""
+    cutoff = (config.local_now() - timedelta(minutes=_RECENT_TEXT_MIN)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT content FROM chat_history WHERE telegram_user_id=? AND role='user' AND ts>=? ORDER BY rowid",
+            (str(uid), cutoff)).fetchall()
+    finally:
+        conn.close()
+    texts = []
+    for r in rows:
+        content = json.loads(r["content"]).get("content")
+        if isinstance(content, str) and not content.startswith(history._SUMMARY_TAG):
+            texts.append(content)
+    return "\n".join(texts + [text])
+
+
 def _open_turn(uid: str, text: str) -> list[dict]:
     """Собрать запрос и сразу записать реплику человека. Синхронная работа с
     sqlite и чтение персоны с диска — блокирующие, поэтому вызывается через
@@ -1561,7 +1586,7 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
     # Use _open_turn_vision with special image content
     registry.set_caller(uid)
     _PLAN_ONLY.set(False)
-    config.set_user_text(caption or "")
+    config.set_user_text(await asyncio.to_thread(_recent_user_text, uid, caption or ""))
     prefix = await asyncio.to_thread(_open_turn_vision, uid, content, caption or "[фото]")
 
     load_env_file()
@@ -1746,7 +1771,7 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
         except (RuntimeError, ValueError, OSError, sqlite3.Error) as e:
             log.warning("автосжатие истории не удалось: %s", e)
 
-    config.set_user_text(text)
+    config.set_user_text(await asyncio.to_thread(_recent_user_text, uid, text))
     prefix = await asyncio.to_thread(_open_turn, uid, text)
     used_models: list[str] = []
     llm.USED_MODELS.set(used_models)

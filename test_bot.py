@@ -272,6 +272,32 @@ def test_history_roundtrip_and_isolation():
         conn.close()
 
 
+def test_time_hint_from_recent_messages():
+    # 18.11: «обед в 13:00» + фото + «запиши как обед» -> обед лёг на 14:32
+    from plugin import tools as _t
+    from health_core import config as _cfg
+    conn = connect()
+    migrate(conn)
+    try:
+        history.clear(conn, "111")
+        history.append(conn, "111", {"role": "user", "content": "обед в 13:00 200гр тушёнки"})
+        history.append(conn, "111", {"role": "assistant", "content": "добавил в запас"})
+        history.append(conn, "222", {"role": "user", "content": "чужое в 09:00"})
+        conn.execute("INSERT INTO chat_history(telegram_user_id, ts, role, content) VALUES ('111', '2000-01-01 00:00:00', 'user', ?)",
+                     (json.dumps({"role": "user", "content": "давнее в 07:00"}, ensure_ascii=False),))
+        conn.commit()
+    finally:
+        conn.close()
+    text = main._recent_user_text("111", "запиши как обед")
+    assert "13:00" in text and "запиши как обед" in text, text
+    assert "09:00" not in text and "07:00" not in text, text
+    _cfg.set_user_text(text)
+    assert _t._drop_unnamed_ts("2026-11-18 13:00") == "2026-11-18 13:00"
+    _cfg.set_user_text("запиши как обед")
+    assert _t._drop_unnamed_ts("2026-11-18 13:00") is None
+    _cfg.set_user_text(None)
+
+
 def test_history_window_never_starts_with_tool():
     """Обрезка не должна оставлять role:"tool" в голове списка — такой запрос
     провайдер отвергает целиком."""

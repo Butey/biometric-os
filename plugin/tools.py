@@ -766,7 +766,7 @@ def handle_log_food(params: dict) -> str:
     conn.close()
 
     return json.dumps(
-        {"status_bar": bar, "alerts": alerts, "meal_slot": meal_slot,
+        {"food_log_id": food_log_id, "status_bar": bar, "alerts": alerts, "meal_slot": meal_slot,
          **({"pantry_deducted": pantry_done} if pantry_done else {}),
          **({"pantry_not_deducted": pantry_skipped} if pantry_skipped else {}),
          # source по каждой позиции — видно, откуда взят состав (CONTEXT.md
