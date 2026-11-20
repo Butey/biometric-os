@@ -30,7 +30,8 @@ if [ "${1:-}" = "--restart" ]; then
     done
 
     echo "Проверка журнала бота..."
-    if ! journalctl -u health-agent.service --since "$since" --no-pager | grep -q "бот запущен"; then
+    out=$(journalctl -u health-agent.service --since "$since" --no-pager)
+    if ! grep -q "бот запущен" <<<"$out"; then
         echo "В журнале health-agent нет строки «бот запущен»"
         exit 1
     fi
