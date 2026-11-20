@@ -580,6 +580,14 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
                 failures.append(f"{provider['model']}[{_mask_key(key)}]: HTTP {status} Auth/BalanceError")
                 continue
 
+            if "not available for this key" in str(body).lower():
+                # Ключ не подходит к модели: повтор через 5 минут бесполезен, как и при ошибке авторизации
+                state.cooldown_until = time.time() + _COOLDOWN_RATE_LIMIT_S
+                log.warning("%s (key %s): HTTP %s модель недоступна для этого ключа, ротация на следующий ключ",
+                            provider["model"], _mask_key(key), status)
+                failures.append(f"{provider['model']}[{_mask_key(key)}]: HTTP {status} ModelNotAvailableForKey")
+                continue
+
             if status in (400, 422):
                 if status == 400 and is_google and "thought_signature" in str(body).lower():
                     # Google отклонил запрос из-за thought_signature:
@@ -742,6 +750,7 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
     failed: dict[tuple[str, str], str] = {}  # вызовы с ошибкой в ЭТОМ ходе -> текст ошибки
     wrote = False  # была ли в этом ходе успешная запись (см. _is_write)
     nudge = None   # служебная реплика-поправка, в историю не попадает
+    empty_retried = False  # один повтор пустого ответа, отдельно от nudge
     receipts: list[str] = []
     day_line = None
 
@@ -758,6 +767,12 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
             # reasoning — внутреннее поле провайдера, а не ответ человеку.
             # Пустой content остаётся пустым даже при наличии reasoning.
             answer = message.get("content") or ""
+            if not answer.strip() and not empty_retried:
+                # Пустой ответ - сбой провайдера: один тихий повтор, прежде чем беспокоить человека
+                log.warning("модель вернула пустой ответ, повтор")
+                empty_retried = True
+                messages.pop()
+                continue
             if not answer.strip():
                 answer = ("Модель не подготовила ответ. Перед повтором записи проверьте журнал: "
                           "часть действий могла выполниться.")
@@ -1115,6 +1130,7 @@ if __name__ == "__main__":
             queue = [
                 _resp(200, _msg(content=None, reasoning_content="думаю над вызовом...", tool_calls=[tc])),
                 _resp(200, _msg(content="")),  # финал: пусто, без reasoning
+                _resp(200, _msg(content="")),  # и повтор пуст
             ]
             with patch(__name__ + "._post", _post_ok):
                 text, msgs = await run_loop(session, [{"role": "user", "content": "запиши"}], [{"type": "function"}],
@@ -1122,6 +1138,35 @@ if __name__ == "__main__":
                 assert "Модель не подготовила ответ" in text and "думаю" not in text, text
                 assert msgs[-1]["content"] == text, msgs[-1]
             print("OK: 7) пустой финал заменён уведомлением, reasoning не раскрывается")
+
+            # --- 7b. пустой ответ -> один повтор; пустое сообщение в историю не попадает ---
+            sent_e = []
+            for label, replies_e, want, n_req in (("а", ["", "ответ"], "ответ", 2),
+                                                  ("б", ["", "  "], "Модель не подготовила ответ", 2)):
+                replies_it = iter(replies_e)
+                sent_e.clear()
+
+                async def _post_empty(session, url, headers, payload, timeout_s=None):
+                    sent_e.append(payload["messages"])
+                    return 200, {"choices": [{"message": _msg(content=next(replies_it))}]}
+
+                with patch(__name__ + "._post", _post_empty):
+                    text, msgs = await run_loop(session, [{"role": "user", "content": "привет"}], [],
+                                                PROVIDERS, lambda n, a: "{}")
+                    assert want in text and len(sent_e) == n_req, (label, text, len(sent_e))
+                    assert sent_e[1][-1]["role"] == "user", sent_e[1][-1]
+                    assert [m["content"] for m in msgs if m["role"] == "assistant"] == [text], msgs
+            print("OK: 7b) пустой ответ получает один повтор; два пустых -> заглушка")
+
+            # --- 7c. 503 «not available for this key» -> кулдаун ключа не меньше 3500 с ---
+            _KEY_STATES.clear()
+            queue = [_resp(503, error={"error": {"message": "This model is not available for this key."}}),
+                     _resp(200, _msg(content="со второго"))]
+            with patch(__name__ + "._post", _post_ok):
+                message = await chat(session, [{"role": "user", "content": "hi"}], [], PROVIDERS)
+                assert message["content"] == "со второго", message
+            assert _get_key_state("k1", model="model-1").cooldown_until >= time.time() + 3500
+            print("OK: 7c) 503 not available for this key -> кулдаун ключа около часа, переход дальше")
 
             # --- 8. устаревший снимок healthy_keys не обрывает провайдера
             # раньше времени: оба изначально здоровых ключа 429 в рамках
