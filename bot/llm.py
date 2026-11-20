@@ -448,6 +448,8 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
         role = m.get("role")
         key = "system" if role == "system" else "tool_results" if role == "tool" else "history"
         sizes[key] += len(str(m.get("content") or ""))
+        if key == "history":
+            sizes[key] += len(json.dumps(m.get("tool_calls") or [], ensure_ascii=False))
     log.info("размер запроса: system=%d history=%d tool_results=%d tools=%d симв",
              sizes["system"], sizes["history"], sizes["tool_results"],
              len(json.dumps(tools, ensure_ascii=False)))
