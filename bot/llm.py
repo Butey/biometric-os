@@ -443,6 +443,15 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
     """
     failures: list[str] = []
 
+    sizes = {"system": 0, "history": 0, "tool_results": 0}
+    for m in messages:
+        role = m.get("role")
+        key = "system" if role == "system" else "tool_results" if role == "tool" else "history"
+        sizes[key] += len(str(m.get("content") or ""))
+    log.info("размер запроса: system=%d history=%d tool_results=%d tools=%d симв",
+             sizes["system"], sizes["history"], sizes["tool_results"],
+             len(json.dumps(tools, ensure_ascii=False)))
+
     for provider in providers:
         env_name = provider.get("api_key_env", "DEFAULT_KEY")
         all_keys = get_provider_keys(provider)

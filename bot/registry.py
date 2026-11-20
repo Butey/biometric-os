@@ -1,5 +1,6 @@
 """Локальный реестр: plugin.tools.register(ctx), описания и диспетчеризация.
 """
+import copy
 import json
 import threading
 
@@ -96,18 +97,25 @@ SLASH_COMMANDS: list[tuple[str, callable, str]] = _tools._SLASH_COMMANDS
 
 
 def openai_tools() -> list[dict]:
-    """Формат OpenAI chat completions: [{"type": "function", "function": {...}}, ...]."""
-    return [
-        {
+    """Формат OpenAI chat completions: [{"type": "function", "function": {...}}, ...].
+
+    user_id модели не отдаём: она подставляет мусор (1, 458894), а личность всё равно
+    берётся из ContextVar. В копии схемы, TOOLS не трогаем: CLI передают user_id сами."""
+    out = []
+    for name, info in TOOLS.items():
+        params = copy.deepcopy(info["schema"])
+        params.get("properties", {}).pop("user_id", None)
+        if "user_id" in params.get("required", []):
+            params["required"] = [r for r in params["required"] if r != "user_id"]
+        out.append({
             "type": "function",
             "function": {
                 "name": name,
                 "description": info["description"],
-                "parameters": info["schema"],
+                "parameters": params,
             },
-        }
-        for name, info in TOOLS.items()
-    ]
+        })
+    return out
 
 
 _leaked = threading.local()
@@ -274,6 +282,12 @@ if __name__ == "__main__":
         assert fn["description"]
         assert isinstance(fn["parameters"], dict)
     print("OK: openai_tools() отдаёт валидную структуру")
+
+    for item in ot:
+        assert "user_id" not in item["function"]["parameters"].get("properties", {}), item["function"]["name"]
+        assert "user_id" not in item["function"]["parameters"].get("required", []), item["function"]["name"]
+    assert "user_id" in TOOLS["council"]["schema"]["properties"], "TOOLS не должен мутироваться"
+    print("OK: openai_tools() без user_id, TOOLS[...]['schema'] его сохраняет")
 
     result = json.loads(dispatch("get_status_bar", {"user_id": uid, "format": "bar"}))
     assert "error" not in result, f"get_status_bar вернул ошибку: {result}"
