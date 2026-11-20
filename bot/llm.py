@@ -687,6 +687,9 @@ def _error_text(result: str) -> str | None:
     return str(data["error"]) if isinstance(data, dict) and "error" in data else None
 
 
+_CLAIMS_WRITE = re.compile(r"\b(записал\w*|записан\w*|добавил\w*|внёс|внес\w*|сохранил\w*)\b", re.IGNORECASE)
+
+
 async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict],
                     providers: list[Provider], dispatch: Callable[[str, dict], str | Awaitable[str]],
                     max_iters: int = 6, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[str, list[dict]]:
@@ -698,6 +701,8 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
     """
     messages = list(messages)
     failed: dict[tuple[str, str], str] = {}  # вызовы с ошибкой в ЭТОМ ходе -> текст ошибки
+    wrote = False  # был ли в этом ходе успешный log_*
+    nudge = None   # служебная реплика-поправка, в историю не попадает
 
     for _ in range(max_iters):
         message = await chat(session, messages, tools, providers, timeout_s=timeout_s)
@@ -716,6 +721,20 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
                 answer = ("Модель не подготовила ответ. Перед повтором записи проверьте журнал: "
                           "часть действий могла выполниться.")
                 messages[-1]["content"] = answer
+            # Ответ «записал» без единого успешного log_* в этом ходе - выдумка (слабая
+            # модель берёт цифры из вчерашней истории). Один раз просим сделать запись.
+            if nudge is None and not wrote and _CLAIMS_WRITE.search(answer):
+                log.warning("ответ утверждает запись без log_*, повтор: %s", _short(answer))
+                messages.pop()
+                nudge = {"role": "user", "content": (
+                    "[Система] В этом ходе не было ни одного успешного вызова log_*, но ты написал, "
+                    "что запись сделана. Вызови нужный log_* с данными из последнего сообщения человека "
+                    "или честно скажи, что ничего не записано. Числа дня бери только из результатов "
+                    "инструментов этого хода, не из прошлых сообщений.")}
+                messages.append(nudge)
+                continue
+            if nudge is not None:
+                messages = [m for m in messages if m is not nudge]
             return answer, messages
 
         results = []
@@ -734,6 +753,8 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
             err = _error_text(results[-1])
             if key and err is not None:
                 failed[key] = err
+            elif call["function"]["name"].startswith("log_"):
+                wrote = True
         for call, result in zip(tool_calls, results, strict=True):
             messages.append({
                 "role": "tool",
@@ -971,6 +992,22 @@ if __name__ == "__main__":
                 assert isinstance(text, str) and text, text
                 assert "Не удалось завершить проверку" in text, text
             print("OK: 6) max_iters обрывает зацикливание и возвращает строку, а не виснет")
+
+            # --- 6b. «Записал» без log_* -> один повтор с поправкой, поправка в историю не идёт ---
+            replies = iter(["Записал завтрак.", "Ничего не записано."])
+            sent = []
+
+            async def _post_claim(session, url, headers, payload, timeout_s=None):
+                sent.append(payload["messages"])
+                return 200, {"choices": [{"message": _msg(content=next(replies))}]}
+
+            with patch(__name__ + "._post", _post_claim):
+                text, msgs = await run_loop(session, [{"role": "user", "content": "завтрак"}], [{"type": "function"}],
+                                             PROVIDERS, lambda n, a: "{}")
+                assert text == "Ничего не записано." and len(sent) == 2, (text, len(sent))
+                assert "[Система]" in sent[1][-1]["content"], sent[1][-1]
+                assert not any("[Система]" in str(m.get("content")) or m.get("content") == "Записал завтрак." for m in msgs), msgs
+            print("OK: 6b) ответ «записал» без log_* получает один повтор, ложный ответ и поправка не попадают в историю")
 
             # --- 7. reasoning с промежуточного хода tool_calls не протекает в
             # уведомление о пустом финальном ответе (утечка chain-of-thought) ---
