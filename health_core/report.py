@@ -582,6 +582,30 @@ def weight_series(conn: sqlite3.Connection, user_id: int, days: int = 90) -> lis
     return sorted(by_day.items())
 
 
+def weight_trend_line(conn: sqlite3.Connection, user_id: int) -> str | None:
+    """Строка тренда по утренним весам: среднее за 7 дней и изменение за 14/28 дней."""
+    from health_core.energy import _morning_weights
+    daily = dict(_morning_weights(conn, user_id, "0001-01-01", "9999-12-31"))
+    if not daily:
+        return None
+
+    def smooth(day: int) -> float | None:
+        vals = [daily[d] for d in range(day - 6, day + 1) if d in daily]
+        return statistics.mean(vals) if len(vals) >= 3 else None
+
+    last = max(daily)
+    now = smooth(last)
+    if now is None:
+        return None
+    line = f"Тренд веса (среднее за 7 дней): {now:.1f} кг"
+    for n in (14, 28):
+        prev = smooth(last - n)
+        if prev is not None:
+            change = now - prev
+            line += f"; за {n} дн. {change:+.1f} кг ({change / n * 7:+.2f} кг/нед)"
+    return line + ". Дневные скачки до 1 кг - вода и соль, смотри на тренд."
+
+
 def _milestone_values(conn: sqlite3.Connection, user_id: int, metric: str):
     """(текущее, стартовое) значение метрики вехи. None, если замеров нет."""
     src = _MILESTONE_SOURCES.get(metric)

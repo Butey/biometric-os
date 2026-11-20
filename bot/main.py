@@ -55,7 +55,7 @@ from health_core.environment import load_env_file          # тот же .env, �
 from bot import council, history, knowledge, llm, registry
 from health_core import config
 from health_core.config import load as load_config
-from health_core.report import morning_checklist
+from health_core.report import morning_checklist, weight_trend_line
 from health_core.db import connect, migrate
 
 log = logging.getLogger("bot")
@@ -1497,6 +1497,20 @@ async def _handle_document(message: Message, uid: str) -> None:
                         summary_act = ", ".join(parts)
                         details_str = f"\n\n🏃 **{sport}**: {summary_act}\nКалории учтены в дневном расходе (TDEE)."
                     ans_text = f"✅ Файл `{filename}` успешно импортирован! (добавлено: {added}, пропущено дублей: {skipped}){details_str}"
+                    if not act:
+                        def _trend() -> str | None:
+                            c = connect()
+                            try:
+                                user_id = _resolve_uid_to_user_id(c, uid)
+                                return weight_trend_line(c, user_id) if user_id is not None else None
+                            finally:
+                                c.close()
+                        try:
+                            trend = await asyncio.to_thread(_trend)
+                            if trend:
+                                ans_text += "\n\n" + trend
+                        except Exception:
+                            log.warning("weight trend after import failed", exc_info=True)
                     try:
                         await message.answer(ans_text, parse_mode=ParseMode.MARKDOWN)
                     except Exception:

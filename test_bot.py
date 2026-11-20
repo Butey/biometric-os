@@ -3245,6 +3245,64 @@ def test_review_bad_compaction_does_not_drop_new_message():
         _water_rows(uid)
 
 
+def test_weight_trend_line_morning_only():
+    """Тренд: утренние веса (06-11), медиана дня, окно 7 дней; вечерние и <3 дней не в счёт."""
+    import statistics
+    from datetime import date, timedelta
+    from health_core.report import weight_trend_line
+    conn = connect()
+    migrate(conn)
+    uid = 4711
+    start = date(2026, 1, 1)
+    n = 40
+    base = [110 - 0.1 * i for i in range(n)]
+    try:
+        conn.execute("DELETE FROM body_metrics WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM users WHERE id=?", (uid,))
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(?,'4711',180,'1980-01-01',"
+            "'male','UTC',110,'2026-01-01','2026-01-01 00:00:00')", (uid,))
+        k = 0
+
+        def add(at, kg):
+            nonlocal k
+            k += 1
+            conn.execute("INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg) "
+                         "VALUES(?,?,?,?)", (uid, f"t{k}", at, kg))
+
+        assert weight_trend_line(conn, uid) is None
+        for i, w in enumerate(base):
+            d = (start + timedelta(days=i)).isoformat()
+            add(f"{d} 07:00:00", w - 0.4)   # шум внутри дня, медиана = w
+            add(f"{d} 08:00:00", w)
+            add(f"{d} 09:00:00", w + 0.5)
+            add(f"{d} 20:00:00", w + 3.0)   # вечер не считается
+        # день только с вечерним замером после последнего утреннего - не сдвигает L
+        add(f"{(start + timedelta(days=n)).isoformat()} 21:00:00", 150.0)
+        conn.commit()
+
+        now = statistics.mean(base[n - 7:])
+        c14 = now - statistics.mean(base[n - 15 - 6:n - 15 + 1])
+        c28 = now - statistics.mean(base[n - 29 - 6:n - 29 + 1])
+        expect = (f"Тренд веса (среднее за 7 дней): {now:.1f} кг; "
+                  f"за 14 дн. {c14:+.1f} кг ({c14 / 14 * 7:+.2f} кг/нед); "
+                  f"за 28 дн. {c28:+.1f} кг ({c28 / 28 * 7:+.2f} кг/нед). "
+                  "Дневные скачки до 1 кг - вода и соль, смотри на тренд.")
+        assert weight_trend_line(conn, uid) == expect, weight_trend_line(conn, uid)
+        assert "-0.70 кг/нед" in expect and "106.4 кг" in expect
+
+        # меньше 3 утренних дней в последнем окне - нет значения
+        conn.execute("DELETE FROM body_metrics WHERE user_id=? AND date(measured_at)>'2026-01-02'", (uid,))
+        conn.commit()
+        assert weight_trend_line(conn, uid) is None
+    finally:
+        conn.execute("DELETE FROM body_metrics WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM users WHERE id=?", (uid,))
+        conn.commit()
+        conn.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
