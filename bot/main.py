@@ -1595,11 +1595,13 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
     used_models: list[str] = []
     llm.USED_MODELS.set(used_models)
     try:
-        answer, full = await llm.run_loop(
-            session, prefix, tool_specs(), bot_cfg["providers"],
-            _message_dispatch(message, uid), max_iters=bot_cfg.get("max_tool_iters", 6),
-            timeout_s=bot_cfg.get("request_timeout_s", llm.DEFAULT_TIMEOUT_S),
-        )
+        async with _progress_note(message, bot_cfg.get("progress_note_s", 20)):
+            answer, full = await llm.run_loop(
+                session, prefix, tool_specs(), bot_cfg["providers"],
+                _message_dispatch(message, uid), max_iters=bot_cfg.get("max_tool_iters", 6),
+                timeout_s=bot_cfg.get("request_timeout_s", llm.DEFAULT_TIMEOUT_S),
+                deadline_s=bot_cfg.get("turn_deadline_s", 120),
+            )
     except RuntimeError as e:
         log.error("все провайдеры недоступны: %s", e)
         await message.answer("Не смог связаться с моделью. Повтори через минуту.")
@@ -1610,6 +1612,28 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
     await asyncio.to_thread(_close_turn, uid, full[len(prefix):])
     await _flush_pending_notifications(message.bot)
     await send_long(message, answer + model_switch_note(used_models, bot_cfg["providers"]))
+
+
+_IN_FLIGHT: set[tuple[str, str]] = set()  # (uid, текст) ходов, ждущих замок или исполняющихся
+
+
+def _is_duplicate(in_flight: set, uid: str, text: str) -> bool:
+    return (uid, text.strip().lower()) in in_flight
+
+
+@contextlib.asynccontextmanager
+async def _progress_note(message: Message, delay: float):
+    async def _send() -> None:
+        await asyncio.sleep(delay)
+        try:
+            await message.answer("Обрабатываю, ответ будет чуть позже.")
+        except Exception as e:  # сбой Телеграма не должен ломать ход
+            log.warning("не удалось отправить промежуточное сообщение: %s", e)
+    task = asyncio.create_task(_send())
+    try:
+        yield
+    finally:
+        task.cancel()
 
 
 async def handle_message(message: Message, session: aiohttp.ClientSession, cfg: dict) -> None:
@@ -1641,13 +1665,21 @@ async def handle_message(message: Message, session: aiohttp.ClientSession, cfg: 
     if not text:
         return
 
-    async with _user_lock(uid):
-        # «печатает…» на всё время хода. Телеграм гасит статус через 5 секунд,
-        # ChatActionSender переотправляет его сам, пока блок не закончится.
-        # Ответ идёт 5-20 секунд, и без этого статуса бот неотличим от мёртвого —
-        # именно так это и выглядело после ухода Hermes, который статус слал.
-        async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
-            await _handle_turn(message, session, cfg, uid, text)
+    key = (uid, text.lower())
+    if _is_duplicate(_IN_FLIGHT, uid, text):
+        await message.answer("Это сообщение уже обрабатываю, дождись ответа.")
+        return
+    _IN_FLIGHT.add(key)
+    try:
+        async with _user_lock(uid):
+            # «печатает…» на всё время хода. Телеграм гасит статус через 5 секунд,
+            # ChatActionSender переотправляет его сам, пока блок не закончится.
+            # Ответ идёт 5-20 секунд, и без этого статуса бот неотличим от мёртвого —
+            # именно так это и выглядело после ухода Hermes, который статус слал.
+            async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+                await _handle_turn(message, session, cfg, uid, text)
+    finally:
+        _IN_FLIGHT.discard(key)
 
 
 async def _handle_turn(message: Message, session: aiohttp.ClientSession,
@@ -1776,11 +1808,13 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
     used_models: list[str] = []
     llm.USED_MODELS.set(used_models)
     try:
-        answer, full = await llm.run_loop(
-            session, prefix, tool_specs(), bot_cfg["providers"],
-            _message_dispatch(message, uid), max_iters=bot_cfg.get("max_tool_iters", 6),
-            timeout_s=bot_cfg.get("request_timeout_s", llm.DEFAULT_TIMEOUT_S),
-        )
+        async with _progress_note(message, bot_cfg.get("progress_note_s", 20)):
+            answer, full = await llm.run_loop(
+                session, prefix, tool_specs(), bot_cfg["providers"],
+                _message_dispatch(message, uid), max_iters=bot_cfg.get("max_tool_iters", 6),
+                timeout_s=bot_cfg.get("request_timeout_s", llm.DEFAULT_TIMEOUT_S),
+                deadline_s=bot_cfg.get("turn_deadline_s", 120),
+            )
     except RuntimeError as e:
         log.error("все провайдеры недоступны: %s", e)
         await message.answer("Не смог связаться с моделью. Записи в базе не потеряны, повтори через минуту.")

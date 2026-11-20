@@ -443,6 +443,24 @@ def test_tool_loop_limit_is_recorded():
     assert full[-1]["content"] == answer, "показанный текст разошёлся с сохранённым"
 
 
+def test_turn_deadline_stops_loop_before_next_chat():
+    call = {"id": "c1", "type": "function", "function": {"name": "help", "arguments": "{}"}}
+    llm._post = scripted({"role": "assistant", "content": None, "tool_calls": [call]})  # второй вызов упал бы на pop
+    answer, full = asyncio.run(llm.run_loop(
+        None, [{"role": "user", "content": "?"}], main.tool_specs(),
+        PROVIDERS, main.dispatch, max_iters=6, deadline_s=0))
+    assert answer.startswith("Не удалось завершить"), answer
+    assert any(m["role"] == "tool" for m in full), "результат инструмента потерян"
+    assert full[-1] == {"role": "assistant", "content": answer}
+
+
+def test_duplicate_message_detection():
+    flight = {("1", "съел яблоко")}
+    assert main._is_duplicate(flight, "1", "  Съел Яблоко ")
+    assert not main._is_duplicate(flight, "1", "съел грушу")
+    assert not main._is_duplicate(flight, "2", "съел яблоко")
+
+
 def test_tool_loop_limit_does_not_publish_provisional_claims():
     """Гипотеза до проверки инструментом не становится итогом при лимите."""
     from unittest.mock import patch
@@ -476,9 +494,8 @@ def test_reasoning_only_final_response_is_not_published():
     from unittest.mock import patch
 
     for field in ("reasoning_content", "reasoning"):
-        with patch.object(llm, "_post", scripted({
-            "role": "assistant", "content": None, field: "Внутренняя гипотеза о плато",
-        })):
+        empty = {"role": "assistant", "content": None, field: "Внутренняя гипотеза о плато"}
+        with patch.object(llm, "_post", scripted(dict(empty), dict(empty))):  # второй - после тихого повтора
             answer, full = asyncio.run(llm.run_loop(
                 None, [{"role": "user", "content": "Почему вес стоит?"}],
                 [], PROVIDERS, lambda name, args: "{}"))

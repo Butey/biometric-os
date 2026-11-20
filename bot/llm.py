@@ -739,7 +739,8 @@ def _receipt(name: str, args: dict | None, result: str) -> tuple[str | None, str
 
 async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict],
                     providers: list[Provider], dispatch: Callable[[str, dict], str | Awaitable[str]],
-                    max_iters: int = 6, timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[str, list[dict]]:
+                    max_iters: int = 6, timeout_s: float = DEFAULT_TIMEOUT_S,
+                    deadline_s: float | None = None) -> tuple[str, list[dict]]:
     """Цикл: chat → если есть tool_calls, исполнить все и повторить, иначе вернуть текст.
 
     Синхронный dispatch вызывается через asyncio.to_thread с переносом ContextVar
@@ -753,8 +754,12 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
     empty_retried = False  # один повтор пустого ответа, отдельно от nudge
     receipts: list[str] = []
     day_line = None
+    started = time.monotonic()
 
-    for _ in range(max_iters):
+    for i in range(max_iters):
+        if i and deadline_s is not None and time.monotonic() - started > deadline_s:
+            log.warning("ход превысил дедлайн %s с", deadline_s)
+            break
         message = await chat(session, messages, tools, providers, timeout_s=timeout_s)
         messages.append(clean_message(message))  # reasoning и пр. в историю не тащим
 
@@ -838,7 +843,7 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
     # Текст при tool_calls — предварительный: он написан ДО результатов
     # последней проверки. Выдавать его как итог (например, «это плато»)
     # при исчерпании лимита нельзя, даже если он непустой.
-    log.warning("цикл вызова инструментов исчерпал лимит: %d", max_iters)
+    log.warning("цикл вызова инструментов завершён без ответа (лимит итераций %d)", max_iters)
     answer = ("Не удалось завершить проверку данных и подготовить итоговый ответ. "
               "Перед повтором записи проверьте журнал: часть действий могла выполниться.")
     messages.append({"role": "assistant", "content": answer})
