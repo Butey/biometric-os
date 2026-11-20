@@ -857,6 +857,8 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
     log.warning("цикл вызова инструментов завершён без ответа (лимит итераций %d)", max_iters)
     answer = ("Не удалось завершить проверку данных и подготовить итоговый ответ. "
               "Перед повтором записи проверьте журнал: часть действий могла выполниться.")
+    if nudge is not None:
+        messages = [m for m in messages if m is not nudge]
     messages.append({"role": "assistant", "content": answer})
     return answer, messages
 
@@ -1107,6 +1109,16 @@ if __name__ == "__main__":
                 assert text == _NOT_WRITTEN and len(sent) == 2, (text, len(sent))
                 assert msgs[-1]["content"] == _NOT_WRITTEN, msgs[-1]
             print("OK: 6c) вторая ложная «запись» заменяется честным текстом кода")
+
+            # --- 6c2. поправка не попадает в историю и на пути дедлайна/лимита ---
+            replies = iter(["Записал завтрак."])
+            sent.clear()
+            with patch(__name__ + "._post", _post_claim):
+                text, msgs = await run_loop(session, [{"role": "user", "content": "завтрак"}], [{"type": "function"}],
+                                             PROVIDERS, lambda n, a: "{}", deadline_s=0)
+                assert text.startswith("Не удалось завершить"), text
+                assert not any("[Система]" in str(m.get("content")) for m in msgs), msgs
+            print("OK: 6c2) поправка не попадает в историю при выходе по дедлайну")
 
             # --- 6d. что считается заявкой и записью ---
             for s in ("Могу внести в план?", "Записать как съеденное?", "Записано воды 0.7 / 2.6 л.",
