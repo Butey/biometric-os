@@ -80,6 +80,8 @@ sudo journalctl -u health-agent.service -f
 sudo systemctl restart health-agent.service health-admin.service
 ```
 
+После копирования файлов на сервер запускайте `bash scripts/server_update.sh`: он установит зависимости, проверит код и запустит тесты. Для перезапуска служб запускайте его с `--restart` (перезапуск прерывает обрабатываемые ответы).
+
 Админ-панель управляется теми же командами с именем `health-admin.service`.
 Перезапуск бота прерывает обрабатываемые ответы. После изменения самих
 unit-файлов сначала скопируйте их в `/etc/systemd/system/` и выполните
