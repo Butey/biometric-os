@@ -498,6 +498,7 @@ def trends(conn: sqlite3.Connection, user_id: int, window_days: int = 30) -> dic
         "waist_delta_cm": _delta(waist_rows, "value_cm"),
         "whr": whr(conn, user_id),
         "actual_tdee_kcal": None,
+        "target_expenditure_kcal": None,
         "lean_loss": {
             "ratio": lean[0] if lean else None,
             "points": lean[3] if lean else None,
@@ -515,6 +516,13 @@ def trends(conn: sqlite3.Connection, user_id: int, window_days: int = 30) -> dic
     except ImportError:
         return out
     out["actual_tdee_kcal"] = adaptive_tdee(conn, user_id, window_days=window_days)
+    try:
+        # Тот же расход, от которого считается цель (explain_target).
+        from health_core.energy import daily_expenditure
+        out["target_expenditure_kcal"] = round(
+            daily_expenditure(conn, user_id, user_now(conn, user_id).date().isoformat())["kcal"])
+    except Exception:
+        out["target_expenditure_kcal"] = None
     return out
 
 

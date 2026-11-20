@@ -3303,6 +3303,37 @@ def test_weight_trend_line_morning_only():
         conn.close()
 
 
+def test_trends_target_expenditure_matches_daily_expenditure():
+    """get_trends отдаёт target_expenditure_kcal = round(daily_expenditure на сегодня по поясу)."""
+    from datetime import date
+    from health_core.energy import daily_expenditure
+    from health_core.config import user_now
+    registry.set_caller("4713")
+    conn = connect()
+    migrate(conn)
+    uid = 4713
+    try:
+        conn.execute("DELETE FROM users WHERE id=?", (uid,))
+        conn.execute(
+            "INSERT INTO users(id,telegram_user_id,height_cm,birth_date,sex,timezone,"
+            "base_weight_kg,base_weight_date,created_at) VALUES(?,'4713',180,'1980-01-01',"
+            "'male','UTC',100,'2026-01-01','2026-01-01 00:00:00')", (uid,))
+        conn.execute("DELETE FROM body_metrics WHERE user_id=?", (uid,))
+        conn.execute(
+            "INSERT INTO body_metrics(user_id,burst_key,measured_at,weight_kg,ffm_kg,fat_pct) "
+            "VALUES(?, 'tt4713', ?, 100.0, 75.0, 25.0)", (uid, f"{date.today().isoformat()} 08:00:00"))
+        conn.commit()
+        today = user_now(conn, uid).date().isoformat()
+        expected = round(daily_expenditure(conn, uid, today)["kcal"])
+        out = json.loads(main.strip_tool_rules(main.dispatch("get_trends", {})))
+        assert out.get("target_expenditure_kcal") == expected, (out.get("target_expenditure_kcal"), expected)
+    finally:
+        conn.execute("DELETE FROM body_metrics WHERE user_id=?", (uid,))
+        conn.execute("DELETE FROM users WHERE id=?", (uid,))
+        conn.commit()
+        conn.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
