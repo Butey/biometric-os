@@ -3334,6 +3334,17 @@ def test_trends_target_expenditure_matches_daily_expenditure():
         conn.close()
 
 
+def test_keys_page_restart_button():
+    """Кнопка перезапуска есть всегда; приглашение с пояснением - только после смены ключа."""
+    from admin import pages
+    plain = pages.keys_page([], {}, "", "tok")
+    assert 'value="restart_bot"' in plain and "работает на старых" not in plain
+    offered = pages.keys_page([], {}, "", "tok", offer_restart=True)
+    assert "работает на старых" in offered and offered.count('value="restart_bot"') == 2
+    failed = pages.keys_page([], {}, "", "tok", error="x", offer_restart=True)
+    assert "работает на старых" not in failed
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

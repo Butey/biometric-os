@@ -983,7 +983,7 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------------- keys & models
 
     def _keys_page_html(self, sess, message: str | None = None, error: str | None = None,
-                         test_results: list[dict] | None = None) -> str:
+                         test_results: list[dict] | None = None, offer_restart: bool = False) -> str:
         import yaml
         from health_core.config import load as load_config
         cfg = load_config()
@@ -992,7 +992,7 @@ class Handler(BaseHTTPRequestHandler):
         providers_yaml = yaml.safe_dump(providers, default_flow_style=False, sort_keys=False)
         body = pages.keys_page(
             providers, keys_dict, providers_yaml, sess["csrf"],
-            message=message, error=error, test_results=test_results,
+            message=message, error=error, test_results=test_results, offer_restart=offer_restart,
         )
         return self._layout("Ключи и Модели", body, sess["csrf"], active="keys")
 
@@ -1016,7 +1016,19 @@ class Handler(BaseHTTPRequestHandler):
 
         action = form.get("action")
         message, error = None, None
-        if action == "list_models":
+        offer_restart = False
+        if action == "restart_bot":
+            import subprocess
+            unit = os.environ.get("HEALTH_BOT_UNIT", "health-agent")
+            try:
+                r = subprocess.run(["systemctl", "restart", unit], capture_output=True, text=True, timeout=60)
+                if r.returncode:
+                    error = f"Перезапуск не удался: {(r.stderr or r.stdout).strip()[:200]}"
+                else:
+                    message = "Бот перезапущен и работает на актуальных ключах."
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                error = f"Перезапуск не удался: {exc}"
+        elif action == "list_models":
             try:
                 provider = provider_setup.from_form(form, require_model=False)
                 models = provider_setup.list_models(provider, form.get("new_api_key", ""))
@@ -1037,6 +1049,7 @@ class Handler(BaseHTTPRequestHandler):
                 key = form.get("new_api_key", "").strip()
                 if key:
                     auth.update_env_vars({provider["api_key_env"]: key})
+                    offer_restart = True
                 _update_providers_in_config(current + [provider])
                 message = "Модель добавлена в конец цепочки. Приоритет можно изменить стрелками."
             except ValueError as exc:
@@ -1091,6 +1104,7 @@ class Handler(BaseHTTPRequestHandler):
                         updates[f"{var}_{i}"] = None
             auth.update_env_vars(updates)
             auth.load_env_file(force=True)
+            offer_restart = True
             message = f"API-ключи успешно сохранены (Google: {len(g_keys)} шт., Groq: {len(groq_keys)} шт.). Ротация активна."
 
         elif action == "save_providers":
@@ -1190,7 +1204,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             error = "Неизвестное действие."
 
-        self._html(200, self._keys_page_html(sess, message=message, error=error))
+        self._html(200, self._keys_page_html(sess, message=message, error=error, offer_restart=offer_restart))
 
     def _post_keys_test(self):
         ctx = self._require_auth()

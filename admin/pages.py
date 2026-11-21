@@ -2322,12 +2322,24 @@ def keys_page(
     message: str | None = None,
     error: str | None = None,
     test_results: list[dict] | None = None,
+    offer_restart: bool = False,
 ) -> str:
+    restart_form = (
+        f'<form method="post" action="/keys" style="display:inline;margin:0" '
+        f'data-confirm="Перезапустить бота? Ответ, который он пишет прямо сейчас, оборвётся.">'
+        f'{_csrf_field(csrf_token)}<input type="hidden" name="action" value="restart_bot">'
+        f'<button type="submit">🔄 Перезапустить бота</button></form>'
+    )
     msg_html = ""
     if error:
         msg_html = f'<p class="error">{html.escape(error)}</p>'
     elif message:
         msg_html = f'<p class="msg">{html.escape(message)}</p>'
+    if offer_restart and not error:
+        msg_html += (
+            '<p class="msg">Бот читает ключи из окружения при старте и до перезапуска '
+            f'работает на старых. Перезапустить сейчас? {restart_form}</p>'
+        )
 
     google_keys = keys_dict.get("GOOGLE_API_KEY", [])
     groq_keys = keys_dict.get("GROQ_API_KEY", [])
@@ -2665,10 +2677,11 @@ def keys_page(
 <div class="card">
   <h3>3. Диагностика и проверка связи</h3>
   <p class="comment">Отправляет тестовый минимальный запрос к каждой модели с каждым из настроенных ключей для проверки доступности и квот.</p>
-  <form method="post" action="/keys/test">
+  <form method="post" action="/keys/test" style="display:inline">
     {_csrf_field(csrf_token)}
     <button type="submit">⚡ Проверить все ключи и модели</button>
   </form>
+  {restart_form}
 </div>
 
 {test_html}
