@@ -3345,6 +3345,12 @@ def test_keys_page_restart_button():
     assert "работает на старых" not in failed
 
 
+def test_vision_providers_skip_text_only():
+    a, b = {"model": "deepseek", "vision": False}, {"model": "gemini"}
+    assert main._vision_providers([a, b]) == [b]
+    assert main._vision_providers([a]) == [a]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

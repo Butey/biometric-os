@@ -1552,6 +1552,12 @@ _RECEIPT_RULE = (
 )
 
 
+def _vision_providers(providers: list[dict]) -> list[dict]:
+    """Фото видят не все модели (deepseek - только текст): без картинки модель
+    выдумывает содержимое. Помечены vision: false в config.yaml."""
+    return [p for p in providers if p.get("vision", True)] or providers
+
+
 async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: dict, uid: str) -> None:
     """Скачивает фото, кодирует в base64 и отправляет модели как vision-запрос.
     Сценарии: фото еды для оценки КБЖУ, фото глюкометра, фото этикетки."""
@@ -1611,7 +1617,7 @@ async def _handle_photo(message: Message, session: aiohttp.ClientSession, cfg: d
     try:
         async with _progress_note(message, bot_cfg.get("progress_note_s", 20)):
             answer, full = await llm.run_loop(
-                session, prefix, tool_specs(), bot_cfg["providers"],
+                session, prefix, tool_specs(), _vision_providers(bot_cfg["providers"]),
                 _message_dispatch(message, uid), max_iters=bot_cfg.get("max_tool_iters", 6),
                 timeout_s=bot_cfg.get("request_timeout_s", llm.DEFAULT_TIMEOUT_S),
                 deadline_s=bot_cfg.get("turn_deadline_s", 120),
