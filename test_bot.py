@@ -3351,6 +3351,12 @@ def test_vision_providers_skip_text_only():
     assert main._vision_providers([a]) == [a]
 
 
+def test_strip_stubs_mangled_marker():
+    mangled = "Сон записан.\n<!-- METABOLICPANELSHOWN: блок сна передан человеку. Числа устарели -->\nГотово"
+    assert main._strip_stubs(mangled) == "Сон записан.\n\nГотово"
+    assert main._strip_stubs(main._PANEL_STUB) == ""
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
