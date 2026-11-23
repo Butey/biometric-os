@@ -430,7 +430,8 @@ def _note_used(model: str) -> None:
 
 
 async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict],
-                providers: list[Provider], timeout_s: float = DEFAULT_TIMEOUT_S) -> dict:
+                providers: list[Provider], timeout_s: float = DEFAULT_TIMEOUT_S,
+                force_tool: str | None = None) -> dict:
     """Идёт по providers по порядку, ротирует API-ключи для каждого провайдера,
     возвращает choices[0].message первого, кто ответил 200.
 
@@ -504,6 +505,9 @@ async def chat(session: aiohttp.ClientSession, messages: list[dict], tools: list
         anthropic = provider.get("api") == "anthropic"
         if anthropic:
             url, payload = _to_anthropic(provider, clean_messages, tools)
+        if force_tool and "tools" in payload:
+            payload["tool_choice"] = ({"type": "tool", "name": force_tool} if anthropic else
+                                      {"type": "function", "function": {"name": force_tool}})
 
         for key in ordered_keys:
             state = _get_key_state(key, model=scope)
@@ -767,6 +771,7 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
     failed: dict[tuple[str, str], str] = {}  # вызовы с ошибкой в ЭТОМ ходе -> текст ошибки
     wrote = False  # была ли в этом ходе успешная запись (см. _is_write)
     food_wrote = False  # успешный log_food(add): вода или аптека приём пищи не заменяют
+    force = None   # имя инструмента, вызов которого требуем на ближайшей итерации
     nudge = None   # служебная реплика-поправка, в историю не попадает
     empty_retried = False  # один повтор пустого ответа, отдельно от nudge
     receipts: list[str] = []
@@ -777,7 +782,17 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
         if i and deadline_s is not None and time.monotonic() - started > deadline_s:
             log.warning("ход превысил дедлайн %s с", deadline_s)
             break
-        message = await chat(session, messages, tools, providers, timeout_s=timeout_s)
+        if force and not any((t.get("function") or {}).get("name") == force for t in tools):
+            force = None
+        try:
+            message = await chat(session, messages, tools, providers, timeout_s=timeout_s, force_tool=force)
+        except RuntimeError:
+            if not force:
+                raise
+            # провайдер отверг принудительный tool_choice: лучше обычный запрос, чем сорванный ход
+            log.warning("принудительный вызов %s отвергнут, повтор без принуждения", force)
+            message = await chat(session, messages, tools, providers, timeout_s=timeout_s)
+        force = None
         messages.append(clean_message(message))  # reasoning и пр. в историю не тащим
 
         tool_calls = message.get("tool_calls") or []
@@ -814,6 +829,7 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
                         "из его последних сообщений. Иначе честно скажи, что ничего не записано. Числа дня "
                         "бери только из результатов инструментов этого хода, не из прошлых сообщений.")}
                     messages.append(nudge)
+                    force = "log_food" if unlogged else None
                     continue
                 # Повтор с поправкой снова соврал - человеку уходит текст кода, не выдумка модели
                 log.warning("ответ после поправки снова утверждает запись без записи: %s", _short(answer))
@@ -1188,6 +1204,38 @@ if __name__ == "__main__":
                                          PROVIDERS, lambda n, a: '{"water_id": 1}', expect_food_write=True)
                 assert _FOOD_NOT_LOGGED in text, text
             print("OK: 6f) отчёт о еде без log_food: повтор, затем честная пометка; вопрос/отказ не трогаем")
+
+            # --- 6g. повтор требует log_food принудительно, и модель его вызывает ---
+            tools_f = [{"type": "function", "function": {"name": "log_food", "parameters": {"type": "object"}}}]
+            seq = iter([_msg(content="Готово! Омлет 320 ккал."), _msg(content=None, tool_calls=[tc_food]),
+                        _msg(content="Записал.")])
+            choices = []
+
+            async def _post_force(session, url, headers, payload, timeout_s=None):
+                choices.append(payload.get("tool_choice"))
+                return 200, {"choices": [{"message": next(seq)}]}
+
+            with patch(__name__ + "._post", _post_force):
+                text, _ = await run_loop(session, [{"role": "user", "content": "съела омлет"}], tools_f,
+                                         PROVIDERS, lambda n, a: food_res, expect_food_write=True)
+                assert choices == ["auto", {"type": "function", "function": {"name": "log_food"}}, "auto"], choices
+                assert "Запись в журнале #479" in text, text
+
+            # провайдер отверг принудительный tool_choice -> обычный запрос, ход не падает
+            seq = iter([_msg(content="Готово! Омлет 320 ккал."), None, _msg(content=None, tool_calls=[tc_food]),
+                        _msg(content="Записал.")])
+
+            async def _post_reject(session, url, headers, payload, timeout_s=None):
+                m = next(seq)
+                if m is None:
+                    return 400, {"error": "tool_choice not supported"}
+                return 200, {"choices": [{"message": m}]}
+
+            with patch(__name__ + "._post", _post_reject):
+                text, _ = await run_loop(session, [{"role": "user", "content": "съела омлет"}], tools_f,
+                                         [PROVIDERS[0]], lambda n, a: food_res, expect_food_write=True)
+                assert "Запись в журнале #479" in text, text
+            print("OK: 6g) повтор принудительно требует log_food; отказ провайдера не срывает ход")
 
             # --- 7. reasoning с промежуточного хода tool_calls не протекает в
             # уведомление о пустом финальном ответе (утечка chain-of-thought) ---
