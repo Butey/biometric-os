@@ -127,6 +127,7 @@ def fetch_by_code(off_code: str) -> dict:
 # "творожный" сливались) -> отсортированное множество основ.
 _PAREN_RE = re.compile(r"\([^)]*\)")
 _WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+_EGG_CAT_RE = re.compile(r"(?<!\w)[сc][0-3в](?!\w)")
 _STOPWORDS = {"для", "без", "при", "над", "под", "или"}
 _STEM_LEN = 6
 _MIN_WORD_LEN = 3
@@ -139,6 +140,8 @@ def name_stems(name: str) -> set[str]:
         if len(w) < _MIN_WORD_LEN or w in _STOPWORDS:
             continue
         stems.add(w[:_STEM_LEN])
+    # Категория яиц (С0/С1/С2/СВ) короче порога и с цифрой - без этого "яйцо С0" и "яйцо СВ" один продукт
+    stems.update(m.replace("c", "с") for m in _EGG_CAT_RE.findall(s))
     return stems
 
 
@@ -369,6 +372,11 @@ if __name__ == "__main__":
     assert not foods_mod.keys_match(foods_mod.name_key("творожный сыр"), "творог"), \
         "сохранённый 'творожный сыр' не должен совпадать с 'творог'"
     print("OK: 'творог' и 'творожный сыр' — разные продукты")
+
+    s0, sv = foods_mod.name_stems("Яйцо куриное С0"), foods_mod.name_stems("Яйцо куриное СВ")
+    assert s0 != sv and not foods_mod.keys_match(foods_mod.name_key("Яйцо куриное С0"), "Яйцо куриное СВ")
+    assert not foods_mod._loose_match(sv, s0) and foods_mod.keys_match(foods_mod.name_key("яйцо св"), "Яйцо куриное СВ")
+    print("OK: яйца С0 и СВ - разные продукты")
 
     assert foods_mod.extra_words("чай", "чай с молоком и сахаром") == ["молоком", "сахаром"]
     assert foods_mod.extra_words("бородинский хлеб", "хлеб бородинский 80 г") == []
