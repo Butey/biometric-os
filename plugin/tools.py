@@ -4677,14 +4677,14 @@ def handle_sick(params: dict) -> str:
 _SLICE_UNITS = ("кусок", "кусочек", "кусочка", "кусочков", "куска", "ломтик", "ломтика", "ломтиков", "ломоть", "слайс", "слайсов")
 
 
-_EGG_GRADE_RE = re.compile(r"(?<!\w)(?:св|с[0о])(?!\w)")
+_EGG_GRADE_RE = re.compile(r"(?<!\w)(?:св|с[0-3о])(?!\w)")
 
 
 def _pantry_stems(name: str) -> set:
     """name_stems + сорт яиц: СВ = XXL, С0 = c0 = со - разные подвиды (короткие слова
     name_stems отбрасывает), яйцо/яйца, куриное/куриные - одно слово."""
     from health_core import foods
-    stems = foods.name_stems(name)
+    stems = foods.name_stems(name) - {"с0", "с1", "с2", "с3", "св"}  # сорт считается отдельно ниже
     low = (name or "").casefold().translate(str.maketrans("c", "с")).replace("xxl", "св")
     if "яйц" not in low:
         return stems
