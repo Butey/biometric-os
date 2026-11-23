@@ -215,6 +215,17 @@ _EATEN_RE = re.compile(
     r"\bел[аи]?\b|\bпил[аи]?\b|\bзапис|\bвнес|\bзанес",
     re.IGNORECASE)
 _PLAN_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar("plan_only", default=False)
+# Явный отчёт о съеденном / приказ записать: по нему цикл требует реальный log_food.
+# Вопрос без приказа («сколько я съел?») отчётом не считается.
+_FOOD_REPORT_RE = re.compile(
+    r"\bсъел|\bпоел|\bпозавтракал|\bпообедал|\bпоужинал|\bперекусил|\bзапиши|\bвнеси|\bзанеси"
+    r"|\bзавтрак|\bобед|\bужин|\bперекус", re.IGNORECASE)
+
+
+def is_food_report(text: str) -> bool:
+    if is_plan_only(text) or not _FOOD_REPORT_RE.search(text):
+        return False
+    return "?" not in text or bool(re.search(r"\bзапиши|\bвнеси|\bзанеси", text, re.IGNORECASE))
 
 
 def model_switch_note(used: list[str], providers: list[dict]) -> str:
@@ -1844,6 +1855,7 @@ async def _handle_turn(message: Message, session: aiohttp.ClientSession,
                 _message_dispatch(message, uid), max_iters=bot_cfg.get("max_tool_iters", 6),
                 timeout_s=bot_cfg.get("request_timeout_s", llm.DEFAULT_TIMEOUT_S),
                 deadline_s=bot_cfg.get("turn_deadline_s", 120),
+                expect_food_write=is_food_report(text),
             )
     except RuntimeError as e:
         log.error("все провайдеры недоступны: %s", e)

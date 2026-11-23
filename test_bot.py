@@ -406,6 +406,10 @@ def test_plan_talk_is_not_logged_as_eaten():
               "завтрак: 2 яйца С0, тунец 140гр без сока, картофель baby 150гр, фасоль 200гр 365 дней, капуста квашеная 200гр в 11:37",
               "на завтрак 2 яйца", "завтрак 100г творога", "хочу записать 2 яйца", "хочу внести 2 яйца"):
         assert not main.is_plan_only(t), t
+    for t in ("съела омлет 3 яйца", "завтрак: 2 яйца, тост", "на завтрак 2 яйца", "запиши обед: суп 300г"):
+        assert main.is_food_report(t), t
+    for t in ("сколько я съел сегодня?", "что на ужин?", "не записывай обед", "привет", "как мой вес"):
+        assert not main.is_food_report(t), t
     main._PLAN_ONLY.set(True)
     try:
         out = json.loads(main.strip_tool_rules(main.dispatch("log_food", {"items": [{"name": "тунец", "grams": 100}]})))
