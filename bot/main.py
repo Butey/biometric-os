@@ -142,7 +142,7 @@ def tool_specs() -> list[dict]:
 
 
 _tool_rules_cache: tuple[float, dict[str, str]] | None = None
-_TOOL_RULES_MARK = "\n\n[ПРАВИЛА "
+_TOOL_RULES_MARK = llm.TOOL_RULES_MARK
 
 
 def _tool_rules() -> dict[str, str]:

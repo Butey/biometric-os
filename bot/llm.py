@@ -700,11 +700,19 @@ def _call_key(call: dict) -> tuple[str, str] | None:
     return call["function"]["name"], json.dumps(args, sort_keys=True, ensure_ascii=False)
 
 
+# Приклеивается bot.main.with_tool_rules к результату инструмента; JSON-часть - всё до метки.
+TOOL_RULES_MARK = "\n\n[ПРАВИЛА "
+
+
+def _json_part(result: str) -> str:
+    return result.split(TOOL_RULES_MARK, 1)[0]
+
+
 def _error_text(result: str) -> str | None:
     """Текст ошибки, если результат инструмента - JSON-объект с ключом "error".
     {"saved": true, "warning": ...} ошибкой не считается."""
     try:
-        data = json.loads(result)
+        data = json.loads(_json_part(result))
     except (ValueError, TypeError):
         return None
     return str(data["error"]) if isinstance(data, dict) and "error" in data else None
@@ -739,7 +747,7 @@ def _receipt(name: str, args: dict | None, result: str) -> tuple[str | None, str
     """(строка о записи, строка итога дня) из результата инструмента - числа из базы,
     а не пересказ модели (она путала итоги и выдавала невыполненные записи)."""
     try:
-        data = json.loads(result)
+        data = json.loads(_json_part(result))
     except (ValueError, TypeError):
         return None, None
     if not isinstance(data, dict) or "error" in data:
@@ -771,6 +779,7 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
     failed: dict[tuple[str, str], str] = {}  # вызовы с ошибкой в ЭТОМ ходе -> текст ошибки
     wrote = False  # была ли в этом ходе успешная запись (см. _is_write)
     food_wrote = False  # успешный log_food(add): вода или аптека приём пищи не заменяют
+    logged_food: dict[tuple[str, str], str] = {}  # log_food(add), уже исполненный в ЭТОМ ходе -> результат
     force = None   # имя инструмента, вызов которого требуем на ближайшей итерации
     nudge = None   # служебная реплика-поправка, в историю не попадает
     empty_retried = False  # один повтор пустого ответа, отдельно от nudge
@@ -854,6 +863,11 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
                          key[0], _short(call["function"].get("arguments")), _short(failed[key]))
                 results.append(result)
                 continue
+            if key in logged_food:
+                # Модель после успешной записи забыла о ней и шлёт ту же запись снова (дубль в журнале)
+                log.warning("повтор log_food с теми же аргументами в одном ходе подавлен")
+                results.append(logged_food[key])
+                continue
             results.append(await _run_one(call, dispatch))
             err = _error_text(results[-1])
             name = call["function"]["name"]
@@ -865,7 +879,11 @@ async def run_loop(session: aiohttp.ClientSession, messages: list[dict], tools: 
                 failed[key] = err
             elif err is None and args is not None and _is_write(name, args):
                 wrote = True
-                food_wrote = food_wrote or (name == "log_food" and (args.get("action") or "add") == "add")
+                if name == "log_food" and (args.get("action") or "add") == "add":
+                    food_wrote = True
+                    logged_food[key] = json.dumps({
+                        "already_logged": True, "note": "Этот приём пищи уже записан в этом ходе, повтор не выполнен. "
+                        "Не вызывай log_food снова: ответь человеку."}, ensure_ascii=False)
                 line, day = _receipt(name, args, results[-1])
                 if line:
                     receipts.append(line)
@@ -1236,6 +1254,37 @@ if __name__ == "__main__":
                                          [PROVIDERS[0]], lambda n, a: food_res, expect_food_write=True)
                 assert "Запись в журнале #479" in text, text
             print("OK: 6g) повтор принудительно требует log_food; отказ провайдера не срывает ход")
+
+            # --- 6h. к результату приклеены правила инструмента: JSON всё равно читается ---
+            rules = TOOL_RULES_MARK + "log_food]\nправила"
+            queue = [_resp(200, _msg(content=None, tool_calls=[tc_food])), _resp(200, _msg(content="Записал хлеб."))]
+            with patch(__name__ + "._post", _post_ok):
+                text, _ = await run_loop(session, [{"role": "user", "content": "хлеб"}], [{"type": "function"}],
+                                         PROVIDERS, lambda n, a: food_res + rules)
+                assert "Запись в журнале #479" in text, text
+            # ошибка с правилами - не запись: «записал» после неё ловится
+            err_res = json.dumps({"error": "нет КБЖУ"}, ensure_ascii=False) + rules
+            queue = [_resp(200, _msg(content=None, tool_calls=[tc_food])), _resp(200, _msg(content="Записал хлеб.")),
+                     _resp(200, _msg(content="Ничего не записано."))]
+            with patch(__name__ + "._post", _post_ok):
+                text, _ = await run_loop(session, [{"role": "user", "content": "съел хлеб"}], [{"type": "function"}],
+                                         PROVIDERS, lambda n, a: err_res, expect_food_write=True)
+                assert text == "Ничего не записано.", text
+            # тот же log_food дважды в одном ходе исполняется один раз
+            calls = []
+
+            def _count(n, a):
+                calls.append(n)
+                return food_res + rules
+
+            tc_food2 = {**tc_food, "id": "c_f2"}
+            queue = [_resp(200, _msg(content=None, tool_calls=[tc_food])),
+                     _resp(200, _msg(content=None, tool_calls=[tc_food2])), _resp(200, _msg(content="Записал."))]
+            with patch(__name__ + "._post", _post_ok):
+                text, _ = await run_loop(session, [{"role": "user", "content": "хлеб"}], [{"type": "function"}],
+                                         PROVIDERS, _count)
+                assert calls == ["log_food"] and text.count("Запись в журнале") == 1, (calls, text)
+            print("OK: 6h) правила в результате не мешают разбору; ошибка не запись; дубль log_food подавлен")
 
             # --- 7. reasoning с промежуточного хода tool_calls не протекает в
             # уведомление о пустом финальном ответе (утечка chain-of-thought) ---
